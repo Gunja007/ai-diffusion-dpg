@@ -125,7 +125,7 @@ class AgentCore(AgentCoreBase):
 
         # ── Step 3: Assemble prompt ───────────────────────────────────
         messages = self._knowledge_engine.assemble_prompt(
-            session_id, turn_input.user_message, state
+            session_id, turn_input.user_message, state, self._llm
         )
 
         # Empty prompt edge case — return safe empty response
