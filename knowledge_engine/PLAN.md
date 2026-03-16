@@ -27,7 +27,6 @@ messages = knowledge_engine.assemble_prompt(
     session_id=session_id,
     user_message=turn_input.user_message,
     session_state=state,
-    llm=self._llm,          # LLMWrapperBase instance owned by Agent Core
 )
 ```
 
@@ -48,7 +47,6 @@ class KnowledgeEngineBase(ABC):
         session_id: str,
         user_message: str,
         session_state: SessionState,
-        llm: LLMWrapperBase,
     ) -> list[dict]:
         """
         Returns complete messages list for the LLM call.
@@ -60,14 +58,66 @@ The concrete `KnowledgeEngine` class must inherit from `KnowledgeEngineBase` and
 this method with the exact same signature.
 
 ### LLM usage rule
-The `llm` parameter is the `LLMWrapperBase` instance owned by Agent Core.
-Knowledge Engine **must not** import `anthropic` directly or instantiate any LLM client.
-All LLM calls inside KE go through `llm.call(messages, tools=[], system="", model_override=<haiku_model>)`.
-Use `model_override` to point to the fast/cheap NLU model from YAML config — never the primary Sonnet model.
+
+Knowledge Engine **must not** import `anthropic` directly or instantiate any Anthropic client.
+
+The LLM client is injected at **construction time** as `LLMWrapperBase`:
+
+```python
+# PoC (monorepo — same process):
+ke = KnowledgeEngine(config, llm=ClaudeLLMWrapper(config))
+
+# Production (separate services):
+ke = KnowledgeEngine(config, llm=HttpLLMWrapper(proxy_url="http://agent-core/internal/llm/call"))
+```
+
+All internal LLM calls (NLU, language normalisation) use:
+```python
+self._llm.call(messages, tools=[], system="", model_override=<haiku_model>)
+```
+
+Use `model_override` to point to the fast/cheap NLU model from YAML config — never the primary
+Sonnet model.
 
 ---
 
-## 3. The 5 Internal Blocks
+## 3. LLM Proxy Architecture
+
+### PoC (current — monorepo, same process)
+
+`ClaudeLLMWrapper` is instantiated once in `main.py` and injected into both Agent Core and
+Knowledge Engine at startup. Both share the same Python object in memory.
+
+```
+main.py
+├── llm = ClaudeLLMWrapper(config)
+├── agent_core = AgentCore(..., llm_wrapper=llm, ...)
+└── ke = KnowledgeEngine(config, llm=llm)     ← same object, zero network overhead
+```
+
+### Production (separate services)
+
+When KE becomes its own deployed service, `ClaudeLLMWrapper` cannot cross a network boundary.
+
+Agent Core exposes an internal HTTP endpoint:
+```
+POST /internal/llm/call
+Body:     { "messages": [...], "tools": [...], "system": "", "model_override": "" }
+Response: { "content": "", "stop_reason": "", "tool_calls": [...] }
+```
+
+KE uses `HttpLLMWrapper(LLMWrapperBase)` — same interface, backed by an HTTP call:
+
+```
+KE service  →  POST /internal/llm/call  →  Agent Core  →  Anthropic API
+```
+
+**KE code changes zero** — it still calls `self._llm.call(...)`. Only the injected object changes.
+`HttpLLMWrapper` lives at `knowledge_engine/src/llm_proxy_client.py`.
+
+---
+
+## 4. The 5 Internal Blocks
 
 Knowledge Engine processes every user message through 5 blocks in a fixed order.
 Each block enriches a shared `KEContext` object. The final prompt is assembled after all blocks complete.
@@ -87,7 +137,7 @@ Block order is enforced by the engine regardless of declaration order in YAML.
 
 ---
 
-## 4. KEContext — Shared Data Object
+## 5. KEContext — Shared Data Object
 
 All 5 blocks read from and write to a single `KEContext` dataclass.
 It is created at the start of `assemble_prompt()` and passed through each block in sequence.
@@ -113,7 +163,7 @@ Agent Core only receives the final `list[dict]` return value.
 
 ---
 
-## 5. Block Specifications
+## 6. Block Specifications
 
 ---
 
@@ -126,9 +176,9 @@ Agent Core only receives the final `list[dict]` return value.
 KKB users speak Hindi, Hinglish (mixed Hindi-English), Kannada, and Roman-script Hindi.
 
 **How it works (PoC):**
-- Provider `llm_native`: single `llm.call()` using `model_override` pointing to the NLU model from YAML.
-  Prompt asks the model to detect language, transliterate Roman-script Hindi to Devanagari concepts,
-  and return normalised text.
+- Provider `llm_native`: single `self._llm.call()` using `model_override` pointing to the NLU model
+  from YAML. Prompt asks the model to detect language, transliterate Roman-script Hindi to Devanagari
+  concepts, and return normalised text.
 - Provider `bhashini`: stub — raises `NotImplementedError` with a clear message. Real Bhashini API
   integration is post-PoC.
 - Provider is read from `knowledge.blocks.language_normalisation.provider` in YAML.
@@ -173,7 +223,7 @@ knowledge:
 This drives what RAG retrieves (Block 4) and what tool the LLM is likely to call.
 
 **How it works (PoC):**
-Single `llm.call()` using `model_override` pointing to the NLU model from YAML.
+Single `self._llm.call()` using `model_override` pointing to the NLU model from YAML.
 Uses a structured output prompt that returns JSON:
 ```json
 {
@@ -317,7 +367,7 @@ This is the core block — it provides the grounding context the LLM uses to ans
 | Mode | When | How invoked |
 |---|---|---|
 | `ingest()` | Once offline, before first run | `python -m knowledge_engine.scripts.ingest` |
-| `process()` | Every turn at runtime | Called by engine via `block.process(context)` |
+| `process()` | Every turn at runtime | Called by engine via `block.process(context, llm, config)` |
 
 **Vector DB:** ChromaDB (local, in-process for PoC — no separate server).
 Collection name: `kkb_knowledge` (from YAML config).
@@ -417,14 +467,14 @@ receiving photos) would set `enabled: true`.
 
 **Supported in PoC:**
 - PDF → extract text using PyMuPDF (`fitz`), append to `context.raw_input`
-- Image → base64 encode, call Claude vision via `llm.call()` with vision prompt, append description
+- Image → base64 encode, call Claude vision via `self._llm.call()` with vision prompt, append description
 - Audio → stub: logs that ASR pipeline is not in scope, returns context unchanged
 
 **Writes to KEContext:**
 - `context.raw_input` — appended with extracted text/description
 
 **DB calls:** None
-**LLM calls:** Image only — `llm.call()` with `model_override` pointing to vision-capable model from YAML.
+**LLM calls:** Image only — `self._llm.call()` with `model_override` pointing to vision-capable model from YAML.
 
 **YAML config section:**
 ```yaml
@@ -440,23 +490,33 @@ knowledge:
 
 **Tests to write (`test_multimodal_input_handler.py`):**
 - PDF extraction: 1-page test PDF → `context.raw_input` contains extracted text
-- Image description: mock `llm.call()` → description appended to context
+- Image description: mock `self._llm.call()` → description appended to context
 - Audio input: returns context unchanged, logs stub message
 - `enabled: false`: block is skipped by engine, context unchanged
 - File exceeds `max_file_size_mb`: logs error, returns context unchanged
 
 ---
 
-## 6. KnowledgeEngine Orchestrator
+## 7. KnowledgeEngine Orchestrator
 
 **File:** `knowledge_engine/src/engine.py`
 **Class:** `KnowledgeEngine(KnowledgeEngineBase)`
 
 **Responsibilities:**
-1. Instantiate all enabled blocks from YAML config at construction time
-2. Run blocks in fixed logical order on every `assemble_prompt()` call
-3. Build the final `messages` list from the enriched `KEContext`
-4. Return the complete `messages` list to Agent Core
+1. Accept `llm: LLMWrapperBase` at construction and store as `self._llm`
+2. Instantiate all enabled blocks from YAML config at construction time
+3. Run blocks in fixed logical order on every `assemble_prompt()` call
+4. Build the final `messages` list from the enriched `KEContext`
+5. Return the complete `messages` list to Agent Core
+
+### Constructor
+
+```python
+def __init__(self, config: dict, llm: LLMWrapperBase) -> None:
+    self._config = config
+    self._llm = llm          # LLMWrapperBase — ClaudeLLMWrapper (PoC) or HttpLLMWrapper (prod)
+    self._enabled_blocks = self._init_blocks()
+```
 
 ### Block Instantiation
 Blocks are instantiated once at startup. YAML config has a per-block `enabled` flag.
@@ -501,7 +561,7 @@ After all blocks run, `assemble_prompt()` builds the messages list in this exact
 ### `assemble_prompt()` flow:
 
 ```python
-def assemble_prompt(self, session_id, user_message, session_state, llm) -> list[dict]:
+def assemble_prompt(self, session_id, user_message, session_state) -> list[dict]:
     if not user_message:
         return []
 
@@ -520,14 +580,14 @@ def assemble_prompt(self, session_id, user_message, session_state, llm) -> list[
     )
 
     for block in self._enabled_blocks:   # in fixed order
-        context = block.process(context, llm, self._config)
+        context = block.process(context, self._llm, self._config)
 
     return self._build_messages(context)
 ```
 
 ---
 
-## 7. KnowledgeBlock Base Class
+## 8. KnowledgeBlock Base Class
 
 **File:** `knowledge_engine/src/base.py`
 
@@ -550,15 +610,61 @@ class KnowledgeBlock(ABC):
         """
 ```
 
+The `llm` parameter received here is `self._llm` from the engine — either `ClaudeLLMWrapper`
+(PoC) or `HttpLLMWrapper` (production). Blocks use it the same way regardless.
+
 ---
 
-## 8. File Structure
+## 9. HttpLLMWrapper — Production LLM Proxy Client
+
+**File:** `knowledge_engine/src/llm_proxy_client.py`
+**Class:** `HttpLLMWrapper(LLMWrapperBase)`
+
+> **PoC status:** Not needed for PoC. In PoC, `main.py` injects `ClaudeLLMWrapper` directly.
+> Implement this when KE becomes a separate deployed service.
+
+When KE runs as a separate service, it uses `HttpLLMWrapper` instead of `ClaudeLLMWrapper`.
+Same `LLMWrapperBase` interface — just backed by an HTTP call to Agent Core's proxy endpoint.
+
+```python
+class HttpLLMWrapper(LLMWrapperBase):
+
+    def __init__(self, proxy_url: str, timeout_ms: int) -> None:
+        self._proxy_url = proxy_url      # e.g. "http://agent-core:8000/internal/llm/call"
+        self._timeout_s = timeout_ms / 1000
+
+    def call(self, messages, tools=None, system="", model_override=None) -> LLMResponse:
+        payload = {
+            "messages": messages,
+            "tools": tools or [],
+            "system": system,
+            "model_override": model_override,
+        }
+        response = httpx.post(self._proxy_url, json=payload, timeout=self._timeout_s)
+        response.raise_for_status()
+        return LLMResponse(**response.json())
+
+    def get_active_model(self) -> str:
+        return "proxy"   # model name is resolved by Agent Core
+```
+
+**Agent Core HTTP proxy endpoint** (to be added to Agent Core when services split):
+```
+POST /internal/llm/call
+```
+Receives the request body, calls `self._llm.call(...)`, returns `LLMResponse` as JSON.
+Agent Core retains the Anthropic API key — KE never holds it.
+
+---
+
+## 10. File Structure
 
 ```
 knowledge_engine/
 ├── src/
 │   ├── base.py                          # KnowledgeBlock ABC + KEContext dataclass
 │   ├── engine.py                        # KnowledgeEngine(KnowledgeEngineBase) — orchestrator
+│   ├── llm_proxy_client.py              # HttpLLMWrapper — production only, not needed for PoC
 │   └── blocks/
 │       ├── language_normalisation.py    # Block 1 — LLM call (Haiku)
 │       ├── nlu_processor.py             # Block 2 — LLM call (Haiku) + JSON parse
@@ -584,7 +690,7 @@ knowledge_engine/
 
 ---
 
-## 9. Dependencies
+## 11. Dependencies
 
 ```
 chromadb          >=0.4.0     # local vector DB, no server needed
@@ -593,14 +699,15 @@ openai            >=1.0.0     # for text-embedding-3-small
 pymupdf (fitz)                # PDF text extraction (multimodal block)
 pypdf2                        # fallback PDF extraction
 pydantic          >=2.0.0     # config validation
+httpx             >=0.27.0    # used by HttpLLMWrapper (production only)
 ```
 
 > **Do not add `anthropic` as a dependency of `knowledge_engine/`.** The `llm` object is
-> passed in from Agent Core. Knowledge Engine never imports or instantiates an Anthropic client.
+> injected from outside. Knowledge Engine never imports or instantiates an Anthropic client.
 
 ---
 
-## 10. YAML Config — Full Knowledge Section (KKB)
+## 12. YAML Config — Full Knowledge Section (KKB)
 
 ```yaml
 knowledge:
@@ -695,7 +802,7 @@ knowledge:
 
 ---
 
-## 11. Error Handling Rules
+## 13. Error Handling Rules
 
 These apply to every block and to the engine orchestrator:
 
@@ -713,7 +820,7 @@ These apply to every block and to the engine orchestrator:
 
 ---
 
-## 12. Testing Requirements
+## 14. Testing Requirements
 
 Minimum coverage: **≥ 70% line coverage** across `knowledge_engine/`.
 
@@ -740,7 +847,7 @@ Assert:
 
 ---
 
-## 13. Implementation Order
+## 15. Implementation Order
 
 Build in this order — each step is independently testable before the next:
 
