@@ -28,7 +28,9 @@ class LLMWrapperBase(ABC):
         Args:
             messages:       Conversation messages in Anthropic format.
             tools:          Tool definitions to inject. Pass empty list if no tools.
-            system:         System prompt string.
+            system:         System prompt string. Currently passed as "" because Knowledge
+                            Engine embeds the system prompt inside messages. When Knowledge
+                            Engine is fully implemented, pass the system prompt here instead.
             model_override: If provided, use this model instead of the active model.
                             Used internally for fallback switching.
 

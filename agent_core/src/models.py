@@ -42,7 +42,7 @@ class SessionState:
 
     session_id: str
     history: list[dict]               # [{"role": "user"|"assistant", "content": str}, ...]
-    confirmed_entities: dict[str, Any]
+    confirmed_entities: dict[str, Any] # Things we already know about the user 
     workflow_step: Optional[str]
     user_profile: dict[str, Any]
 
