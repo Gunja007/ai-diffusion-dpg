@@ -89,13 +89,33 @@ The standard processing flow for a single turn is as follows:
 9.  **State update (async):** Agent Core writes back to the Memory Layer.
 10. **Observability events (async):** Turn metadata and metrics are emitted to the Learning Layer.
 
-## 6. Domain Configuration Kit
-Deployment-specific behavior is controlled by configurations in five areas:
+## 6. Configuration Architecture
+
+The framework uses a **two-level configuration model** that separates deployment-specific intelligence from service-level operational settings.
+
+### Level 1 — Domain Configuration Kit (Deployment-level)
+A single YAML file per deployment that configures all 7 DPGs for a specific domain. This is the contract between the deployer and the framework — no source code changes required to deploy to a new domain.
+
 1.  **Knowledge Corpus:** Configures source documents, domain glossaries, and chunking strategy for retrieval.
 2.  **Connectors & Data Sources:** Declares external systems with endpoints, authentication, and fallback behaviors.
 3.  **Conversation Design:** Defines the agent's persona, behavior rules, and multi-step workflows.
 4.  **Trust & Policy:** Specifies domain-specific safety rules, escalation triggers, and topic firewalls.
 5.  **Success Criteria & Evaluation Rules:** Defines the metrics used to measure deployment quality and outcomes.
+
+### Level 2 — Per-DPG Service Config (Service-level)
+Each DPG maintains its own `config.yaml` for **operational settings that belong to the service itself** — not to any specific deployment. These stay constant across domains but may differ between environments (staging vs production).
+
+| DPG | Service Config Controls |
+|---|---|
+| **Agent Core** | LLM model selection (primary/fallback), timeout, retry attempts, max tool rounds, fallback messages |
+| **Knowledge Engine** | Embedding model, chunk size, retrieval top-k, NLU confidence thresholds |
+| **Memory Layer** | TTL for session state, max history length, persistence backend settings |
+| **Trust Layer** | Rule evaluation order, ML model thresholds, escalation sensitivity |
+| **Action Gateway** | Connector timeout, retry policy, circuit breaker settings |
+| **Reach Layer** | Channel adapter settings, handoff timeout, max message length |
+| **Learning Layer** | Emit batch size, flush interval, log retention settings |
+
+**Rule:** Domain Configuration Kit overrides service config where there is overlap. Service config provides defaults; the Domain Kit provides deployment-specific values.
 
 ## 7. Connector Model
 The framework interacts with external systems using a unified connector pattern:

@@ -1,0 +1,100 @@
+# agent_core/config/config.yaml
+#
+# Service-level configuration for the Agent Core DPG.
+# Controls LLM model selection, latency budget, retry behaviour,
+# tool execution limits, and user-facing fallback messages.
+#
+# This file is loaded once at startup. No values here are hardcoded in source.
+# For deployment-specific domain knowledge, persona, connectors, and trust
+# rules — see the Domain Configuration Kit (domain_config/).
+
+# ---------------------------------------------------------------------------
+# LLM Model Configuration
+# ---------------------------------------------------------------------------
+agent:
+  # Primary model used for all LLM calls under normal conditions.
+  # Must be a valid Anthropic model ID.
+  primary_model: claude-sonnet-4-6
+
+  # Fallback model used when the primary model exhausts all retry attempts.
+  # Typically a faster, lower-latency model to stay within the latency budget.
+  fallback_model: claude-haiku-4-5-20251001
+
+  # Per-request timeout in milliseconds.
+  # Every anthropic.messages.create() call uses this value explicitly.
+  # Target latency budget is 800–1200ms per turn.
+  timeout_ms: 10000
+
+  # Number of retry attempts before switching to the fallback model.
+  # Retries apply only to transient failures (rate limits, timeouts).
+  # Exponential backoff: attempt 1 at 0ms, attempt 2 at 500ms, attempt 3 at 1000ms.
+  retry_attempts: 2
+
+  # Maximum tool → LLM cycles allowed per turn.
+  # Set to 1 for PoC (single tool call per turn).
+  # Increase for multi-step tool chains without code changes.
+  max_tool_rounds: 1
+
+# ---------------------------------------------------------------------------
+# Conversation Behaviour
+# ---------------------------------------------------------------------------
+conversation:
+  # Maximum number of turns stored in session history.
+  # Older turns are trimmed to keep prompt size within token limits.
+  max_turns: 20
+
+  # Message returned to the user when their input is blocked by the Trust Layer.
+  blocked_message: "I'm unable to help with that request."
+
+  # Message returned to the user when their input triggers escalation to a human agent.
+  escalation_message: "I'm connecting you to a human agent who can better assist you."
+
+  # Message returned to the user when the LLM output is blocked by the Trust Layer.
+  # The original LLM response is discarded and this message is delivered instead.
+  output_blocked_message: >
+    I wasn't able to produce a safe response.
+    Please try rephrasing your question.
+
+# ---------------------------------------------------------------------------
+# Connectors
+# ---------------------------------------------------------------------------
+# Declare the external connectors this agent is permitted to use.
+# Each connector entry is injected into the LLM as a tool definition.
+# Connector types:
+#   read     — query-only, no consent required
+#   write    — action on external system, requires explicit user consent
+#   identity — identity verification, requires explicit user consent
+#
+# For PoC, connectors are empty — Action Gateway stub returns synthetic data.
+# Populate these when integrating real external systems.
+
+connectors:
+  read: []
+    # Example:
+    # - name: search_records
+    #   description: Search for records matching a query
+    #   endpoint: https://api.example.com/search
+    #   parameters:
+    #     query:
+    #       type: string
+    #       description: The search term
+
+  write: []
+    # Example:
+    # - name: submit_application
+    #   description: Submit a completed application form
+    #   endpoint: https://api.example.com/applications
+    #   parameters:
+    #     application_id:
+    #       type: string
+    #       description: The application to submit
+
+  identity: []
+    # Example:
+    # - name: verify_otp
+    #   description: Verify a one-time password sent to the user
+    #   endpoint: https://api.example.com/otp/verify
+    #   parameters:
+    #     otp:
+    #       type: string
+    #       description: The OTP entered by the user
