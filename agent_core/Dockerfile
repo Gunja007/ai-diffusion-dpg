@@ -3,8 +3,6 @@
 # =============================================================================
 # Stage 1 (builder): install dependencies into an isolated prefix.
 # Stage 2 (runtime): copy only the installed packages and source — no build tools.
-#
-# NOTE: main.py is not yet implemented. Update CMD once the entrypoint is added.
 # =============================================================================
 
 # -----------------------------------------------------------------------------
@@ -36,8 +34,9 @@ WORKDIR /app
 # Copy installed packages from builder
 COPY --from=builder /install /usr/local
 
-# Copy application source and config
+# Copy application source, entrypoint, and config
 COPY src/ ./src/
+COPY main.py ./
 COPY config/ ./config/
 
 # Ownership
@@ -50,6 +49,4 @@ USER agentcore
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 
-# TODO: replace with actual entrypoint once main.py is implemented
-# CMD ["python", "-m", "src.main"]
-CMD ["python", "-c", "print('Agent Core — entrypoint not yet wired. Implement main.py.')"]
+CMD ["python", "main.py"]

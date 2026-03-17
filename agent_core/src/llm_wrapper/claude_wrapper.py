@@ -171,6 +171,23 @@ class ClaudeLLMWrapper(LLMWrapperBase):
                 )
                 return LLMResponse(content=None, stop_reason="error")
 
+            except Exception as e:
+                # Catches SDK errors raised before the HTTP request fires —
+                # e.g. TypeError from missing API key during header validation.
+                # These are non-retryable configuration errors.
+                logger.error(
+                    "llm_wrapper.unexpected_error",
+                    extra={
+                        "operation": "llm_wrapper.call",
+                        "status": "failure",
+                        "model": model,
+                        "attempt": attempt + 1,
+                        "error": f"{type(e).__name__}: {e}",
+                        "latency_ms": int((time.time() - start) * 1000),
+                    },
+                )
+                return LLMResponse(content=None, stop_reason="error")
+
         logger.error(
             "llm_wrapper.exhausted",
             extra={

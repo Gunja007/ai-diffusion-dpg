@@ -225,3 +225,19 @@ def test_non_retryable_api_error_returns_error_immediately(mock_anthropic_cls):
 
     assert response.stop_reason == "error"
     assert mock_client.messages.create.call_count == 1
+
+
+@patch("src.llm_wrapper.claude_wrapper.anthropic.Anthropic")
+def test_missing_api_key_returns_error_not_raises(mock_anthropic_cls):
+    """TypeError from missing API key must return stop_reason=error, not crash the server."""
+    mock_client = MagicMock()
+    mock_anthropic_cls.return_value = mock_client
+    mock_client.messages.create.side_effect = TypeError(
+        "Could not resolve authentication method. Expected either api_key or auth_token"
+    )
+
+    wrapper = ClaudeLLMWrapper(VALID_CONFIG)
+    response = wrapper.call(messages=MESSAGES, tools=[], system=SYSTEM)
+
+    assert response.stop_reason == "error"
+    assert response.content is None

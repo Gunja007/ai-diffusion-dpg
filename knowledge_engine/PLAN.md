@@ -61,14 +61,10 @@ this method with the exact same signature.
 
 Knowledge Engine **must not** import `anthropic` directly or instantiate any Anthropic client.
 
-The LLM client is injected at **construction time** as `LLMWrapperBase`:
+The LLM client is always `HttpLLMWrapper`, injected at **construction time**:
 
 ```python
-# PoC (monorepo — same process):
-ke = KnowledgeEngine(config, llm=ClaudeLLMWrapper(config))
-
-# Production (separate services):
-ke = KnowledgeEngine(config, llm=HttpLLMWrapper(proxy_url="http://agent-core/internal/llm/call"))
+ke = KnowledgeEngine(config, llm=HttpLLMWrapper(proxy_url=config["knowledge"]["llm_proxy_url"]))
 ```
 
 All internal LLM calls (NLU, language normalisation) use:
@@ -83,36 +79,34 @@ Sonnet model.
 
 ## 3. LLM Proxy Architecture
 
-### PoC (current — monorepo, same process)
+KE and Agent Core always run as **separate services** — even when developed in the same repo.
+KE never holds an Anthropic API key and never calls the Anthropic API directly.
 
-`ClaudeLLMWrapper` is instantiated once in `main.py` and injected into both Agent Core and
-Knowledge Engine at startup. Both share the same Python object in memory.
-
-```
-main.py
-├── llm = ClaudeLLMWrapper(config)
-├── agent_core = AgentCore(..., llm_wrapper=llm, ...)
-└── ke = KnowledgeEngine(config, llm=llm)     ← same object, zero network overhead
-```
-
-### Production (separate services)
-
-When KE becomes its own deployed service, `ClaudeLLMWrapper` cannot cross a network boundary.
-
-Agent Core exposes an internal HTTP endpoint:
+Agent Core exposes an internal HTTP endpoint that KE calls for all LLM work:
 ```
 POST /internal/llm/call
 Body:     { "messages": [...], "tools": [...], "system": "", "model_override": "" }
 Response: { "content": "", "stop_reason": "", "tool_calls": [...] }
 ```
 
-KE uses `HttpLLMWrapper(LLMWrapperBase)` — same interface, backed by an HTTP call:
-
 ```
 KE service  →  POST /internal/llm/call  →  Agent Core  →  Anthropic API
 ```
 
-**KE code changes zero** — it still calls `self._llm.call(...)`. Only the injected object changes.
+KE uses `HttpLLMWrapper(LLMWrapperBase)` which makes this HTTP call.
+The proxy URL comes from YAML config — changing from local dev to production is a config change only,
+zero code changes:
+
+```yaml
+# Local dev:
+knowledge:
+  llm_proxy_url: http://localhost:8000/internal/llm/call
+
+# Production:
+knowledge:
+  llm_proxy_url: http://agent-core:8000/internal/llm/call
+```
+
 `HttpLLMWrapper` lives at `knowledge_engine/src/llm_proxy_client.py`.
 
 ---
@@ -615,16 +609,13 @@ The `llm` parameter received here is `self._llm` from the engine — either `Cla
 
 ---
 
-## 9. HttpLLMWrapper — Production LLM Proxy Client
+## 9. HttpLLMWrapper — LLM Proxy Client
 
 **File:** `knowledge_engine/src/llm_proxy_client.py`
 **Class:** `HttpLLMWrapper(LLMWrapperBase)`
 
-> **PoC status:** Not needed for PoC. In PoC, `main.py` injects `ClaudeLLMWrapper` directly.
-> Implement this when KE becomes a separate deployed service.
-
-When KE runs as a separate service, it uses `HttpLLMWrapper` instead of `ClaudeLLMWrapper`.
-Same `LLMWrapperBase` interface — just backed by an HTTP call to Agent Core's proxy endpoint.
+`HttpLLMWrapper` is the **only** LLM client used by Knowledge Engine — in local dev and in production.
+Same `LLMWrapperBase` interface — backed by an HTTP call to Agent Core's `/internal/llm/call` endpoint.
 
 ```python
 class HttpLLMWrapper(LLMWrapperBase):
@@ -648,12 +639,14 @@ class HttpLLMWrapper(LLMWrapperBase):
         return "proxy"   # model name is resolved by Agent Core
 ```
 
-**Agent Core HTTP proxy endpoint** (to be added to Agent Core when services split):
+**Agent Core HTTP proxy endpoint** (must be implemented in Agent Core before KE can run):
 ```
 POST /internal/llm/call
 ```
 Receives the request body, calls `self._llm.call(...)`, returns `LLMResponse` as JSON.
 Agent Core retains the Anthropic API key — KE never holds it.
+
+> Implementing this endpoint in Agent Core is a prerequisite for running KE end-to-end.
 
 ---
 
@@ -711,6 +704,11 @@ httpx             >=0.27.0    # used by HttpLLMWrapper (production only)
 
 ```yaml
 knowledge:
+  # URL of Agent Core's internal LLM proxy endpoint.
+  # KE calls this for all internal LLM work (NLU, language normalisation, image description).
+  # Change this value to switch between environments — zero code changes required.
+  llm_proxy_url: http://localhost:8000/internal/llm/call
+
   blocks:
     language_normalisation:
       enabled: true

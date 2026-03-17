@@ -31,9 +31,9 @@ class KnowledgeEngineBase(ABC):
 
         The LLM client used by Knowledge Engine for internal calls (NLU, language
         normalisation) is injected at construction time — not passed per call.
-        In PoC (monorepo): KnowledgeEngine receives a ClaudeLLMWrapper at startup.
-        In production (separate services): KnowledgeEngine receives an HttpLLMWrapper
-        that calls Agent Core's POST /internal/llm/call proxy endpoint.
+        KnowledgeEngine always receives an HttpLLMWrapper that calls Agent Core's
+        POST /internal/llm/call proxy endpoint. The URL comes from YAML config so
+        switching environments requires no code changes.
 
         Returns an empty list only if user_message is empty — never raises.
         """
