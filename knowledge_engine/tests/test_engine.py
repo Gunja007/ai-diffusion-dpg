@@ -133,23 +133,24 @@ def test_init_llm_optional():
 
 def test_empty_user_message_returns_empty_list():
     engine = KnowledgeEngine(config=CONFIG)
-    result = engine.assemble_prompt(
+    messages, system = engine.assemble_prompt(
         session_id="sess1",
         user_message="",
         session_state=make_session_state(),
     )
-    assert result == []
+    assert messages == []
+    assert system == ""
 
 
 def test_whitespace_only_message_is_processed():
     """Whitespace is truthy — engine processes it and returns messages."""
     engine = KnowledgeEngine(config=CONFIG)
-    result = engine.assemble_prompt(
+    messages, system = engine.assemble_prompt(
         session_id="sess1",
         user_message="   ",
         session_state=make_session_state(),
     )
-    assert isinstance(result, list)
+    assert isinstance(messages, list)
 
 
 def test_none_session_id_raises():
@@ -169,7 +170,7 @@ def test_none_session_id_raises():
 
 def test_nlu_params_pre_populate_context(engine_with_mock_kb):
     """NLU results from Agent Core should appear in the assembled messages."""
-    result = engine_with_mock_kb.assemble_prompt(
+    messages, system = engine_with_mock_kb.assemble_prompt(
         session_id="test-session",
         user_message="kaam chahiye Hubli mein",
         session_state=make_session_state(),
@@ -180,8 +181,8 @@ def test_nlu_params_pre_populate_context(engine_with_mock_kb):
         sentiment="neutral",
         confidence=0.92,
     )
-    assert isinstance(result, list)
-    assert len(result) > 0
+    assert isinstance(messages, list)
+    assert len(messages) > 0
 
 
 # ---------------------------------------------------------------------------
@@ -190,63 +191,64 @@ def test_nlu_params_pre_populate_context(engine_with_mock_kb):
 
 
 def test_assemble_prompt_returns_list_of_dicts(engine_with_mock_kb):
-    result = engine_with_mock_kb.assemble_prompt(
+    messages, system = engine_with_mock_kb.assemble_prompt(
         session_id="test-session",
         user_message="kaam chahiye",
         session_state=make_session_state(),
     )
-    assert isinstance(result, list)
-    assert all(isinstance(m, dict) for m in result)
+    assert isinstance(messages, list)
+    assert all(isinstance(m, dict) for m in messages)
+    assert isinstance(system, str)
 
 
 def test_messages_have_role_and_content_keys(engine_with_mock_kb):
-    result = engine_with_mock_kb.assemble_prompt(
+    messages, system = engine_with_mock_kb.assemble_prompt(
         session_id="test-session",
         user_message="kaam chahiye",
         session_state=make_session_state(),
     )
-    for msg in result:
+    for msg in messages:
         assert "role" in msg
         assert "content" in msg
 
 
 def test_last_message_is_user_input(engine_with_mock_kb):
-    result = engine_with_mock_kb.assemble_prompt(
+    messages, system = engine_with_mock_kb.assemble_prompt(
         session_id="test-session",
         user_message="electrician kaam chahiye Hubli mein",
         session_state=make_session_state(),
     )
-    assert result[-1]["role"] == "user"
-    assert result[-1]["content"] == "electrician kaam chahiye Hubli mein"
+    assert messages[-1]["role"] == "user"
+    assert "electrician kaam chahiye Hubli mein" in messages[-1]["content"]
 
 
-def test_persona_text_in_first_message(engine_with_mock_kb):
-    result = engine_with_mock_kb.assemble_prompt(
+def test_persona_text_in_system_prompt(engine_with_mock_kb):
+    """Persona is now in the system prompt string, not in the messages list."""
+    messages, system = engine_with_mock_kb.assemble_prompt(
         session_id="test-session",
         user_message="hello",
         session_state=make_session_state(),
     )
-    first_content = result[0]["content"]
-    assert "Kaam Ki Baat" in first_content
+    assert "Kaam Ki Baat" in system
 
 
 def test_rag_chunks_in_messages(engine_with_mock_kb):
-    result = engine_with_mock_kb.assemble_prompt(
+    messages, system = engine_with_mock_kb.assemble_prompt(
         session_id="test-session",
         user_message="electrician kaam",
         session_state=make_session_state(),
     )
-    combined = " ".join(m["content"] for m in result)
+    combined = " ".join(m["content"] for m in messages)
     assert "Electrician jobs available" in combined
 
 
 def test_always_include_chunks_in_messages(engine_with_mock_kb):
-    result = engine_with_mock_kb.assemble_prompt(
+    messages, system = engine_with_mock_kb.assemble_prompt(
         session_id="test-session",
         user_message="kaam chahiye",
         session_state=make_session_state(),
     )
-    combined = " ".join(m["content"] for m in result)
+    combined = " ".join(m["content"] for m in messages)
     assert "Market truth" in combined
 
 
@@ -255,26 +257,26 @@ def test_history_injected_into_messages(engine_with_mock_kb):
         {"role": "user", "content": "kaam chahiye"},
         {"role": "assistant", "content": "Hubli mein ITI centres hain."},
     ]
-    result = engine_with_mock_kb.assemble_prompt(
+    messages, system = engine_with_mock_kb.assemble_prompt(
         session_id="test-session",
         user_message="aur batao",
         session_state=make_session_state(history=history),
     )
-    contents = [m["content"] for m in result]
+    contents = [m["content"] for m in messages]
     assert "kaam chahiye" in contents
     assert "Hubli mein ITI centres hain." in contents
 
 
 def test_message_roles_alternate(engine_with_mock_kb):
     """Messages must alternate user/assistant (Anthropic API requirement)."""
-    result = engine_with_mock_kb.assemble_prompt(
+    messages, system = engine_with_mock_kb.assemble_prompt(
         session_id="test-session",
         user_message="hello",
         session_state=make_session_state(),
     )
-    for i in range(len(result) - 1):
-        current_role = result[i]["role"]
-        next_role = result[i + 1]["role"]
+    for i in range(len(messages) - 1):
+        current_role = messages[i]["role"]
+        next_role = messages[i + 1]["role"]
         assert current_role != next_role, (
             f"Consecutive messages at positions {i} and {i+1} both have role '{current_role}'"
         )
@@ -300,14 +302,14 @@ def test_block_exception_does_not_crash_engine():
             engine._blocks[i] = mock_kb
             break
 
-    result = engine.assemble_prompt(
+    messages, system = engine.assemble_prompt(
         session_id="test-session",
         user_message="kaam chahiye",
         session_state=make_session_state(),
     )
 
-    assert isinstance(result, list)
-    assert len(result) > 0
+    assert isinstance(messages, list)
+    assert len(messages) > 0
 
 
 # ---------------------------------------------------------------------------
@@ -326,7 +328,7 @@ def test_kkb_e2e_scenario(engine_with_mock_kb):
     - persona and context appear in first message
     """
     user_input = "ITI electrician Hubli mein kaam chahiye"
-    result = engine_with_mock_kb.assemble_prompt(
+    messages, system = engine_with_mock_kb.assemble_prompt(
         session_id="kkb-e2e",
         user_message=user_input,
         session_state=make_session_state(),
@@ -337,13 +339,12 @@ def test_kkb_e2e_scenario(engine_with_mock_kb):
         confidence=0.92,
     )
 
-    assert len(result) >= 3  # at minimum: system context, assistant ack, user message
-    assert result[-1]["role"] == "user"
-    assert result[-1]["content"] == user_input
+    assert len(messages) >= 1
+    assert messages[-1]["role"] == "user"
+    assert user_input in messages[-1]["content"]
 
-    first_content = result[0]["content"]
-    assert "Kaam Ki Baat" in first_content  # persona
-    assert "Market truth" in " ".join(m["content"] for m in result)  # always_include
+    assert "Kaam Ki Baat" in system  # persona in system prompt
+    assert "Market truth" in " ".join(m["content"] for m in messages)  # always_include
 
 
 def test_history_trimmed_to_max_turns(engine_with_mock_kb):
@@ -353,7 +354,7 @@ def test_history_trimmed_to_max_turns(engine_with_mock_kb):
         long_history.append({"role": "user", "content": f"turn {i}"})
         long_history.append({"role": "assistant", "content": f"response {i}"})
 
-    result = engine_with_mock_kb.assemble_prompt(
+    messages, system = engine_with_mock_kb.assemble_prompt(
         session_id="test-trim",
         user_message="kaam chahiye",
         session_state=make_session_state(history=long_history),
@@ -361,7 +362,7 @@ def test_history_trimmed_to_max_turns(engine_with_mock_kb):
 
     # Max 5 turns = 10 messages from history
     history_in_result = [
-        m for m in result
+        m for m in messages
         if m["content"].startswith("turn ") or m["content"].startswith("response ")
     ]
     assert len(history_in_result) <= 10

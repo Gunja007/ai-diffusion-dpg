@@ -116,7 +116,8 @@ def _make_agent(
     knowledge_engine = MagicMock()
     knowledge_engine.assemble_prompt.return_value = (
         prompt_messages if prompt_messages is not None
-        else [{"role": "user", "content": "Hello"}]
+        else [{"role": "user", "content": "Hello"}],
+        "",
     )
 
     llm = MagicMock()
