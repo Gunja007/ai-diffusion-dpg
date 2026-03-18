@@ -76,6 +76,7 @@ class AssemblePromptRequest(BaseModel):
 
 class AssemblePromptResponse(BaseModel):
     messages: list[dict]
+    system: str
     session_id: str
 
 
@@ -149,7 +150,7 @@ def create_app(ke: KnowledgeEngine, config: dict) -> FastAPI:
             user_profile=request.session_state.user_profile,
         )
 
-        messages = app.state.ke.assemble_prompt(
+        messages, system = app.state.ke.assemble_prompt(
             session_id=request.session_id,
             user_message=request.user_message,
             session_state=session_state,
@@ -173,6 +174,7 @@ def create_app(ke: KnowledgeEngine, config: dict) -> FastAPI:
 
         return AssemblePromptResponse(
             messages=messages,
+            system=system,
             session_id=request.session_id,
         )
 

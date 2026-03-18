@@ -28,7 +28,7 @@ connectors:
 
 ke_client:
   endpoint: "http://localhost:8001/assemble_prompt"
-  timeout_ms: 8000
+  timeout_ms: 30000
 
 memory_client:
   endpoint: "http://localhost:8002"

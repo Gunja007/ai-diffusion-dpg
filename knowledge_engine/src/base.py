@@ -173,16 +173,20 @@ class KnowledgeEngineBase(ABC):
         entities: Optional[dict] = None,
         sentiment: str = "neutral",
         confidence: float = 0.0,
-    ) -> list[dict]:
+    ) -> tuple[list[dict], str]:
         """
-        Build and return the complete messages list for the LLM call.
+        Build and return the messages list and system prompt for the LLM call.
 
         Agent Core runs Language Normalisation and NLU before calling this method
         and passes the results as parameters. KE uses these to drive Glossary
         normalisation and Static KB intent-based filtering, then assembles the
-        messages list from the enriched KEContext.
+        messages list and system prompt from the enriched KEContext.
 
         Returns:
-            list[dict]: Complete messages array in Anthropic format.
-            Empty list if user_message is empty string — never raises.
+            tuple[list[dict], str]:
+                - messages: conversation messages in Anthropic format (RAG context +
+                  history + current user message). Empty list if user_message is empty.
+                - system: system prompt string (persona + language instruction +
+                  guardrails). Empty string if no persona is configured.
+            Never raises.
         """

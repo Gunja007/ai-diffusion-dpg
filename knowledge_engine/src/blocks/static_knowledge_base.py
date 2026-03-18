@@ -57,8 +57,29 @@ class StaticKnowledgeBaseBlock(KnowledgeBlock):
     """
 
     def __init__(self) -> None:
-        self._collection = None  # lazily initialised at first process() call
+        self._collection = None
         self._embedding_fn = None
+
+    def warmup(self, block_cfg: dict) -> None:
+        """Pre-load the embedding model and open the ChromaDB collection at startup.
+        Prevents cold-start latency on the first real request."""
+        if not block_cfg.get("enabled", True):
+            return
+        try:
+            self._get_collection(block_cfg)
+            logger.info(
+                "static_kb.warmup_complete",
+                extra={"operation": "static_kb.warmup", "status": "success"},
+            )
+        except Exception as e:
+            logger.warning(
+                "static_kb.warmup_failed",
+                extra={
+                    "operation": "static_kb.warmup",
+                    "status": "failure",
+                    "error": f"{type(e).__name__}: {e}",
+                },
+            )
 
     def process(
         self,

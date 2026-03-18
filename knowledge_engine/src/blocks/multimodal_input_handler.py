@@ -82,7 +82,7 @@ class MultimodalInputHandlerBlock(KnowledgeBlock):
         supported_types = block_cfg.get("supported_types", ["pdf", "image"])
         audio_enabled = block_cfg.get("audio_enabled", False)
         max_file_size_mb = block_cfg.get("max_file_size_mb", 10)
-        image_model = block_cfg.get("image_model", "claude-sonnet-4-6")
+        image_model = block_cfg.get("image_model", "claude-haiku-4-5-20251001")
 
         # Look for file paths embedded in the raw_input
         # Convention: file references are passed as "FILE:<path>" tokens in context

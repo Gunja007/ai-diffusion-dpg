@@ -68,6 +68,7 @@ class KnowledgeEngine(KnowledgeEngineBase):
         self._config = config
         self._llm = llm
         self._blocks: list[KnowledgeBlock] = self._init_blocks()
+        self._warmup_blocks()
 
         logger.info(
             "knowledge_engine.init",
@@ -89,17 +90,21 @@ class KnowledgeEngine(KnowledgeEngineBase):
         entities: Optional[dict[str, Any]] = None,
         sentiment: str = "neutral",
         confidence: float = 0.0,
-    ) -> list[dict]:
+    ) -> tuple[list[dict], str]:
         """
-        Run Glossary, Static KB, and Multimodal blocks, then build the messages list.
+        Run Glossary, Static KB, and Multimodal blocks, then build messages and system prompt.
 
         Agent Core has already run Language Normalisation and NLU — their results
         are passed in as parameters and used to pre-populate KEContext so Glossary
         and Static KB can use them immediately.
 
         Returns:
-            list[dict]: Complete messages in Anthropic format.
-            Empty list if user_message is empty string — never raises.
+            tuple[list[dict], str]:
+                - messages: RAG context + history + current user message.
+                  Empty list if user_message is empty string.
+                - system: persona + language instruction + guardrails.
+                  Empty string if no persona configured.
+            Never raises.
         """
         if not user_message:
             logger.info(
@@ -110,7 +115,7 @@ class KnowledgeEngine(KnowledgeEngineBase):
                     "session_id": session_id,
                 },
             )
-            return []
+            return [], ""
 
         if session_id is None:
             raise ValueError("session_id must not be None")
@@ -148,7 +153,7 @@ class KnowledgeEngine(KnowledgeEngineBase):
                     },
                 )
 
-        # Build the final messages list from enriched context
+        system = self._build_system_prompt()
         messages = self._build_messages(context)
 
         logger.info(
@@ -164,7 +169,7 @@ class KnowledgeEngine(KnowledgeEngineBase):
             },
         )
 
-        return messages
+        return messages, system
 
     # ------------------------------------------------------------------
     # Private: block initialisation
@@ -178,75 +183,62 @@ class KnowledgeEngine(KnowledgeEngineBase):
         """
         return [cls() for _, cls in _BLOCK_REGISTRY]
 
+    def _warmup_blocks(self) -> None:
+        """Pre-warm blocks that have expensive cold-start initialisation (e.g. embedding model load)."""
+        block_cfg = (
+            self._config.get("knowledge", {})
+            .get("blocks", {})
+            .get("static_knowledge_base", {})
+        )
+        for block in self._blocks:
+            if hasattr(block, "warmup"):
+                block.warmup(block_cfg)
+
     # ------------------------------------------------------------------
     # Private: prompt assembly
     # ------------------------------------------------------------------
 
-    def _build_messages(self, context: KEContext) -> list[dict]:
+    def _build_system_prompt(self) -> str:
         """
-        Build the complete Anthropic messages array from the enriched KEContext.
+        Build the system prompt string: persona + language instruction + guardrails.
 
-        Message structure:
-        [1] System context message (role: "user"):
-              a. Persona block (from YAML conversation.persona.text)
-              b. Language instruction
-              c. Always-include chunks (e.g. market truth framing)
-              d. RAG-retrieved chunks (top-k by similarity)
-              e. Guardrail reminders
-        [2] Conversation history messages (last N turns from session_state.history)
-        [3] Current user message (role: "user", content: context.raw_input)
-
-        Note: Agent Core currently passes system="" to the LLM wrapper. The persona
-        and context are embedded in the first user message instead. When Agent Core
-        is updated to pass the system prompt directly, the persona block should be
-        moved to the `system` field.
+        This is passed to the LLM's `system` field — not embedded in the messages list.
+        Returns an empty string if no persona is configured.
         """
-        messages: list[dict] = []
-
-        # Build system context block (injected as first user message)
-        system_parts = []
-
         conversation_cfg = self._config.get("conversation", {})
-        persona_cfg = conversation_cfg.get("persona", {})
-        persona_text = persona_cfg.get("text", "").strip()
-        if persona_text:
-            system_parts.append(persona_text)
+        parts = []
 
-        # Language instruction
-        system_parts.append(
+        persona_text = conversation_cfg.get("persona", {}).get("text", "").strip()
+        if persona_text:
+            parts.append(persona_text)
+
+        parts.append(
             "Respond in the same language the user is using. "
             "If they mix Hindi and English (Hinglish), respond in Hinglish."
         )
 
-        # Always-include chunks (e.g. ONEST market truth framing)
-        if context.always_include_chunks:
-            system_parts.append("\n--- Always include context ---")
-            for chunk in context.always_include_chunks:
-                system_parts.append(chunk.get("text", ""))
-
-        # RAG-retrieved chunks
-        if context.retrieval_chunks:
-            system_parts.append("\n--- Relevant knowledge ---")
-            for chunk in context.retrieval_chunks:
-                system_parts.append(chunk.get("text", ""))
-
-        # Guardrail reminders
         guardrails = conversation_cfg.get("guardrail_reminders", [])
         if guardrails:
-            system_parts.append("\n--- Guidelines ---")
+            parts.append("\n--- Guidelines ---")
             for reminder in guardrails:
-                system_parts.append(f"- {reminder}")
+                parts.append(f"- {reminder}")
 
-        if system_parts:
-            messages.append({
-                "role": "user",
-                "content": "\n\n".join(system_parts),
-            })
-            # Add assistant acknowledgement turn to maintain valid alternating structure
-            messages.append({
-                "role": "assistant",
-                "content": "Understood. I'm ready to help.",
-            })
+        return "\n\n".join(parts)
+
+    def _build_messages(self, context: KEContext) -> list[dict]:
+        """
+        Build the Anthropic messages array from the enriched KEContext.
+
+        Message structure:
+        [1..N] Conversation history (last N turns from session_state.history)
+        [last] Current user message — with RAG context appended if any chunks exist
+
+        RAG chunks (always-include + retrieved) are appended to the current user
+        message so they appear as close as possible to the question they inform.
+        No fake assistant turn is needed because there is no standalone context
+        message at the start of the array.
+        """
+        messages: list[dict] = []
 
         # Conversation history (last N turns)
         max_turns = (
@@ -256,14 +248,25 @@ class KnowledgeEngine(KnowledgeEngineBase):
         )
         history = context.session_state.history
         if history:
-            # Take last max_turns * 2 messages (each turn = 1 user + 1 assistant)
             recent_history = history[-(max_turns * 2):]
             messages.extend(recent_history)
 
-        # Current user message
+        # Build the current user message content — raw input + RAG context appended
+        content_parts = [context.raw_input]
+
+        if context.always_include_chunks:
+            content_parts.append("\n--- Always include context ---")
+            for chunk in context.always_include_chunks:
+                content_parts.append(chunk.get("text", ""))
+
+        if context.retrieval_chunks:
+            content_parts.append("\n--- Relevant knowledge ---")
+            for chunk in context.retrieval_chunks:
+                content_parts.append(chunk.get("text", ""))
+
         messages.append({
             "role": "user",
-            "content": context.raw_input,
+            "content": "\n\n".join(content_parts),
         })
 
         return messages
