@@ -1,0 +1,10 @@
+# memory_layer/config/config.yaml — Memory Layer service configuration.
+# PoC stub uses in-process dict; these settings are for future real implementations.
+
+server:
+  host: "0.0.0.0"
+  port: 8002
+
+memory:
+  session_ttl_seconds: 3600   # 1 hour; stub holds sessions for process lifetime only
+  max_sessions: 1000          # soft cap; stub does not enforce — for real backend impl
