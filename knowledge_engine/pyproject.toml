@@ -1,0 +1,60 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "knowledge-engine-dpg"
+version = "0.1.0"
+description = "Knowledge Engine DPG — NLU, RAG, and prompt assembly for the AI Composition Framework"
+requires-python = ">=3.11"
+
+dependencies = [
+    "chromadb>=0.4.0",                   # local vector DB, no server needed
+    "langchain-text-splitters>=0.2.0",   # document chunking (semantic + recursive)
+    "openai>=1.0.0",                     # required only when embedding_provider=openai
+    "sentence-transformers>=2.6.0",      # required only when embedding_provider=sentence_transformers
+    "pymupdf>=1.23.0",                   # PDF text extraction (multimodal block)
+    "pyyaml>=6.0",                       # YAML config loading
+    "httpx>=0.27.0",                     # HttpLLMWrapper — HTTP calls to agent_core proxy
+    "fastapi>=0.111.0",                  # HTTP server (KE exposes /assemble_prompt + /health)
+    "uvicorn[standard]>=0.29.0",         # ASGI server
+    "python-dotenv>=1.0.0",              # loads .env at startup
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "pytest-mock>=3.0",
+    "httpx>=0.27.0",
+]
+
+# ---------------------------------------------------------------------------
+# Package discovery — src flat layout (mirrors agent_core convention)
+# ---------------------------------------------------------------------------
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*", "scripts*"]
+
+# ---------------------------------------------------------------------------
+# Pytest
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+python_classes = "Test*"
+python_functions = "test_*"
+
+# ---------------------------------------------------------------------------
+# Coverage
+# ---------------------------------------------------------------------------
+[tool.coverage.run]
+source = ["src"]
+omit = [
+    "*/tests/*",
+    "*/__init__.py",
+]
+
+[tool.coverage.report]
+fail_under = 70
+show_missing = true

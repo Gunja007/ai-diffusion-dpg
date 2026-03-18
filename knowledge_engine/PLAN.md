@@ -366,7 +366,18 @@ This is the core block — it provides the grounding context the LLM uses to ans
 **Vector DB:** ChromaDB (local, in-process for PoC — no separate server).
 Collection name: `kkb_knowledge` (from YAML config).
 
-**Embedding model:** `text-embedding-3-small` (OpenAI) — read from YAML config.
+**Embedding provider:** Configurable via YAML — two supported options:
+
+| Provider | YAML value | API Key Required | Quality for Hindi/Hinglish |
+|---|---|---|---|
+| OpenAI `text-embedding-3-small` | `openai` | `OPENAI_API_KEY` | Best — explicitly recommended in PoC plan for multilingual support |
+| `paraphrase-multilingual-MiniLM-L12-v2` | `sentence_transformers` | None (local) | Good — runs fully offline, no API cost |
+
+The provider and model name are both read from YAML config. Switching between them is a config-only change — zero code changes required.
+
+The original PoC plan (Task 1.2, page 7) states: *"Use Anthropic embeddings or OpenAI text-embedding-3-small. Get OPENAI_API_KEY if using OpenAI."* and the risk register (page 23) adds: *"If ChromaDB embedding quality is poor for Hindi text, switch to OpenAI text-embedding-3-small which has better multilingual support."*
+
+**Anthropic does not offer a public embeddings API** — the "Anthropic embeddings" option in the original doc is not usable. The two viable options are OpenAI (API, better quality) or sentence-transformers (local, no key needed).
 
 **Documents to ingest:**
 
@@ -409,7 +420,8 @@ knowledge:
       enabled: true
       vector_store: chromadb
       collection_name: kkb_knowledge
-      embedding_model: text-embedding-3-small
+      embedding_provider: sentence_transformers  # options: openai | sentence_transformers (default: sentence_transformers — no API key needed)
+      embedding_model: paraphrase-multilingual-MiniLM-L12-v2  # openai: text-embedding-3-small | st: paraphrase-multilingual-MiniLM-L12-v2
       top_k: 3
       similarity_threshold: 0.65
       sources:
@@ -652,13 +664,19 @@ Agent Core retains the Anthropic API key — KE never holds it.
 
 ## 10. File Structure
 
+Mirrors `agent_core/` layout exactly — same conventions, same tooling.
+
 ```
 knowledge_engine/
+├── config/
+│   └── config.yaml                      # service config loaded once at startup (see Section 12)
 ├── src/
+│   ├── __init__.py
 │   ├── base.py                          # KnowledgeBlock ABC + KEContext dataclass
 │   ├── engine.py                        # KnowledgeEngine(KnowledgeEngineBase) — orchestrator
-│   ├── llm_proxy_client.py              # HttpLLMWrapper — production only, not needed for PoC
+│   ├── llm_proxy_client.py              # HttpLLMWrapper — calls agent_core /internal/llm/call
 │   └── blocks/
+│       ├── __init__.py
 │       ├── language_normalisation.py    # Block 1 — LLM call (Haiku)
 │       ├── nlu_processor.py             # Block 2 — LLM call (Haiku) + JSON parse
 │       ├── glossary.py                  # Block 3 — YAML string matching, no LLM/DB
@@ -666,48 +684,112 @@ knowledge_engine/
 │       └── multimodal_input_handler.py  # Block 5 — PDF/image extraction
 ├── scripts/
 │   └── ingest.py                        # Offline: load documents into ChromaDB
-├── data/                                # KKB knowledge documents
+├── data/                                # KKB knowledge documents (not committed — gitignored)
 │   ├── labour_schemes.pdf
 │   ├── trade_descriptions.pdf
 │   ├── training_institutes.csv
 │   ├── bridge_income_options.pdf
 │   └── onest_market_truth_framing.md
-└── tests/
-    ├── test_engine.py                   # End-to-end chain test
-    ├── test_language_normalisation.py
-    ├── test_nlu_processor.py
-    ├── test_glossary.py
-    ├── test_static_knowledge_base.py
-    └── test_multimodal_input_handler.py
+├── tests/
+│   ├── __init__.py
+│   ├── test_engine.py                   # End-to-end chain test
+│   ├── test_language_normalisation.py
+│   ├── test_nlu_processor.py
+│   ├── test_glossary.py
+│   ├── test_static_knowledge_base.py
+│   ├── test_multimodal_input_handler.py
+│   └── test_llm_proxy_client.py
+├── main.py                              # startup entrypoint — loads config, wires KE, starts server
+├── pyproject.toml                       # package metadata + dependencies + pytest/coverage config
+├── Dockerfile                           # multi-stage build (mirrors agent_core/Dockerfile)
+└── .env.example                         # template — copy to .env; OPENAI_API_KEY only needed if embedding_provider=openai
 ```
 
 ---
 
 ## 11. Dependencies
 
-```
-chromadb          >=0.4.0     # local vector DB, no server needed
-langchain-text-splitters      # document chunking (semantic + recursive)
-openai            >=1.0.0     # for text-embedding-3-small
-pymupdf (fitz)                # PDF text extraction (multimodal block)
-pypdf2                        # fallback PDF extraction
-pydantic          >=2.0.0     # config validation
-httpx             >=0.27.0    # used by HttpLLMWrapper (production only)
+`pyproject.toml` for the `knowledge_engine/` package:
+
+```toml
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "knowledge-engine-dpg"
+version = "0.1.0"
+description = "Knowledge Engine DPG — NLU, RAG, and prompt assembly for the AI Composition Framework"
+requires-python = ">=3.11"
+
+dependencies = [
+    "chromadb>=0.4.0",                   # local vector DB, no server needed
+    "langchain-text-splitters>=0.2.0",   # document chunking (semantic + recursive)
+    "openai>=1.0.0",                     # required only when embedding_provider=openai
+    "sentence-transformers>=2.6.0",      # required only when embedding_provider=sentence_transformers
+    "pymupdf>=1.23.0",                   # PDF text extraction (multimodal block)
+    "pyyaml>=6.0",                       # YAML config loading
+    "httpx>=0.27.0",                     # HttpLLMWrapper — HTTP calls to agent_core proxy
+    "fastapi>=0.111.0",                  # HTTP server (KE exposes its own health endpoint)
+    "uvicorn[standard]>=0.29.0",         # ASGI server
+    "python-dotenv>=1.0.0",              # loads .env at startup
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "pytest-mock>=3.0",
+    "httpx>=0.27.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+python_classes = "Test*"
+python_functions = "test_*"
+
+[tool.coverage.run]
+source = ["src"]
+omit = ["*/tests/*", "*/__init__.py"]
+
+[tool.coverage.report]
+fail_under = 70
+show_missing = true
 ```
 
 > **Do not add `anthropic` as a dependency of `knowledge_engine/`.** The `llm` object is
 > injected from outside. Knowledge Engine never imports or instantiates an Anthropic client.
+>
+> **Secrets required depend on the embedding provider chosen in config:**
+> - `embedding_provider: openai` → `OPENAI_API_KEY` required in `.env`
+> - `embedding_provider: sentence_transformers` → no API key needed; model downloads locally on first run
+>
+> The `.env.example` documents both. The code must raise a clear `ValueError` at startup if
+> `embedding_provider: openai` is configured but `OPENAI_API_KEY` is not set.
 
 ---
 
-## 12. YAML Config — Full Knowledge Section (KKB)
+## 12. YAML Config — Full `config/config.yaml` (KKB)
+
+Secrets (`OPENAI_API_KEY`) are never stored here — use environment variables / `.env`.
+The embedding provider is the only choice that determines whether an API key is needed.
 
 ```yaml
+# knowledge_engine/config/config.yaml — service configuration loaded once at startup.
+# Secrets (OPENAI_API_KEY) are never stored here — use environment variables.
+# To run without an API key: set embedding_provider to sentence_transformers.
+
+server:
+  host: 0.0.0.0   # 0.0.0.0 for Docker/container; 127.0.0.1 for local-only
+  port: 8001       # different port from agent_core (8000)
+
 knowledge:
-  # URL of Agent Core's internal LLM proxy endpoint.
-  # KE calls this for all internal LLM work (NLU, language normalisation, image description).
-  # Change this value to switch between environments — zero code changes required.
-  llm_proxy_url: http://localhost:8000/internal/llm/call
+  llm_proxy_url: http://localhost:8000/internal/llm/call  # agent_core LLM proxy
 
   blocks:
     language_normalisation:
@@ -762,7 +844,8 @@ knowledge:
       enabled: true
       vector_store: chromadb
       collection_name: kkb_knowledge
-      embedding_model: text-embedding-3-small
+      embedding_provider: sentence_transformers  # options: openai | sentence_transformers (default: sentence_transformers — no API key needed)
+      embedding_model: paraphrase-multilingual-MiniLM-L12-v2  # openai: text-embedding-3-small | st: paraphrase-multilingual-MiniLM-L12-v2
       top_k: 3
       similarity_threshold: 0.65
       sources:
@@ -849,11 +932,13 @@ Assert:
 
 Build in this order — each step is independently testable before the next:
 
-1. `base.py` — `KnowledgeBlock` ABC + `KEContext` dataclass
-2. `blocks/glossary.py` — no LLM/DB, simplest block, validates the block pattern
-3. `blocks/nlu_processor.py` — LLM call + JSON parsing
-4. `blocks/language_normalisation.py` — LLM call
-5. `blocks/static_knowledge_base.py` — ChromaDB + ingestion script
-6. `blocks/multimodal_input_handler.py` — PDF/image extraction
-7. `engine.py` — wire all blocks, implement `assemble_prompt()`
-8. `tests/` — write all unit tests + end-to-end chain test
+0. **Project scaffold** — `pyproject.toml`, `config/config.yaml`, `main.py`, `Dockerfile`,
+   `.env.example`, `src/__init__.py`, `src/blocks/__init__.py`, `tests/__init__.py`
+1. `src/base.py` — `KnowledgeBlock` ABC + `KEContext` dataclass
+2. `src/llm_proxy_client.py` — `HttpLLMWrapper(LLMWrapperBase)` + `tests/test_llm_proxy_client.py`
+3. `src/blocks/glossary.py` — no LLM/DB, simplest block; validates the block pattern + `tests/test_glossary.py`
+4. `src/blocks/nlu_processor.py` — LLM call + JSON parsing + `tests/test_nlu_processor.py`
+5. `src/blocks/language_normalisation.py` — LLM call + `tests/test_language_normalisation.py`
+6. `src/blocks/static_knowledge_base.py` — ChromaDB + `scripts/ingest.py` + `tests/test_static_knowledge_base.py`
+7. `src/blocks/multimodal_input_handler.py` — PDF/image extraction + `tests/test_multimodal_input_handler.py`
+8. `src/engine.py` — wire all blocks, implement `assemble_prompt()` + `tests/test_engine.py`

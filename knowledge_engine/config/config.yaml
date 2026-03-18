@@ -1,0 +1,97 @@
+# knowledge_engine/config/config.yaml — service configuration loaded once at startup.
+# Secrets (OPENAI_API_KEY) are never stored here — use environment variables.
+# To run without an API key: set embedding_provider to sentence_transformers (the default).
+
+server:
+  host: 0.0.0.0   # 0.0.0.0 for Docker/container; 127.0.0.1 for local-only
+  port: 8001       # different port from agent_core (8000)
+
+knowledge:
+  # Language Normalisation and NLU Processor have been moved to Agent Core.
+  # KE runs only: Glossary → Static KB → Multimodal.
+  # NLU results (intent, entities, etc.) are passed in by Agent Core via /assemble_prompt.
+
+  conversation:
+    max_history_turns: 10   # number of prior turns injected into the prompt
+
+  blocks:
+    glossary:
+      enabled: true
+      mappings:
+        - colloquial: ["kaam chahiye", "naukri chahiye", "job chahiye"]
+          canonical: "market_truth_query"
+        - colloquial: ["ITI", "tradesman", "technician"]
+          canonical: "iti_graduate"
+        - colloquial: ["course", "training", "sikhai"]
+          canonical: "training_query"
+        - colloquial: ["apply kar do", "form bharo"]
+          canonical: "apply_now"
+        - colloquial: ["counsellor chahiye", "kisi se baat karni hai"]
+          canonical: "counsellor_request"
+        - colloquial: ["kitna milega", "salary kya hai", "pay kya hai"]
+          canonical: "pay_range_query"
+        - colloquial: ["electrician", "bijli wala"]
+          canonical: "trade:electrician"
+        - colloquial: ["fitter"]
+          canonical: "trade:fitter"
+        - colloquial: ["welder"]
+          canonical: "trade:welder"
+        - colloquial: ["PMKVY", "Pradhan Mantri Kaushal"]
+          canonical: "scheme:pmkvy"
+        - colloquial: ["Hubli", "Dharwad", "Belgaum"]
+          canonical: "location:karnataka_north"
+      apply_to: [normalised_input, entities]
+
+    static_knowledge_base:
+      enabled: true
+      vector_store: chromadb
+      collection_name: kkb_knowledge
+      chroma_persist_dir: ./data/chroma_db
+      embedding_provider: sentence_transformers  # options: openai | sentence_transformers
+      embedding_model: paraphrase-multilingual-MiniLM-L12-v2  # openai: text-embedding-3-small | st: paraphrase-multilingual-MiniLM-L12-v2
+      top_k: 3
+      similarity_threshold: 0.65
+      sources:
+        - path: ./data/labour_schemes.pdf
+          type: static
+          doc_type: scheme
+          refresh: manual
+        - path: ./data/trade_descriptions.pdf
+          type: static
+          doc_type: trade
+          refresh: annual
+        - path: ./data/training_institutes.csv
+          type: static
+          doc_type: institute
+          refresh: monthly
+        - path: ./data/bridge_income_options.pdf
+          type: static
+          doc_type: bridge_income
+          refresh: manual
+        - path: ./data/onest_market_truth_framing.md
+          type: always_include
+          doc_type: always_include
+          refresh: manual
+      metadata_filters:
+        use_location_filter: true
+        use_intent_filter: true
+
+    multimodal_input_handler:
+      enabled: false
+      supported_types: [pdf, image]
+      audio_enabled: false
+      image_model: claude-haiku-4-5-20251001  # PoC/dev: Haiku. Change to claude-sonnet-4-6 for prod.
+      max_file_size_mb: 10
+
+conversation:
+  persona:
+    text: |
+      You are Kaam Ki Baat, a labour advisory helpline assistant.
+      You help workers find jobs, learn about government schemes, and connect with training institutes.
+      Speak like a knowledgeable neighbour — informal, simple words, no jargon.
+      You speak in Hindi, Hinglish, Kannada, and English depending on what the user prefers.
+      If you do not know something, say so honestly.
+  guardrail_reminders:
+    - "Do not discuss topics unrelated to employment, skills, training, or government schemes."
+    - "Do not make promises about specific job placements or salary guarantees."
+    - "Always recommend consulting a human counsellor for complex legal or financial matters."
