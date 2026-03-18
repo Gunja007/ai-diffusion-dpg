@@ -1,0 +1,12 @@
+reach_layer:
+  cli:
+    prompt: "You: "
+    agent_prefix: "Agent: "
+
+server:
+  host: 0.0.0.0
+  port: 8005                              # reserved port for future Reach Layer HTTP adapter
+
+agent_core_client:
+  endpoint: "http://localhost:8000/process_turn"
+  timeout_s: 30.0
