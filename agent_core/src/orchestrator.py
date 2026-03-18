@@ -2,12 +2,15 @@
 agent_core/orchestrator.py
 
 Concrete implementation of AgentCoreBase.
-Wires all components and executes the 10-step turn sequence.
+Wires all components and executes the 12-step turn sequence.
 
 Design rules enforced here:
 - Trust Layer is called exactly twice per turn (input + output). Neither is skippable.
 - Agent Core holds zero session state between turns.
-- Steps 8-9 (memory write, learning emit) run in a daemon thread after TurnResult is returned.
+- Language Normalisation and NLU Processor run directly in Agent Core (steps 3-4)
+  using the primary LLM wrapper with a model_override to Haiku.
+- Early exit at step 5 if intent is "unknown" or confidence is below threshold.
+- Steps 11-12 (memory write, learning emit) run in a daemon thread after TurnResult is returned.
 - This is the only file that imports and coordinates all DPG interfaces together.
 """
 
@@ -25,10 +28,12 @@ from src.interfaces.learning_layer import LearningLayerBase
 from src.interfaces.memory_layer import MemoryLayerBase
 from src.interfaces.reach_layer import ReachLayerBase
 from src.interfaces.trust_layer import TrustLayerBase
+from src.language_normalisation import LanguageNormaliser
 from src.llm_wrapper.base import LLMWrapperBase
 from src.manager_agent import ManagerAgent
 from src.models import (
     LLMResponse,
+    NLUResult,
     SessionState,
     ToolCall,
     TrustCheckResult,
@@ -36,6 +41,7 @@ from src.models import (
     TurnInput,
     TurnResult,
 )
+from src.nlu_processor import NLUProcessor
 from src.tool_registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
@@ -83,6 +89,11 @@ class AgentCore(AgentCoreBase):
         self._manager_agent = manager_agent
         self._learning = learning
 
+        # Language Normalisation and NLU run directly in Agent Core.
+        # Stateless — instantiated once, reused across all sessions.
+        self._language_normaliser = LanguageNormaliser()
+        self._nlu_processor = NLUProcessor()
+
     # ------------------------------------------------------------------
     # Public interface — single entry point
     # ------------------------------------------------------------------
@@ -123,9 +134,45 @@ class AgentCore(AgentCoreBase):
         if trust_input.action == "escalate":
             return self._escalated_response(session_id, trust_input, start, trust_input)
 
-        # ── Step 3: Assemble prompt ───────────────────────────────────
+        # ── Step 3: Language Normalisation ───────────────────────────
+        # Uses Haiku (model_override in config) — reads from preprocessing.language_normalisation
+        normalised_input, detected_language = self._language_normaliser.normalise(
+            raw_input=turn_input.user_message,
+            config=self._config,
+            llm=self._llm,
+        )
+
+        # ── Step 4: NLU Processor ─────────────────────────────────────
+        # Injects recent history for context-aware follow-up classification.
+        # Uses Haiku (model_override in config) — reads from preprocessing.nlu_processor
+        nlu_result = self._nlu_processor.process(
+            normalised_input=normalised_input,
+            history=state.history,
+            config=self._config,
+            llm=self._llm,
+        )
+
+        # ── Step 5: Early exit on unknown / low-confidence intent ─────
+        confidence_threshold = (
+            self._config.get("preprocessing", {})
+            .get("nlu_processor", {})
+            .get("confidence_threshold", 0.5)
+        )
+        if nlu_result.intent == "unknown" or nlu_result.confidence < confidence_threshold:
+            return self._unknown_intent_response(session_id, start)
+
+        # ── Step 6: Assemble prompt (KE) ─────────────────────────────
+        # KE receives pre-computed NLU data — runs only Glossary, Static KB, Multimodal.
         messages = self._knowledge_engine.assemble_prompt(
-            session_id, turn_input.user_message, state
+            session_id=session_id,
+            user_message=turn_input.user_message,
+            session_state=state,
+            normalised_input=normalised_input,
+            detected_language=detected_language,
+            intent=nlu_result.intent,
+            entities=nlu_result.entities,
+            sentiment=nlu_result.sentiment,
+            confidence=nlu_result.confidence,
         )
 
         # Empty prompt edge case — return safe empty response
@@ -153,24 +200,24 @@ class AgentCore(AgentCoreBase):
                 trust_output=empty_trust,
             )
 
-        # ── Step 4: LLM call #1 ──────────────────────────────────────
+        # ── Step 7: LLM call #1 ──────────────────────────────────────
         tools = self._tool_registry.get_tool_definitions()
         llm_response = self._llm.call(messages=messages, tools=tools, system="")
 
-        # ── Step 5: Tool-use loop ─────────────────────────────────────
+        # ── Step 8: Tool-use loop ─────────────────────────────────────
         final_text, tool_calls = self._manager_agent.run_turn(
             messages=messages,
             session_id=session_id,
             initial_llm_response=llm_response,
         )
 
-        # ── Step 6: Trust check on output ────────────────────────────
+        # ── Step 9: Trust check on output ────────────────────────────
         trust_output = self._trust.check_output(session_id, final_text)
 
         if trust_output.action in ("block", "escalate"):
             final_text = self._safe_fallback_message()
 
-        # ── Step 7: Build result and return ──────────────────────────
+        # ── Step 10: Build result and return ─────────────────────────
         latency_ms = int((time.time() - start) * 1000)
         result = self._build_result(
             session_id=session_id,
@@ -195,13 +242,14 @@ class AgentCore(AgentCoreBase):
                 "latency_ms": latency_ms,
                 "model": llm_response.model_used,
                 "tool_used": bool(tool_calls),
+                "intent": nlu_result.intent,
             },
         )
 
         return result
 
     # ------------------------------------------------------------------
-    # Private: blocked / escalated early exits
+    # Private: blocked / escalated / unknown early exits
     # ------------------------------------------------------------------
 
     def _blocked_response(
@@ -224,7 +272,6 @@ class AgentCore(AgentCoreBase):
             "blocked_message",
             "I'm unable to help with that request.",
         )
-        trust_output = TrustCheckResult(passed=False, action="block", reason="input_blocked")
         return TurnResult(
             session_id=session_id,
             response_text=blocked_text,
@@ -257,6 +304,34 @@ class AgentCore(AgentCoreBase):
             session_id=session_id,
             response_text=escalation_text,
             was_escalated=True,
+            model_used="",
+            latency_ms=int((time.time() - start) * 1000),
+        )
+
+    def _unknown_intent_response(self, session_id: str, start: float) -> TurnResult:
+        """
+        Early exit when intent is unknown or NLU confidence is below threshold.
+        No KE call, no LLM call, no memory write.
+        """
+        logger.info(
+            "orchestrator.unknown_intent",
+            extra={
+                "operation": "orchestrator.process_turn",
+                "status": "skipped",
+                "session_id": session_id,
+                "latency_ms": int((time.time() - start) * 1000),
+            },
+        )
+        unknown_text = self._config.get(
+            "conversation", {}
+        ).get(
+            "unknown_intent_message",
+            "I didn't quite understand that. Could you tell me more about what you need help with?",
+        )
+        return TurnResult(
+            session_id=session_id,
+            response_text=unknown_text,
+            was_escalated=False,
             model_used="",
             latency_ms=int((time.time() - start) * 1000),
         )

@@ -3,9 +3,14 @@ agent_core/src/llm_proxy_server.py
 
 FastAPI application exposing the internal LLM proxy endpoint.
 
-Any DPG that needs LLM access (e.g. Knowledge Engine) calls this endpoint
-instead of holding an Anthropic API key itself. Agent Core remains the sole
-owner of the key and the sole caller of the Anthropic API.
+NOTE: This server is NOT currently used. Language Normalisation and NLU Processor
+have been moved into Agent Core and call the LLM wrapper directly. The proxy
+endpoint is retained so that other DPG layers (e.g. Trust Layer, Action Gateway)
+can use it in the future without requiring their own Anthropic API key.
+
+Any DPG that needs LLM access calls this endpoint instead of holding an Anthropic
+API key itself. Agent Core remains the sole owner of the key and the sole caller
+of the Anthropic API.
 
 Endpoint:
     POST /internal/llm/call   — proxy an LLM call through ClaudeLLMWrapper

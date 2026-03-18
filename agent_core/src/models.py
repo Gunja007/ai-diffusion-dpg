@@ -59,6 +59,24 @@ class SessionState:
 
 
 # ---------------------------------------------------------------------------
+# NLU (Language Normalisation + Intent Classification)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class NLUResult:
+    """
+    Combined output of Language Normalisation and NLU Processor steps run in Agent Core.
+    Produced before the Knowledge Engine call and passed to KE's assemble_prompt().
+    """
+
+    intent: str                    # classified intent label from config intents list
+    entities: dict[str, Any]       # extracted entity key→value pairs
+    sentiment: str                 # one of the configured sentiment classes
+    confidence: float              # 0.0–1.0; below threshold triggers early exit
+
+
+# ---------------------------------------------------------------------------
 # Trust
 # ---------------------------------------------------------------------------
 

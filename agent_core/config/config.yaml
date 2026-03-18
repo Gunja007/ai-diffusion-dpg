@@ -6,8 +6,8 @@ server:
   port: 8000
 
 agent:
-  primary_model: claude-sonnet-4-6          # default model for all LLM calls
-  fallback_model: claude-haiku-4-5-20251001 # used after primary exhausts retries
+  primary_model: claude-haiku-4-5-20251001  # PoC/dev: Haiku everywhere. Change to claude-sonnet-4-6 for prod.
+  fallback_model: claude-haiku-4-5-20251001 # PoC/dev: same as primary. Change to a lighter fallback for prod.
   timeout_ms: 10000                         # per-request timeout (ms)
   retry_attempts: 2                         # retries on rate-limit/timeout before fallback
   max_tool_rounds: 1                        # max tool→LLM cycles per turn
@@ -22,3 +22,32 @@ connectors:
   read: []      # query-only connectors (no consent required)
   write: []     # action connectors (require user consent via Trust Layer)
   identity: []  # identity verification connectors (require user consent)
+
+# Pre-KE processing steps run directly in Agent Core using the primary LLM wrapper.
+# These blocks use a fast model (Haiku) regardless of the agent's primary_model.
+preprocessing:
+  language_normalisation:
+    model: claude-haiku-4-5-20251001
+    provider: llm_native              # options: llm_native | bhashini (post-PoC stub)
+    supported_languages: [hindi, kannada, english, hinglish]
+    transliteration: true
+    code_switching: true
+    bhashini:                         # used only when provider: bhashini (post-PoC)
+      api_key_env: BHASHINI_API_KEY   # name of the environment variable holding the key
+      user_id_env: BHASHINI_USER_ID   # name of the environment variable holding the user ID
+      endpoint: https://dhruva-api.bhashini.gov.in/services/inference/pipeline
+
+  nlu_processor:
+    model: claude-haiku-4-5-20251001
+    confidence_threshold: 0.5   # below this → early exit, no KE call
+    history_turns: 2            # recent turns injected for context-aware classification
+    intents:
+      - market_truth_query
+      - scheme_query
+      - training_query
+      - apply_now
+      - counsellor_request
+      - pay_range_query
+      - unknown
+    entities: [trade, location, distance_km, income_urgency]
+    sentiment_classes: [neutral, positive, distressed, frustrated]
