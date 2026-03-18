@@ -1,0 +1,173 @@
+"""
+learning_layer/src/console_logger.py
+
+ConsoleLogger — PoC stub for the Learning Layer DPG.
+
+Implements the LearningLayerBase interface. Writes all observability events to the
+Python logging system (structured JSON-compatible key-value pairs via `extra`).
+
+In production this is replaced by an async pipeline that writes to an audit database,
+runs quality eval models, and stores feedback signals for training.
+
+Design:
+- emit_turn(): logs all TurnEvent fields at INFO level. Never raises.
+- emit_signal(): logs signal_type + data at INFO level. Never raises.
+- Both methods are safe to call from daemon threads (no shared mutable state).
+- Internal errors are caught and logged — never propagated to the caller.
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+from typing import Any
+
+logger = logging.getLogger(__name__)
+
+
+class ConsoleLogger:
+    """
+    Console-logging Learning Layer stub.
+
+    Accepts any dict-shaped event (to avoid a hard dependency on agent_core.models)
+    and logs it as a structured entry. Attributes are accessed via getattr with
+    a fallback to dict .get() so both dataclasses and plain dicts are supported.
+
+    Args:
+        config: Full config dict. Reads learning_layer section.
+    """
+
+    def __init__(self, config: dict) -> None:
+        if config is None:
+            raise ValueError("config must not be None")
+
+        ll_cfg = config.get("learning_layer", {})
+        self._log_level: str = ll_cfg.get("log_level", "INFO").upper()
+
+        logger.info(
+            "learning_layer.init",
+            extra={
+                "operation": "console_logger.init",
+                "status": "success",
+                "log_level": self._log_level,
+            },
+        )
+
+    # ------------------------------------------------------------------
+    # Public interface — mirrors LearningLayerBase
+    # ------------------------------------------------------------------
+
+    def emit_turn(self, event: Any) -> None:
+        """
+        Log turn-level observability data.
+
+        Accepts a TurnEvent dataclass or any object/dict with the same fields.
+        Never raises — all exceptions are caught and logged internally.
+        """
+        try:
+            if event is None:
+                logger.warning(
+                    "learning_layer.emit_turn_skipped",
+                    extra={
+                        "operation": "console_logger.emit_turn",
+                        "status": "skipped",
+                        "reason": "event is None",
+                    },
+                )
+                return
+
+            start = time.time()
+
+            # Support both dataclass attribute access and plain dict access
+            def _get(key: str, default: Any = None) -> Any:
+                if isinstance(event, dict):
+                    return event.get(key, default)
+                return getattr(event, key, default)
+
+            trust_in = _get("trust_input_result")
+            trust_out = _get("trust_output_result")
+
+            logger.info(
+                "learning_layer.turn_event",
+                extra={
+                    "operation": "console_logger.emit_turn",
+                    "status": "success",
+                    "session_id": _get("session_id", ""),
+                    "model_used": _get("model_used", ""),
+                    "input_tokens": _get("input_tokens", 0),
+                    "output_tokens": _get("output_tokens", 0),
+                    "latency_ms": _get("latency_ms", 0),
+                    "timestamp_ms": _get("timestamp_ms", 0),
+                    "tool_calls_count": len(_get("tool_calls", []) or []),
+                    "trust_input_action": _trust_action(trust_in),
+                    "trust_output_action": _trust_action(trust_out),
+                    "emit_latency_ms": int((time.time() - start) * 1000),
+                },
+            )
+
+        except Exception as e:
+            # Learning Layer must never crash the caller
+            logger.error(
+                "learning_layer.emit_turn_error",
+                extra={
+                    "operation": "console_logger.emit_turn",
+                    "status": "failure",
+                    "error": f"{type(e).__name__}: {e}",
+                },
+            )
+
+    def emit_signal(self, signal_type: str, data: dict[str, Any]) -> None:
+        """
+        Log a discrete signal event.
+
+        Args:
+            signal_type: Label for the signal (e.g. "drop_off", "mismatch",
+                         "low_confidence", "escalation_triggered").
+            data:        Arbitrary key-value context for the signal.
+
+        Never raises — all exceptions are caught and logged internally.
+        """
+        try:
+            if signal_type is None:
+                logger.warning(
+                    "learning_layer.emit_signal_skipped",
+                    extra={
+                        "operation": "console_logger.emit_signal",
+                        "status": "skipped",
+                        "reason": "signal_type is None",
+                    },
+                )
+                return
+
+            logger.info(
+                "learning_layer.signal_event",
+                extra={
+                    "operation": "console_logger.emit_signal",
+                    "status": "success",
+                    "signal_type": signal_type,
+                    "data": data or {},
+                },
+            )
+
+        except Exception as e:
+            logger.error(
+                "learning_layer.emit_signal_error",
+                extra={
+                    "operation": "console_logger.emit_signal",
+                    "status": "failure",
+                    "error": f"{type(e).__name__}: {e}",
+                },
+            )
+
+
+# ---------------------------------------------------------------------------
+# Private helpers
+# ---------------------------------------------------------------------------
+
+def _trust_action(trust_result: Any) -> str:
+    """Extract action string from a TrustCheckResult dataclass or dict."""
+    if trust_result is None:
+        return "unknown"
+    if isinstance(trust_result, dict):
+        return trust_result.get("action", "unknown")
+    return getattr(trust_result, "action", "unknown")
