@@ -19,9 +19,32 @@ conversation:
   output_blocked_message: "I wasn't able to produce a safe response. Please try rephrasing your question."
 
 connectors:
-  read: []      # query-only connectors (no consent required)
+  read:
+    - name: onest_market_lookup
+      description: "Search ONEST live job market data by trade and location"
+      # Action Gateway stub serves this at: http://localhost:9999/onest/market_lookup
   write: []     # action connectors (require user consent via Trust Layer)
   identity: []  # identity verification connectors (require user consent)
+
+ke_client:
+  endpoint: "http://localhost:8001/assemble_prompt"
+  timeout_ms: 8000
+
+memory_client:
+  endpoint: "http://localhost:8002"
+  timeout_ms: 3000
+
+trust_client:
+  endpoint: "http://localhost:8003"
+  timeout_ms: 2000
+
+learning_client:
+  endpoint: "http://localhost:8004"
+  timeout_ms: 2000
+
+action_gateway_client:
+  endpoint: "http://localhost:9999/onest/market_lookup"
+  timeout_ms: 5000
 
 # Pre-KE processing steps run directly in Agent Core using the primary LLM wrapper.
 # These blocks use a fast model (Haiku) regardless of the agent's primary_model.

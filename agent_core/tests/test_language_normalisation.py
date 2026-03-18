@@ -22,7 +22,7 @@ import json
 import pytest
 from unittest.mock import MagicMock
 
-from src.language_normalisation import LanguageNormaliser
+from src.preprocessing.language_normalisation import LanguageNormaliser
 from src.models import LLMResponse
 
 

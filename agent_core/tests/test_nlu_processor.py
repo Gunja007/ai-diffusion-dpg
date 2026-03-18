@@ -27,7 +27,7 @@ import json
 import pytest
 from unittest.mock import MagicMock
 
-from src.nlu_processor import NLUProcessor
+from src.preprocessing.nlu_processor import NLUProcessor
 from src.models import NLUResult, LLMResponse
 
 

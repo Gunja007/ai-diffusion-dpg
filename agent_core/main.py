@@ -1,13 +1,16 @@
 """
 agent_core/main.py
 
-Startup entrypoint for the Agent Core service.
+Startup entrypoint for the Agent Core orchestration service.
 
 Responsibilities:
 - Load config from config/config.yaml
 - Instantiate ClaudeLLMWrapper with agent config
-- Create the FastAPI app via create_app()
-- Start the uvicorn HTTP server on configured host:port
+- Create HTTP clients for Memory Layer, Trust Layer, Learning Layer, Knowledge Engine,
+  and Action Gateway
+- Wire ToolRegistry, ManagerAgent, and AgentCore
+- Create the FastAPI orchestration app via create_orchestration_app()
+- Start the uvicorn HTTP server on port 8000
 
 Run:
     python -m main                    (from agent_core/ directory)
@@ -16,7 +19,16 @@ Run:
 Environment:
     ANTHROPIC_API_KEY must be set. ClaudeLLMWrapper reads it from the environment
     via the Anthropic SDK — never hardcoded here.
+
+Prerequisites (all must be running before this starts):
+    memory_layer/main.py     (port 8002)
+    trust_layer/main.py      (port 8003)
+    learning_layer/main.py   (port 8004)
+    knowledge_engine/main.py (port 8001)
+    action_gateway/main.py   (port 9999)
 """
+
+from __future__ import annotations
 
 import logging
 import sys
@@ -32,7 +44,15 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from src.llm_wrapper.claude_wrapper import ClaudeLLMWrapper
-from src.llm_proxy_server import create_app
+from src.http_clients.knowledge_engine import HttpKnowledgeEngineClient
+from src.http_clients.memory_layer import MemoryLayerHttpClient
+from src.http_clients.trust_layer import TrustLayerHttpClient
+from src.http_clients.learning_layer import LearningLayerHttpClient
+from src.http_clients.action_gateway import ActionGatewayHttpClient
+from src.tool_registry import ToolRegistry
+from src.manager_agent import ManagerAgent
+from src.orchestrator import AgentCore
+from src.servers.orchestration_server import create_orchestration_app
 
 # ---------------------------------------------------------------------------
 # Logging — structured output, INFO level default
@@ -49,17 +69,19 @@ logger = logging.getLogger(__name__)
 # Config loader
 # ---------------------------------------------------------------------------
 
+
 def _load_config(path: str = "config/config.yaml") -> dict:
     config_path = Path(path)
     if not config_path.exists():
         raise FileNotFoundError(f"Config file not found: {config_path.resolve()}")
     with config_path.open("r") as f:
-        return yaml.safe_load(f)
+        return yaml.safe_load(f) or {}
 
 
 # ---------------------------------------------------------------------------
 # App construction — exposed at module level for uvicorn --reload
 # ---------------------------------------------------------------------------
+
 
 def _build_app():
     config = _load_config()
@@ -68,13 +90,47 @@ def _build_app():
     if not agent_cfg:
         raise ValueError("Config missing required 'agent' section")
 
+    # ── LLM Wrapper — the only component that calls the Anthropic API ─────
     llm = ClaudeLLMWrapper(agent_cfg)
+
+    # ── HTTP Clients — one per downstream service ─────────────────────────
+    memory = MemoryLayerHttpClient(config)
+    trust = TrustLayerHttpClient(config)
+    learning = LearningLayerHttpClient(config)
+    ke = HttpKnowledgeEngineClient(config)
+    gateway = ActionGatewayHttpClient(config)
+
+    # ── Tool Registry — built from gateway's tool definitions ─────────────
+    tool_registry = ToolRegistry(config=config, gateway=gateway)
+
+    # ── Manager Agent — owns the tool-use loop ────────────────────────────
+    max_tool_rounds = agent_cfg.get("max_tool_rounds", 1)
+    manager = ManagerAgent(
+        llm_wrapper=llm,
+        tool_registry=tool_registry,
+        action_gateway=gateway,
+        trust_layer=trust,
+        max_tool_rounds=max_tool_rounds,
+    )
+
+    # ── Agent Core — central orchestrator ────────────────────────────────
+    agent_core = AgentCore(
+        config=config,
+        llm_wrapper=llm,
+        memory=memory,
+        trust=trust,
+        knowledge_engine=ke,
+        tool_registry=tool_registry,
+        manager_agent=manager,
+        learning=learning,
+    )
+
+    # ── FastAPI app ───────────────────────────────────────────────────────
+    app = create_orchestration_app(agent_core)
 
     server_cfg = config.get("server", {})
     host = server_cfg.get("host", "0.0.0.0")
     port = server_cfg.get("port", 8000)
-
-    app = create_app(llm)
 
     logger.info(
         "agent_core.startup",

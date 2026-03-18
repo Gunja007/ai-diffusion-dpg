@@ -41,13 +41,12 @@ runtime.
 ## 3. The 7 DPG Modules
 
 ### Knowledge Engine
-Assembles the complete prompt for each LLM call.
-- Runs NLU (intent classification, entity extraction, sentiment)
-- Maps colloquial terms to canonical concepts (Glossary & Domain Vocabulary)
-- Handles dialect detection, code-switching, transliteration (Language Normalisation)
+Assembles the complete prompt for each LLM call. Receives NLU results from Agent Core as
+parameters — it does not run Language Normalisation or NLU itself.
+- Maps entity values to canonical concepts (Glossary & Domain Vocabulary)
 - Performs semantic RAG retrieval over ingested domain documents (Static Knowledge Base)
 - Processes non-text inputs: images, PDFs (Multimodal Input Handler)
-- Pulls conversation history from Memory Layer before prompt assembly
+- Receives session history from Agent Core in the request body (does not call Memory Layer directly)
 
 ### Memory Layer
 Manages all state across three scopes:
@@ -71,13 +70,15 @@ Priority & Escalation Classifier.
 
 ### Agent Core (Orchestrator)
 The central intelligence and orchestration layer. **The only component that calls the LLM.**
+- Runs Language Normalisation (dialect detection, code-switching, transliteration) before calling KE
+- Runs NLU Processor (intent classification, entity extraction, sentiment) before calling KE
 - Coordinates the execution sequence of all other DPGs on every turn
 - Owns the tool execution loop (LLM → tool → LLM)
 - Manages LLM retry and fallback model switching
 - Runtime behaviour is fully driven by the Domain Configuration Kit (YAML)
 
-Internal components: LLM Inferencing Wrapper, Manager Agent (intent-based routing),
-Orchestration Config Layer.
+Internal components: LLM Inferencing Wrapper, Language Normaliser, NLU Processor,
+Manager Agent (intent-based routing), Orchestration Config Layer.
 
 ### Action Gateway
 The framework's only interface with the external world.
@@ -113,7 +114,9 @@ Every user turn follows this exact sequence:
 Input received (Reach Layer)
   → Agent Core: read state (Memory Layer)
   → Agent Core: safety check on input (Trust Layer)
-  → Agent Core: assemble prompt (Knowledge Engine)
+  → Agent Core: Language Normalisation (internal — dialect, code-switching, transliteration)
+  → Agent Core: NLU Processor (internal — intent, entities, sentiment) → early exit if unknown/low-confidence
+  → Agent Core: assemble prompt (Knowledge Engine — receives NLU results in request body)
   → Agent Core: LLM call #1
   → [if tool_use] Agent Core: execute tool (Action Gateway) → LLM call #2
   → Agent Core: safety check on output (Trust Layer)
@@ -135,11 +138,14 @@ They must never block or delay the user-facing response.
 |---|---|---|
 | Agent Core | Memory Layer | Read session state at turn start; write state after response |
 | Agent Core | Trust Layer | Check input before LLM; check output after LLM |
-| Agent Core | Knowledge Engine | Assemble the full prompt before every LLM call |
+| Agent Core | Knowledge Engine | Assemble the full prompt before every LLM call (session state passed in request body) |
 | Agent Core | Action Gateway | Execute tool calls requested by the LLM |
 | Agent Core | Learning Layer | Emit turn metadata asynchronously after response |
-| Knowledge Engine | Memory Layer | Pull conversation history for prompt context |
 | Action Gateway | External systems | Only after receiving intent from Agent Core |
+
+**Note:** Knowledge Engine does **not** call Memory Layer directly. Agent Core fetches session state
+from Memory Layer and passes it to Knowledge Engine in the `/assemble_prompt` request body.
+Knowledge Engine is stateless — it receives all context it needs in each request.
 
 **No other cross-module calls are defined. Do not introduce new dependencies between blocks.**
 
@@ -149,11 +155,15 @@ They must never block or delay the user-facing response.
 
 Follow these rules in every file you write:
 
-1. **Agent Core is the only orchestrator.** No other block initiates calls to other blocks, except
-   Knowledge Engine reading from Memory Layer.
+1. **Agent Core is the only orchestrator.** No other block initiates calls to other blocks.
+   Agent Core fetches session state from Memory Layer and passes it to Knowledge Engine in the
+   `/assemble_prompt` request body. Knowledge Engine never calls Memory Layer directly.
 
 2. **Agent Core is the only LLM caller.** No other block calls the LLM directly. All Anthropic API
-   interaction goes through `agent_core/llm_wrapper.py`.
+   interaction goes through `agent_core/src/llm_wrapper/claude_wrapper.py` (`ClaudeLLMWrapper`).
+   Agent Core also exposes `POST /internal/llm/call` — a proxy endpoint that other DPG services
+   can use in future to get LLM access without holding their own Anthropic API key. Currently
+   implemented but not active (not wired into any other service yet).
 
 3. **All external system access goes through Action Gateway.** The LLM expresses intent via tool
    definitions; it never calls APIs directly.
@@ -237,8 +247,8 @@ The following are **intentionally out of scope** for this framework. Do not impl
 For the current Proof of Concept, system components are split between full implementations and lightweight stubs.
 
 ### Full Modules
-- **Knowledge Engine:** RAG, NLU, and prompt assembly.
-- **Agent Core:** Orchestration and LLM execution.
+- **Knowledge Engine:** RAG retrieval (Glossary, Static KB, Multimodal) and prompt assembly.
+- **Agent Core:** Orchestration, Language Normalisation, NLU, and LLM execution.
 - **Domain Configuration Kit:** YAML-based runtime wiring.
 
 ### Lightweight Stubs

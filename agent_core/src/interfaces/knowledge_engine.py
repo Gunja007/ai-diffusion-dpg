@@ -29,12 +29,9 @@ class KnowledgeEngineBase(ABC):
         entities: Optional[dict[str, Any]] = None,
         sentiment: str = "neutral",
         confidence: float = 0.0,
-    ) -> list[dict]:
+    ) -> tuple[list[dict], str]:
         """
-        Build and return the complete messages list for the LLM call.
-
-        Format:
-            [{"role": "user" | "assistant", "content": str}, ...]
+        Build and return the messages list and system prompt for the LLM call.
 
         Agent Core runs Language Normalisation and NLU before calling this method
         and passes the results as parameters. KE uses these to drive Glossary
@@ -51,5 +48,11 @@ class KnowledgeEngineBase(ABC):
             sentiment:         Sentiment class from NLU Processor.
             confidence:        NLU confidence score 0.0–1.0.
 
-        Returns an empty list only if user_message is empty — never raises.
+        Returns:
+            tuple[list[dict], str]:
+                - messages: RAG context + history + current user message.
+                  Empty list if user_message is empty.
+                - system: persona + language instruction + guardrails.
+                  Empty string if no persona configured.
+            Never raises.
         """

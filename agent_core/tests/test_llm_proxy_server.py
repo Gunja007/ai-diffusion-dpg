@@ -29,7 +29,7 @@ import pytest
 from fastapi.testclient import TestClient
 from unittest.mock import MagicMock
 
-from src.llm_proxy_server import create_app
+from src.servers.llm_proxy_server import create_app
 from src.llm_wrapper.base import LLMWrapperBase
 from src.models import LLMResponse, ToolCall
 

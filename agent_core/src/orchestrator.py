@@ -28,7 +28,7 @@ from src.interfaces.learning_layer import LearningLayerBase
 from src.interfaces.memory_layer import MemoryLayerBase
 from src.interfaces.reach_layer import ReachLayerBase
 from src.interfaces.trust_layer import TrustLayerBase
-from src.language_normalisation import LanguageNormaliser
+from src.preprocessing.language_normalisation import LanguageNormaliser
 from src.llm_wrapper.base import LLMWrapperBase
 from src.manager_agent import ManagerAgent
 from src.models import (
@@ -41,7 +41,7 @@ from src.models import (
     TurnInput,
     TurnResult,
 )
-from src.nlu_processor import NLUProcessor
+from src.preprocessing.nlu_processor import NLUProcessor
 from src.tool_registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
@@ -163,7 +163,8 @@ class AgentCore(AgentCoreBase):
 
         # ── Step 6: Assemble prompt (KE) ─────────────────────────────
         # KE receives pre-computed NLU data — runs only Glossary, Static KB, Multimodal.
-        messages = self._knowledge_engine.assemble_prompt(
+        # Returns (messages, system): system goes to llm.call(), messages are the conversation.
+        messages, system = self._knowledge_engine.assemble_prompt(
             session_id=session_id,
             user_message=turn_input.user_message,
             session_state=state,
@@ -202,7 +203,7 @@ class AgentCore(AgentCoreBase):
 
         # ── Step 7: LLM call #1 ──────────────────────────────────────
         tools = self._tool_registry.get_tool_definitions()
-        llm_response = self._llm.call(messages=messages, tools=tools, system="")
+        llm_response = self._llm.call(messages=messages, tools=tools, system=system)
 
         # ── Step 8: Tool-use loop ─────────────────────────────────────
         final_text, tool_calls = self._manager_agent.run_turn(
