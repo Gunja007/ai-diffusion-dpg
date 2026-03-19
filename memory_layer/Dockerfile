@@ -1,8 +1,9 @@
 # =============================================================================
-# Agent Core DPG — Multi-stage Dockerfile
+# Memory Layer DPG — Multi-stage Dockerfile
 # =============================================================================
 # Stage 1 (builder): install dependencies into an isolated prefix.
 # Stage 2 (runtime): copy only the installed packages and source — no build tools.
+# Mirrors agent_core/Dockerfile conventions exactly.
 # =============================================================================
 
 # -----------------------------------------------------------------------------
@@ -27,7 +28,7 @@ RUN pip install --prefix=/install --no-cache-dir .
 FROM python:3.11-slim AS runtime
 
 # Non-root user for security
-RUN addgroup --system agentcore && adduser --system --ingroup agentcore agentcore
+RUN addgroup --system memorylayer && adduser --system --ingroup memorylayer memorylayer
 
 WORKDIR /app
 
@@ -40,15 +41,13 @@ COPY main.py ./
 COPY config/ ./config/
 
 # Ownership
-RUN chown -R agentcore:agentcore /app
+RUN chown -R memorylayer:memorylayer /app
 
-USER agentcore
+USER memorylayer
 
-# ANTHROPIC_API_KEY must be injected at runtime via environment variable.
-# Never bake secrets into the image.
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 
-EXPOSE 8000
+EXPOSE 8002
 
 CMD ["python", "main.py"]

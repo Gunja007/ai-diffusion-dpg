@@ -1,8 +1,8 @@
 # =============================================================================
-# Agent Core DPG — Multi-stage Dockerfile
+# Action Gateway DPG — Multi-stage Dockerfile
 # =============================================================================
-# Stage 1 (builder): install dependencies into an isolated prefix.
-# Stage 2 (runtime): copy only the installed packages and source — no build tools.
+# Runs the mock ONEST FastAPI server on port 9999.
+# In production this is replaced by a real connector to the ONEST network.
 # =============================================================================
 
 # -----------------------------------------------------------------------------
@@ -12,13 +12,10 @@ FROM python:3.11-slim AS builder
 
 WORKDIR /build
 
-# Install build tooling
 RUN pip install --upgrade pip setuptools wheel
 
-# Copy dependency declarations first — layer is cached unless pyproject.toml changes
 COPY pyproject.toml ./
 
-# Install runtime dependencies into /install prefix (no dev extras)
 RUN pip install --prefix=/install --no-cache-dir .
 
 # -----------------------------------------------------------------------------
@@ -26,29 +23,25 @@ RUN pip install --prefix=/install --no-cache-dir .
 # -----------------------------------------------------------------------------
 FROM python:3.11-slim AS runtime
 
-# Non-root user for security
-RUN addgroup --system agentcore && adduser --system --ingroup agentcore agentcore
+RUN addgroup --system actiongateway && adduser --system --ingroup actiongateway actiongateway
 
 WORKDIR /app
 
-# Copy installed packages from builder
 COPY --from=builder /install /usr/local
 
-# Copy application source, entrypoint, and config
+# Copy source package and entrypoint
+# src/ must be present so `from src.mock_server import app` resolves at startup
 COPY src/ ./src/
 COPY main.py ./
 COPY config/ ./config/
 
-# Ownership
-RUN chown -R agentcore:agentcore /app
+RUN chown -R actiongateway:actiongateway /app
 
-USER agentcore
+USER actiongateway
 
-# ANTHROPIC_API_KEY must be injected at runtime via environment variable.
-# Never bake secrets into the image.
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 
-EXPOSE 8000
+EXPOSE 9999
 
 CMD ["python", "main.py"]

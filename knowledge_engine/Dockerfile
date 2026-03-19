@@ -51,4 +51,10 @@ USER knowledgeengine
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 
+# ChromaDB vector store is written here at ingest time.
+# Mount a named volume at this path to persist embeddings across container restarts.
+VOLUME /app/data/chroma_db
+
+EXPOSE 8001
+
 CMD ["python", "main.py"]
