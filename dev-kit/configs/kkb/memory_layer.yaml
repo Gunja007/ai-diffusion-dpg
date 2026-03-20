@@ -1,0 +1,8 @@
+# dev-kit/configs/kkb/memory_layer.yaml
+# KKB domain values for Memory Layer.
+# No KKB-specific overrides — DPG defaults apply.
+# To override session TTL or max_sessions for KKB, add them here.
+#
+# memory:
+#   session_ttl_seconds: 7200   # example: 2-hour sessions for KKB
+#   max_sessions: 5000

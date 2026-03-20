@@ -1,0 +1,7 @@
+# dev-kit/dpg/trust_layer.yaml
+# DPG framework defaults for Trust Layer — same for any domain deployment.
+# Blocked phrases and escalation topics are domain-specific — never put them here.
+
+server:
+  host: "0.0.0.0"
+  port: 8003

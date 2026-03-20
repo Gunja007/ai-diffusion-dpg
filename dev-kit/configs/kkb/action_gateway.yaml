@@ -1,0 +1,12 @@
+# dev-kit/configs/kkb/action_gateway.yaml
+# KKB domain values for Action Gateway.
+# Merged with dev-kit/dpg/action_gateway.yaml by loader.py before deployment.
+#
+# PoC: action_gateway is a mock ONEST server running as a stub.
+# In production, replace the endpoint with the actual ONEST API URL.
+
+action_gateway:
+  connectors:
+    onest_market_lookup:
+      endpoint: "http://action_gateway:9999/onest/market_lookup"
+      timeout_ms: 5000

@@ -1,0 +1,9 @@
+# dev-kit/configs/kkb/reach_layer.yaml
+# KKB domain values for Reach Layer.
+# Merged with dev-kit/dpg/reach_layer.yaml by loader.py before deployment.
+#
+# Endpoint uses Docker Compose service name.
+# For Kubernetes, update in automation/helm/reach-layer/values.yaml.
+
+agent_core_client:
+  endpoint: "http://agent_core:8000/process_turn"

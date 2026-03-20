@@ -1,0 +1,35 @@
+replicaCount: 1
+
+image:
+  repository: ghcr.io/your-org/action-gateway
+  tag: latest
+  pullPolicy: IfNotPresent
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 512Mi
+  limits:
+    cpu: 500m
+    memory: 1Gi
+
+# DPG framework defaults — mounted as /app/config/dpg.yaml inside the pod.
+dpgConfig:
+  server:
+    host: "0.0.0.0"
+    port: 9999
+  action_gateway:
+    timeout_ms: 5000
+
+# Domain-specific config — mounted as /app/config/domain.yaml inside the pod.
+config:
+  server:
+    host: "0.0.0.0"
+    port: 9999
+
+  action_gateway:
+    timeout_ms: 5000
+    connectors:
+      onest_market_lookup:
+        endpoint: "http://action-gateway.action-gateway.svc.cluster.local:9999/onest/market_lookup"
+        timeout_ms: 5000
