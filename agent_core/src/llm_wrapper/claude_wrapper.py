@@ -26,9 +26,6 @@ from src.models import LLMResponse, ToolCall
 
 logger = logging.getLogger(__name__)
 
-# Backoff delays in seconds between retry attempts (index = attempt number, 0-based)
-_BACKOFF_SECONDS = [0, 0.5, 1.0]
-
 
 class _RetryableExhausted(Exception):
     """Internal sentinel: all retry attempts on transient errors were consumed.
@@ -57,6 +54,7 @@ class ClaudeLLMWrapper(LLMWrapperBase):
         self._fallback_model: str = config["fallback_model"]
         self._timeout_s: float = config["timeout_ms"] / 1000
         self._max_attempts: int = max(1, config["retry_attempts"])
+        self._backoff_seconds: list[float] = config.get("retry_backoff_seconds", [0, 0.5, 1.0])
 
         self._active_model: str = self._primary_model
         self._client = anthropic.Anthropic()
@@ -110,7 +108,7 @@ class ClaudeLLMWrapper(LLMWrapperBase):
         last_error: Optional[Exception] = None
 
         for attempt in range(self._max_attempts):
-            delay = _BACKOFF_SECONDS[min(attempt, len(_BACKOFF_SECONDS) - 1)]
+            delay = self._backoff_seconds[min(attempt, len(self._backoff_seconds) - 1)]
             if delay > 0:
                 time.sleep(delay)
 

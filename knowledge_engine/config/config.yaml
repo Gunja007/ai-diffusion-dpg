@@ -75,6 +75,17 @@ knowledge:
       metadata_filters:
         use_location_filter: true
         use_intent_filter: true
+      # Maps intent names to the doc_types to search within ChromaDB.
+      # Empty list means no doc_type filter — all documents are searched.
+      # Add or change entries here when deploying to a new domain.
+      intent_filters:
+        market_truth_query: [scheme, trade, bridge_income]
+        scheme_query: [scheme]
+        training_query: [trade, institute]
+        pay_range_query: [trade]
+        apply_now: [scheme, institute]
+        counsellor_request: []
+        unknown: []
 
     multimodal_input_handler:
       enabled: false
@@ -91,6 +102,11 @@ conversation:
       Speak like a knowledgeable neighbour — informal, simple words, no jargon.
       You speak in Hindi, Hinglish, Kannada, and English depending on what the user prefers.
       If you do not know something, say so honestly.
+  # Injected as the second block of the system prompt, after persona and before guardrails.
+  # Change this for deployments that use a different language set or must respond only in one language.
+  language_instruction: >-
+    Respond in the same language the user is using.
+    If they mix Hindi and English (Hinglish), respond in Hinglish.
   guardrail_reminders:
     - "Do not discuss topics unrelated to employment, skills, training, or government schemes."
     - "Do not make promises about specific job placements or salary guarantees."

@@ -34,6 +34,15 @@ CONFIG = {
                     "use_location_filter": True,
                     "use_intent_filter": True,
                 },
+                "intent_filters": {
+                    "market_truth_query": ["scheme", "trade", "bridge_income"],
+                    "scheme_query": ["scheme"],
+                    "training_query": ["trade", "institute"],
+                    "pay_range_query": ["trade"],
+                    "apply_now": ["scheme", "institute"],
+                    "counsellor_request": [],
+                    "unknown": [],
+                },
             }
         }
     }

@@ -212,10 +212,9 @@ class KnowledgeEngine(KnowledgeEngineBase):
         if persona_text:
             parts.append(persona_text)
 
-        parts.append(
-            "Respond in the same language the user is using. "
-            "If they mix Hindi and English (Hinglish), respond in Hinglish."
-        )
+        language_instruction = conversation_cfg.get("language_instruction", "").strip()
+        if language_instruction:
+            parts.append(language_instruction)
 
         guardrails = conversation_cfg.get("guardrail_reminders", [])
         if guardrails:

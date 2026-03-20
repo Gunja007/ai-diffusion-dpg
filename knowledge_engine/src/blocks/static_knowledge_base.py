@@ -30,16 +30,8 @@ from src.base import KnowledgeBlock, KEContext, LLMWrapperBase
 
 logger = logging.getLogger(__name__)
 
-# Intent → doc_type filter mapping
-_INTENT_TO_DOC_TYPES: dict[str, list[str]] = {
-    "market_truth_query": ["scheme", "trade", "bridge_income"],
-    "scheme_query": ["scheme"],
-    "training_query": ["trade", "institute"],
-    "pay_range_query": ["trade"],
-    "apply_now": ["scheme", "institute"],
-    "counsellor_request": [],   # no filter — search all
-    "unknown": [],              # no filter — search all
-}
+# Intent → doc_type filter mapping is loaded from config at runtime.
+# See knowledge.blocks.static_knowledge_base.intent_filters in config/config.yaml.
 
 
 class StaticKnowledgeBaseBlock(KnowledgeBlock):
@@ -132,12 +124,14 @@ class StaticKnowledgeBaseBlock(KnowledgeBlock):
             similarity_threshold = block_cfg.get("similarity_threshold", 0.65)
             use_intent_filter = block_cfg.get("metadata_filters", {}).get("use_intent_filter", True)
             use_location_filter = block_cfg.get("metadata_filters", {}).get("use_location_filter", True)
+            intent_filters: dict[str, list[str]] = block_cfg.get("intent_filters", {})
 
             # Build metadata filters
             where_filter = self._build_where_filter(
                 context=context,
                 use_intent_filter=use_intent_filter,
                 use_location_filter=use_location_filter,
+                intent_filters=intent_filters,
             )
 
             # Query for relevant chunks
@@ -324,16 +318,24 @@ class StaticKnowledgeBaseBlock(KnowledgeBlock):
         context: KEContext,
         use_intent_filter: bool,
         use_location_filter: bool,
+        intent_filters: dict[str, list[str]] | None = None,
     ) -> Optional[dict]:
         """
         Build a ChromaDB `where` filter dict from context.intent and entities.
         Returns None if no meaningful filter can be constructed.
+
+        intent_filters: mapping of intent name → list of doc_types to restrict search to.
+                        Loaded from knowledge.blocks.static_knowledge_base.intent_filters in config.
+                        Empty list for an intent means no doc_type filter (search all).
         """
+        if intent_filters is None:
+            intent_filters = {}
+
         conditions = []
 
         # Intent → doc_type filter
         if use_intent_filter and context.intent:
-            doc_types = _INTENT_TO_DOC_TYPES.get(context.intent, [])
+            doc_types = intent_filters.get(context.intent, [])
             if doc_types:
                 # Exclude always_include from similarity search (fetched separately)
                 conditions.append({"doc_type": {"$in": doc_types}})
