@@ -1,19 +1,7 @@
-# knowledge_engine/config/config.yaml — service configuration loaded once at startup.
-# Secrets (OPENAI_API_KEY) are never stored here — use environment variables.
-# To run without an API key: set embedding_provider to sentence_transformers (the default).
-
-server:
-  host: 0.0.0.0   # 0.0.0.0 for Docker/container; 127.0.0.1 for local-only
-  port: 8001       # different port from agent_core (8000)
+# knowledge_engine/config/domain.yaml — KKB domain config (local dev).
+# In Docker/Kubernetes this file is replaced by dev-kit/configs/kkb/knowledge_engine.yaml.
 
 knowledge:
-  # Language Normalisation and NLU Processor have been moved to Agent Core.
-  # KE runs only: Glossary → Static KB → Multimodal.
-  # NLU results (intent, entities, etc.) are passed in by Agent Core via /assemble_prompt.
-
-  conversation:
-    max_history_turns: 10   # number of prior turns injected into the prompt
-
   blocks:
     glossary:
       enabled: true
@@ -44,13 +32,8 @@ knowledge:
 
     static_knowledge_base:
       enabled: true
-      vector_store: chromadb
       collection_name: kkb_knowledge
       chroma_persist_dir: ./data/chroma_db
-      embedding_provider: sentence_transformers  # options: openai | sentence_transformers
-      embedding_model: paraphrase-multilingual-MiniLM-L12-v2  # openai: text-embedding-3-small | st: paraphrase-multilingual-MiniLM-L12-v2
-      top_k: 3
-      similarity_threshold: 0.65
       sources:
         - path: ./data/labour_schemes.pdf
           type: static
@@ -72,12 +55,6 @@ knowledge:
           type: always_include
           doc_type: always_include
           refresh: manual
-      metadata_filters:
-        use_location_filter: true
-        use_intent_filter: true
-      # Maps intent names to the doc_types to search within ChromaDB.
-      # Empty list means no doc_type filter — all documents are searched.
-      # Add or change entries here when deploying to a new domain.
       intent_filters:
         market_truth_query: [scheme, trade, bridge_income]
         scheme_query: [scheme]
@@ -88,11 +65,7 @@ knowledge:
         unknown: []
 
     multimodal_input_handler:
-      enabled: false
-      supported_types: [pdf, image]
-      audio_enabled: false
-      image_model: claude-haiku-4-5-20251001  # PoC/dev: Haiku. Change to claude-sonnet-4-6 for prod.
-      max_file_size_mb: 10
+      image_model: claude-haiku-4-5-20251001
 
 conversation:
   persona:
@@ -102,8 +75,6 @@ conversation:
       Speak like a knowledgeable neighbour — informal, simple words, no jargon.
       You speak in Hindi, Hinglish, Kannada, and English depending on what the user prefers.
       If you do not know something, say so honestly.
-  # Injected as the second block of the system prompt, after persona and before guardrails.
-  # Change this for deployments that use a different language set or must respond only in one language.
   language_instruction: >-
     Respond in the same language the user is using.
     If they mix Hindi and English (Hinglish), respond in Hinglish.

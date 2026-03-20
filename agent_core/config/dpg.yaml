@@ -1,0 +1,18 @@
+# agent_core/config/dpg.yaml — DPG framework defaults.
+# These values are the same for any domain deployment.
+
+server:
+  host: 0.0.0.0
+  port: 8000
+
+agent:
+  timeout_ms: 10000
+  retry_attempts: 2
+  retry_backoff_seconds: [0, 0.5, 1.0]
+  max_tool_rounds: 1
+
+conversation:
+  max_turns: 20
+  blocked_message: "I'm unable to help with that request."
+  escalation_message: "I'm connecting you to a human agent who can better assist you."
+  output_blocked_message: "I wasn't able to produce a safe response. Please try rephrasing your question."

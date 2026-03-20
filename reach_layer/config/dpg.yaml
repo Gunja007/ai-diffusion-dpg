@@ -1,0 +1,13 @@
+# reach_layer/config/dpg.yaml — DPG framework defaults.
+
+server:
+  host: 0.0.0.0
+  port: 8005
+
+reach_layer:
+  cli:
+    prompt: "You: "
+    agent_prefix: "Agent: "
+
+agent_core_client:
+  timeout_s: 30.0

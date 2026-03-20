@@ -1,0 +1,8 @@
+# action_gateway/config/dpg.yaml — DPG framework defaults.
+
+server:
+  host: 0.0.0.0
+  port: 9999
+
+action_gateway:
+  timeout_ms: 5000

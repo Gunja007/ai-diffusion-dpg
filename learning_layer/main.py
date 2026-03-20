@@ -45,12 +45,23 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-def _load_config(path: str = "config/config.yaml") -> dict:
+def _load_config(path: str) -> dict:
     config_path = Path(path)
     if not config_path.exists():
         raise FileNotFoundError(f"Config file not found: {config_path.resolve()}")
     with config_path.open("r") as f:
         return yaml.safe_load(f) or {}
+
+
+def _deep_merge(base: dict, override: dict) -> dict:
+    """Merge override into base. Override values win. Dicts are merged recursively."""
+    result = base.copy()
+    for key, value in override.items():
+        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+            result[key] = _deep_merge(result[key], value)
+        else:
+            result[key] = value
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -59,7 +70,9 @@ def _load_config(path: str = "config/config.yaml") -> dict:
 
 
 def _build_app():
-    config = _load_config()
+    dpg_config = _load_config("config/dpg.yaml")
+    domain_config = _load_config("config/domain.yaml")
+    config = _deep_merge(dpg_config, domain_config)
 
     learning = ConsoleLogger(config)
     app = create_app(learning)

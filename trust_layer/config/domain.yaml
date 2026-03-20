@@ -1,10 +1,5 @@
-# trust_layer/config/config.yaml — Trust Layer rule configuration for KKB PoC.
-# All phrase lists are domain-specific — change these for a different deployment.
-
-server:
-  host: "0.0.0.0"
-  port: 8003
-
+# trust_layer/config/domain.yaml — KKB domain config (local dev).
+# In Docker/Kubernetes this file is replaced by dev-kit/configs/kkb/trust_layer.yaml.
 
 trust:
   input_rules:
@@ -26,5 +21,5 @@ trust:
     blocked_phrases:
       - "I cannot help with that"
       - "as an AI, I"
-      - "guaranteed placement"    # guardrail: never promise placement
-      - "100% job guarantee"      # guardrail: never promise job guarantee
+      - "guaranteed placement"
+      - "100% job guarantee"

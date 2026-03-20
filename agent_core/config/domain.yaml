@@ -1,0 +1,60 @@
+# agent_core/config/domain.yaml — KKB domain config (local dev).
+# In Docker/Kubernetes this file is replaced by dev-kit/configs/kkb/agent_core.yaml.
+
+agent:
+  primary_model: claude-haiku-4-5-20251001
+  fallback_model: claude-haiku-4-5-20251001
+
+connectors:
+  read:
+    - name: onest_market_lookup
+      description: "Search ONEST live job market data by trade and location"
+  write: []
+  identity: []
+
+ke_client:
+  endpoint: "http://localhost:8001/assemble_prompt"
+  timeout_ms: 30000
+
+memory_client:
+  endpoint: "http://localhost:8002"
+  timeout_ms: 3000
+
+trust_client:
+  endpoint: "http://localhost:8003"
+  timeout_ms: 2000
+
+learning_client:
+  endpoint: "http://localhost:8004"
+  timeout_ms: 2000
+
+action_gateway_client:
+  endpoint: "http://localhost:9999/onest/market_lookup"
+  timeout_ms: 5000
+
+preprocessing:
+  language_normalisation:
+    model: claude-haiku-4-5-20251001
+    provider: llm_native
+    supported_languages: [hindi, kannada, english, hinglish]
+    transliteration: true
+    code_switching: true
+    bhashini:
+      api_key_env: BHASHINI_API_KEY
+      user_id_env: BHASHINI_USER_ID
+      endpoint: https://dhruva-api.bhashini.gov.in/services/inference/pipeline
+
+  nlu_processor:
+    model: claude-haiku-4-5-20251001
+    confidence_threshold: 0.5
+    history_turns: 2
+    intents:
+      - market_truth_query
+      - scheme_query
+      - training_query
+      - apply_now
+      - counsellor_request
+      - pay_range_query
+      - unknown
+    entities: [trade, location, distance_km, income_urgency]
+    sentiment_classes: [neutral, positive, distressed, frustrated]

@@ -89,12 +89,23 @@ class HealthResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-def _load_config(path: str = "config/config.yaml") -> dict:
+def _load_config(path: str) -> dict:
     config_path = Path(path)
     if not config_path.exists():
         raise FileNotFoundError(f"Config file not found: {config_path.resolve()}")
     with config_path.open("r") as f:
-        return yaml.safe_load(f)
+        return yaml.safe_load(f) or {}
+
+
+def _deep_merge(base: dict, override: dict) -> dict:
+    """Merge override into base. Override values win. Dicts are merged recursively."""
+    result = base.copy()
+    for key, value in override.items():
+        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+            result[key] = _deep_merge(result[key], value)
+        else:
+            result[key] = value
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -196,7 +207,9 @@ def create_app(ke: KnowledgeEngine, config: dict) -> FastAPI:
 
 
 def _build_app():
-    config = _load_config()
+    dpg_config = _load_config("config/dpg.yaml")
+    domain_config = _load_config("config/domain.yaml")
+    config = _deep_merge(dpg_config, domain_config)
 
     knowledge_cfg = config.get("knowledge", {})
     if not knowledge_cfg:

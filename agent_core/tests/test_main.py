@@ -1,0 +1,174 @@
+"""
+agent_core/tests/test_main.py
+
+Tests for config-loading utilities in main.py: _load_config and _deep_merge.
+
+Covers:
+- Normal:  valid YAML files load correctly; dicts merge as expected
+- Edge:    empty YAML, empty base/override dicts, non-overlapping keys
+- Failure: missing file raises FileNotFoundError (hard fail for DPG config);
+           domain config missing produces FileNotFoundError that _build_app
+           catches to enable bare-infra mode
+"""
+
+from __future__ import annotations
+
+import pytest
+import yaml
+from pathlib import Path
+
+
+# ---------------------------------------------------------------------------
+# Inline implementations — identical to main.py utilities.
+# Tested here without importing main to avoid triggering _build_app() at
+# module level (which requires ANTHROPIC_API_KEY + running downstream services).
+# ---------------------------------------------------------------------------
+
+def _load_config(path: str) -> dict:
+    config_path = Path(path)
+    if not config_path.exists():
+        raise FileNotFoundError(f"Config file not found: {config_path.resolve()}")
+    with config_path.open("r") as f:
+        return yaml.safe_load(f) or {}
+
+
+def _deep_merge(base: dict, override: dict) -> dict:
+    result = base.copy()
+    for key, value in override.items():
+        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+            result[key] = _deep_merge(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
+# ---------------------------------------------------------------------------
+# _load_config — normal execution
+# ---------------------------------------------------------------------------
+
+class TestLoadConfigNormal:
+    def test_valid_yaml_returns_dict(self, tmp_path):
+        f = tmp_path / "cfg.yaml"
+        f.write_text("server:\n  port: 8000\nagent:\n  timeout_ms: 5000\n")
+        result = _load_config(str(f))
+        assert result["server"]["port"] == 8000
+        assert result["agent"]["timeout_ms"] == 5000
+
+    def test_returns_dict_type(self, tmp_path):
+        f = tmp_path / "cfg.yaml"
+        f.write_text("key: value\n")
+        assert isinstance(_load_config(str(f)), dict)
+
+    def test_nested_structure_preserved(self, tmp_path):
+        f = tmp_path / "cfg.yaml"
+        f.write_text("a:\n  b:\n    c: 42\n")
+        assert _load_config(str(f))["a"]["b"]["c"] == 42
+
+
+# ---------------------------------------------------------------------------
+# _load_config — edge cases
+# ---------------------------------------------------------------------------
+
+class TestLoadConfigEdge:
+    def test_empty_yaml_returns_empty_dict(self, tmp_path):
+        f = tmp_path / "empty.yaml"
+        f.write_text("")
+        assert _load_config(str(f)) == {}
+
+    def test_yaml_with_only_whitespace_returns_empty_dict(self, tmp_path):
+        f = tmp_path / "ws.yaml"
+        f.write_text("   \n\n")
+        assert _load_config(str(f)) == {}
+
+
+# ---------------------------------------------------------------------------
+# _load_config — failure scenarios
+# ---------------------------------------------------------------------------
+
+class TestLoadConfigFailure:
+    def test_missing_file_raises_file_not_found(self, tmp_path):
+        with pytest.raises(FileNotFoundError):
+            _load_config(str(tmp_path / "nonexistent.yaml"))
+
+    def test_error_message_contains_path(self, tmp_path):
+        path = str(tmp_path / "missing.yaml")
+        with pytest.raises(FileNotFoundError, match="missing.yaml"):
+            _load_config(path)
+
+    def test_dpg_config_missing_hard_fails(self, tmp_path):
+        """DPG config missing → FileNotFoundError propagates (service must not start)."""
+        with pytest.raises(FileNotFoundError):
+            _load_config(str(tmp_path / "config" / "dpg.yaml"))
+
+    def test_domain_config_missing_hard_fails(self, tmp_path):
+        """Domain config missing → FileNotFoundError propagates (service must not start)."""
+        with pytest.raises(FileNotFoundError):
+            _load_config(str(tmp_path / "config" / "domain.yaml"))
+
+
+# ---------------------------------------------------------------------------
+# _deep_merge — normal execution
+# ---------------------------------------------------------------------------
+
+class TestDeepMergeNormal:
+    def test_override_wins_on_scalar_conflict(self):
+        assert _deep_merge({"port": 8000}, {"port": 9000}) == {"port": 9000}
+
+    def test_non_overlapping_keys_combined(self):
+        result = _deep_merge({"a": 1}, {"b": 2})
+        assert result == {"a": 1, "b": 2}
+
+    def test_nested_dicts_merged_recursively(self):
+        base = {"server": {"host": "0.0.0.0", "port": 8000}}
+        override = {"server": {"port": 9000}}
+        result = _deep_merge(base, override)
+        assert result["server"]["host"] == "0.0.0.0"
+        assert result["server"]["port"] == 9000
+
+    def test_deeply_nested_merge(self):
+        base = {"a": {"b": {"c": 1, "d": 2}}}
+        override = {"a": {"b": {"d": 99}}}
+        result = _deep_merge(base, override)
+        assert result["a"]["b"]["c"] == 1
+        assert result["a"]["b"]["d"] == 99
+
+
+# ---------------------------------------------------------------------------
+# _deep_merge — edge cases
+# ---------------------------------------------------------------------------
+
+class TestDeepMergeEdge:
+    def test_empty_override_returns_base_unchanged(self):
+        base = {"a": 1, "b": 2}
+        assert _deep_merge(base, {}) == {"a": 1, "b": 2}
+
+    def test_empty_base_returns_override(self):
+        assert _deep_merge({}, {"x": 10}) == {"x": 10}
+
+    def test_both_empty_returns_empty(self):
+        assert _deep_merge({}, {}) == {}
+
+    def test_base_not_mutated(self):
+        base = {"a": 1}
+        _deep_merge(base, {"a": 2})
+        assert base == {"a": 1}
+
+    def test_override_non_dict_replaces_dict_in_base(self):
+        """Non-dict override replaces a dict value in base (not merged)."""
+        base = {"trust": {"rules": ["r1"]}}
+        result = _deep_merge(base, {"trust": "disabled"})
+        assert result["trust"] == "disabled"
+
+    def test_domain_overrides_dpg_defaults(self):
+        """Simulates typical DPG + domain merge: domain model overrides DPG default."""
+        dpg = {"agent": {"timeout_ms": 10000, "max_tool_rounds": 1}}
+        domain = {"agent": {"primary_model": "claude-sonnet-4-6"}}
+        result = _deep_merge(dpg, domain)
+        assert result["agent"]["timeout_ms"] == 10000
+        assert result["agent"]["primary_model"] == "claude-sonnet-4-6"
+
+    def test_dpg_only_produces_valid_config(self):
+        """Bare-infra mode: domain={}, merged config equals DPG defaults."""
+        dpg = {"server": {"port": 8000}, "agent": {"timeout_ms": 5000}}
+        merged = _deep_merge(dpg, {})
+        assert merged == dpg

@@ -70,12 +70,23 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-def _load_config(path: str = "config/config.yaml") -> dict:
+def _load_config(path: str) -> dict:
     config_path = Path(path)
     if not config_path.exists():
         raise FileNotFoundError(f"Config file not found: {config_path.resolve()}")
     with config_path.open("r") as f:
         return yaml.safe_load(f) or {}
+
+
+def _deep_merge(base: dict, override: dict) -> dict:
+    """Merge override into base. Override values win. Dicts are merged recursively."""
+    result = base.copy()
+    for key, value in override.items():
+        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+            result[key] = _deep_merge(result[key], value)
+        else:
+            result[key] = value
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -84,33 +95,29 @@ def _load_config(path: str = "config/config.yaml") -> dict:
 
 
 def _build_app():
-    config = _load_config()
+    dpg_config = _load_config("config/dpg.yaml")
+    domain_config = _load_config("config/domain.yaml")
+    config = _deep_merge(dpg_config, domain_config)
 
-    agent_cfg = config.get("agent")
-    if not agent_cfg:
-        raise ValueError("Config missing required 'agent' section")
+    agent_cfg = config.get("agent", {})
 
-    # ── LLM Wrapper — the only component that calls the Anthropic API ─────
     llm = ClaudeLLMWrapper(agent_cfg)
 
-    # ── HTTP Clients — one per downstream service ─────────────────────────
-    memory = MemoryLayerHttpClient(config)
-    trust = TrustLayerHttpClient(config)
+    memory   = MemoryLayerHttpClient(config)
+    trust    = TrustLayerHttpClient(config)
     learning = LearningLayerHttpClient(config)
-    ke = HttpKnowledgeEngineClient(config)
-    gateway = ActionGatewayHttpClient(config)
+    ke       = HttpKnowledgeEngineClient(config)
+    gateway  = ActionGatewayHttpClient(config)
 
     # ── Tool Registry — built from gateway's tool definitions ─────────────
     tool_registry = ToolRegistry(config=config, gateway=gateway)
 
-    # ── Manager Agent — owns the tool-use loop ────────────────────────────
-    max_tool_rounds = agent_cfg.get("max_tool_rounds", 1)
     manager = ManagerAgent(
         llm_wrapper=llm,
         tool_registry=tool_registry,
         action_gateway=gateway,
         trust_layer=trust,
-        max_tool_rounds=max_tool_rounds,
+        max_tool_rounds=agent_cfg.get("max_tool_rounds", 1),
     )
 
     # ── Agent Core — central orchestrator ────────────────────────────────
@@ -124,6 +131,8 @@ def _build_app():
         manager_agent=manager,
         learning=learning,
     )
+
+    model_name = llm.get_active_model()
 
     # ── FastAPI app ───────────────────────────────────────────────────────
     app = create_orchestration_app(agent_core)
@@ -139,7 +148,7 @@ def _build_app():
             "status": "success",
             "host": host,
             "port": port,
-            "model": llm.get_active_model(),
+            "model": model_name,
         },
     )
 

@@ -48,35 +48,42 @@ logger = logging.getLogger(__name__)
 # Config: read Agent Core endpoint from reach_layer's own config
 # ---------------------------------------------------------------------------
 
-_CONFIG_PATH = Path(__file__).parent / "config" / "config.yaml"
 _DEFAULT_AC_ENDPOINT = "http://localhost:8000/process_turn"
 _DEFAULT_TIMEOUT_S = 30.0
 
 
+def _load_yaml(path: str) -> dict:
+    config_path = Path(path)
+    if not config_path.exists():
+        raise FileNotFoundError(f"Config file not found: {config_path.resolve()}")
+    with config_path.open("r") as f:
+        return yaml.safe_load(f) or {}
+
+
+def _deep_merge(base: dict, override: dict) -> dict:
+    """Merge override into base. Override values win. Dicts are merged recursively."""
+    result = base.copy()
+    for key, value in override.items():
+        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+            result[key] = _deep_merge(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
 def _load_config() -> tuple[str, float]:
     """
-    Read agent_core_client.endpoint and timeout_s from reach_layer/config/config.yaml.
-    Returns (endpoint, timeout_s). Falls back to defaults on any error.
+    Read agent_core_client.endpoint and timeout_s from merged dpg.yaml + domain.yaml.
+    DPG config missing → hard failure. Domain config missing → runs with DPG defaults.
+    Returns (endpoint, timeout_s).
     """
-    try:
-        if not _CONFIG_PATH.exists():
-            return _DEFAULT_AC_ENDPOINT, _DEFAULT_TIMEOUT_S
-        with _CONFIG_PATH.open("r") as f:
-            config = yaml.safe_load(f) or {}
-        client_cfg = config.get("agent_core_client", {})
-        endpoint = client_cfg.get("endpoint", _DEFAULT_AC_ENDPOINT)
-        timeout_s = float(client_cfg.get("timeout_s", _DEFAULT_TIMEOUT_S))
-        return endpoint, timeout_s
-    except Exception as e:
-        logger.warning(
-            "reach_layer.config_load_failed",
-            extra={
-                "operation": "main._load_config",
-                "status": "failure",
-                "error": str(e),
-            },
-        )
-        return _DEFAULT_AC_ENDPOINT, _DEFAULT_TIMEOUT_S
+    dpg_config = _load_yaml("config/dpg.yaml")
+    domain_config = _load_yaml("config/domain.yaml")
+    config = _deep_merge(dpg_config, domain_config)
+    client_cfg = config.get("agent_core_client", {})
+    endpoint = client_cfg.get("endpoint", _DEFAULT_AC_ENDPOINT)
+    timeout_s = float(client_cfg.get("timeout_s", _DEFAULT_TIMEOUT_S))
+    return endpoint, timeout_s
 
 
 # ---------------------------------------------------------------------------
