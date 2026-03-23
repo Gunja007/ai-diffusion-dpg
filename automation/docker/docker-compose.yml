@@ -1,17 +1,16 @@
 # automation/docker/docker-compose.yml
 #
-# Runs all 7 DPG services on a single machine.
+# Runs all 7 DPG services on a single machine using pre-built Docker Hub images.
 # Each service receives two volume-mounted config files:
 #   /app/config/dpg.yaml    — DPG framework defaults (from dev-kit/dpg/)
 #   /app/config/domain.yaml — domain-specific values (from dev-kit/configs/kkb/)
 # Services deep-merge these at startup: domain values override DPG defaults.
-# Domain config missing → service starts in bare-infra mode; exceptions thrown at request time.
+# Both config files are mandatory — service will not start if either is missing.
 #
 # Prerequisites:
 #   1. cp .env.example .env && edit .env  (add ANTHROPIC_API_KEY)
-#   2. docker compose build               (build all service images)
-#   3. docker compose up -d               (start background services)
-#   4. docker compose run --rm reach_layer (interactive CLI session)
+#   2. docker compose up -d               (start background services)
+#   3. docker compose run --rm reach_layer (interactive CLI session)
 #
 # Paths in this file are relative to the docker-compose.yml location.
 # ../../ resolves to the repository root.
@@ -22,7 +21,7 @@ services:
   # Memory Layer — session state store (port 8002)
   # ---------------------------------------------------------------------------
   memory_layer:
-    build: ../../memory_layer
+    image: srivatsak2002/dpg-memory-layer:latest
     container_name: memory_layer
     volumes:
       - ../../dev-kit/dpg/memory_layer.yaml:/app/config/dpg.yaml:ro
@@ -41,7 +40,7 @@ services:
   # Trust Layer — content safety gate (port 8003)
   # ---------------------------------------------------------------------------
   trust_layer:
-    build: ../../trust_layer
+    image: srivatsak2002/dpg-trust-layer:latest
     container_name: trust_layer
     volumes:
       - ../../dev-kit/dpg/trust_layer.yaml:/app/config/dpg.yaml:ro
@@ -60,7 +59,7 @@ services:
   # Learning Layer — async observability (port 8004)
   # ---------------------------------------------------------------------------
   learning_layer:
-    build: ../../learning_layer
+    image: srivatsak2002/dpg-learning-layer:latest
     container_name: learning_layer
     volumes:
       - ../../dev-kit/dpg/learning_layer.yaml:/app/config/dpg.yaml:ro
@@ -79,7 +78,7 @@ services:
   # Action Gateway — external API stub / ONEST mock (port 9999)
   # ---------------------------------------------------------------------------
   action_gateway:
-    build: ../../action_gateway
+    image: srivatsak2002/dpg-action-gateway:latest
     container_name: action_gateway
     volumes:
       - ../../dev-kit/dpg/action_gateway.yaml:/app/config/dpg.yaml:ro
@@ -98,7 +97,7 @@ services:
   # Knowledge Engine — RAG, NLU, prompt assembly (port 8001)
   # ---------------------------------------------------------------------------
   knowledge_engine:
-    build: ../../knowledge_engine
+    image: srivatsak2002/dpg-knowledge-engine:latest
     container_name: knowledge_engine
     volumes:
       - ../../dev-kit/dpg/knowledge_engine.yaml:/app/config/dpg.yaml:ro
@@ -118,7 +117,7 @@ services:
   # Agent Core — orchestrator and LLM caller (port 8000)
   # ---------------------------------------------------------------------------
   agent_core:
-    build: ../../agent_core
+    image: srivatsak2002/dpg-agent-core:latest
     container_name: agent_core
     env_file: .env                         # injects ANTHROPIC_API_KEY
     volumes:
@@ -150,7 +149,7 @@ services:
   # Run separately: docker compose run --rm reach_layer
   # ---------------------------------------------------------------------------
   reach_layer:
-    build: ../../reach_layer
+    image: srivatsak2002/dpg-reach-layer:latest
     container_name: reach_layer
     volumes:
       - ../../dev-kit/dpg/reach_layer.yaml:/app/config/dpg.yaml:ro
