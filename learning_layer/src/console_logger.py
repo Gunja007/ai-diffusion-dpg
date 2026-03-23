@@ -86,19 +86,63 @@ class ConsoleLogger:
 
             trust_in = _get("trust_input_result")
             trust_out = _get("trust_output_result")
+            tool_calls = _get("tool_calls", []) or []
+            response_text = _get("response_text", "")
+            session_id = _get("session_id", "")
+            model_used = _get("model_used", "")
+            input_tokens = _get("input_tokens", 0)
+            output_tokens = _get("output_tokens", 0)
+            latency_ms = _get("latency_ms", 0)
+
+            # Format tool calls for display
+            tool_calls_str = "none"
+            if tool_calls:
+                tool_calls_str = ", ".join(
+                    f"{tc.get('tool_name', '?')}({tc.get('input_params', {})})"
+                    if isinstance(tc, dict)
+                    else f"{getattr(tc, 'tool_name', '?')}({getattr(tc, 'input_params', {})})"
+                    for tc in tool_calls
+                )
+
+            # Truncate long response text for readability
+            response_preview = (response_text[:300] + "...") if len(response_text) > 300 else response_text
+
+            logger.info(
+                "\n"
+                "┌─────────────────────────────────────────────────────────────────\n"
+                "│  LEARNING LAYER — TURN AUDIT\n"
+                "│  session_id   : %s\n"
+                "│  model        : %s\n"
+                "│  tokens       : %d in / %d out\n"
+                "│  latency      : %d ms\n"
+                "│  trust input  : %s\n"
+                "│  trust output : %s\n"
+                "│  tool calls   : %s\n"
+                "│  response     : %s\n"
+                "└─────────────────────────────────────────────────────────────────",
+                session_id,
+                model_used,
+                input_tokens,
+                output_tokens,
+                latency_ms,
+                _trust_action(trust_in),
+                _trust_action(trust_out),
+                tool_calls_str,
+                response_preview,
+            )
 
             logger.info(
                 "learning_layer.turn_event",
                 extra={
                     "operation": "console_logger.emit_turn",
                     "status": "success",
-                    "session_id": _get("session_id", ""),
-                    "model_used": _get("model_used", ""),
-                    "input_tokens": _get("input_tokens", 0),
-                    "output_tokens": _get("output_tokens", 0),
-                    "latency_ms": _get("latency_ms", 0),
+                    "session_id": session_id,
+                    "model_used": model_used,
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "latency_ms": latency_ms,
                     "timestamp_ms": _get("timestamp_ms", 0),
-                    "tool_calls_count": len(_get("tool_calls", []) or []),
+                    "tool_calls_count": len(tool_calls),
                     "trust_input_action": _trust_action(trust_in),
                     "trust_output_action": _trust_action(trust_out),
                     "emit_latency_ms": int((time.time() - start) * 1000),

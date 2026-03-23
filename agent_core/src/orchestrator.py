@@ -121,35 +121,110 @@ class AgentCore(AgentCoreBase):
                 "channel": turn_input.channel,
             },
         )
+        logger.info(
+            "\n═══════════════════════════════════════════════════════════════\n"
+            "  TURN START  session=%s  channel=%s\n"
+            "  input: %r\n"
+            "═══════════════════════════════════════════════════════════════",
+            session_id, turn_input.channel, turn_input.user_message[:120],
+        )
 
         # ── Step 1: Read session state ────────────────────────────────
+        memory_endpoint = (
+            self._config.get("memory_client", {}).get("endpoint", "http://memory_layer:8002")
+        )
+        logger.info(
+            "  [STEP 1] Memory Read  →  POST %s/session/read  (session=%s)",
+            memory_endpoint, session_id,
+        )
+        t1 = time.time()
         state = self._memory.read_session(session_id)
+        logger.info(
+            "  [STEP 1] Memory Read  ✓  history_turns=%d  confirmed_entities=%s  latency=%dms",
+            len(state.history) // 2,
+            list(state.confirmed_entities.keys()) if state.confirmed_entities else [],
+            int((time.time() - t1) * 1000),
+        )
 
         # ── Step 2: Trust check on input ─────────────────────────────
+        trust_endpoint = (
+            self._config.get("trust_client", {}).get("endpoint", "http://trust_layer:8003")
+        )
+        logger.info(
+            "  [STEP 2] Trust Input Check  →  POST %s/check/input  (session=%s)",
+            trust_endpoint, session_id,
+        )
+        t2 = time.time()
         trust_input = self._trust.check_input(session_id, turn_input.user_message)
+        logger.info(
+            "  [STEP 2] Trust Input Check  ✓  action=%s  passed=%s  reason=%s  latency=%dms",
+            trust_input.action, trust_input.passed,
+            trust_input.reason or "—", int((time.time() - t2) * 1000),
+        )
 
         if trust_input.action == "block":
+            logger.info(
+                "  [STEP 2] ✗ INPUT BLOCKED — reason=%s  →  returning blocked response",
+                trust_input.reason,
+            )
             return self._blocked_response(session_id, trust_input, start, trust_input)
 
         if trust_input.action == "escalate":
+            logger.info(
+                "  [STEP 2] ⚠ INPUT ESCALATED — reason=%s  →  routing to human agent",
+                trust_input.reason,
+            )
             return self._escalated_response(session_id, trust_input, start, trust_input)
 
         # ── Step 3: Language Normalisation ───────────────────────────
         # Uses Haiku (model_override in config) — reads from preprocessing.language_normalisation
+        lang_model = (
+            self._config.get("preprocessing", {})
+            .get("language_normalisation", {})
+            .get("model_override", "haiku")
+        )
+        logger.info(
+            "  [STEP 3] Language Normalisation  →  LLM call (model_override=%s)",
+            lang_model,
+        )
+        t3 = time.time()
         normalised_input, detected_language = self._language_normaliser.normalise(
             raw_input=turn_input.user_message,
             config=self._config,
             llm=self._llm,
         )
+        logger.info(
+            "  [STEP 3] Language Normalisation  ✓  detected_language=%s  normalised=%r  latency=%dms",
+            detected_language or "en",
+            (normalised_input or turn_input.user_message)[:100],
+            int((time.time() - t3) * 1000),
+        )
 
         # ── Step 4: NLU Processor ─────────────────────────────────────
         # Injects recent history for context-aware follow-up classification.
         # Uses Haiku (model_override in config) — reads from preprocessing.nlu_processor
+        nlu_model = (
+            self._config.get("preprocessing", {})
+            .get("nlu_processor", {})
+            .get("model_override", "haiku")
+        )
+        logger.info(
+            "  [STEP 4] NLU Processor  →  LLM call (model_override=%s)  history_turns=%d",
+            nlu_model, len(state.history) // 2,
+        )
+        t4 = time.time()
         nlu_result = self._nlu_processor.process(
             normalised_input=normalised_input,
             history=state.history,
             config=self._config,
             llm=self._llm,
+        )
+        logger.info(
+            "  [STEP 4] NLU Processor  ✓  intent=%s  confidence=%.2f  entities=%s  sentiment=%s  latency=%dms",
+            nlu_result.intent, nlu_result.confidence,
+            nlu_result.entities if nlu_result.entities else {},
+            nlu_result.sentiment,
+            int((time.time() - t4) * 1000),
         )
 
         # ── Step 5: Early exit on unknown / low-confidence intent ─────
@@ -158,12 +233,30 @@ class AgentCore(AgentCoreBase):
             .get("nlu_processor", {})
             .get("confidence_threshold", 0.5)
         )
+        logger.info(
+            "  [STEP 5] Intent Gate  →  intent=%s  confidence=%.2f  threshold=%.2f",
+            nlu_result.intent, nlu_result.confidence, confidence_threshold,
+        )
         if nlu_result.intent == "unknown" or nlu_result.confidence < confidence_threshold:
+            logger.info(
+                "  [STEP 5] ✗ EARLY EXIT — intent below threshold  →  returning unknown-intent response",
+            )
             return self._unknown_intent_response(session_id, start)
+        logger.info("  [STEP 5] Intent Gate  ✓  proceeding")
 
         # ── Step 6: Assemble prompt (KE) ─────────────────────────────
         # KE receives pre-computed NLU data — runs only Glossary, Static KB, Multimodal.
         # Returns (messages, system): system goes to llm.call(), messages are the conversation.
+        ke_endpoint = (
+            self._config.get("knowledge_engine_client", {}).get("endpoint", "http://knowledge_engine:8001")
+        )
+        logger.info(
+            "  [STEP 6] Knowledge Engine  →  POST %s/assemble_prompt"
+            "  (intent=%s  entities=%s)",
+            ke_endpoint, nlu_result.intent,
+            nlu_result.entities if nlu_result.entities else {},
+        )
+        t6 = time.time()
         messages, system = self._knowledge_engine.assemble_prompt(
             session_id=session_id,
             user_message=turn_input.user_message,
@@ -174,6 +267,12 @@ class AgentCore(AgentCoreBase):
             entities=nlu_result.entities,
             sentiment=nlu_result.sentiment,
             confidence=nlu_result.confidence,
+        )
+        rag_chunks = len(messages[-1]["content"].split("--- Relevant knowledge ---")) - 1 if messages else 0
+        logger.info(
+            "  [STEP 6] Knowledge Engine  ✓  message_count=%d  rag_chunks_found=%d"
+            "  system_prompt_len=%d  latency=%dms",
+            len(messages), rag_chunks, len(system), int((time.time() - t6) * 1000),
         )
 
         # Empty prompt edge case — return safe empty response
@@ -203,23 +302,73 @@ class AgentCore(AgentCoreBase):
 
         # ── Step 7: LLM call #1 ──────────────────────────────────────
         tools = self._tool_registry.get_tool_definitions()
+        primary_model = self._config.get("agent", {}).get("primary_model", "unknown")
+        logger.info(
+            "  [STEP 7] LLM Call #1  →  Anthropic API (model=%s)"
+            "  tools_available=%d  message_count=%d",
+            primary_model, len(tools), len(messages),
+        )
+        t7 = time.time()
         llm_response = self._llm.call(messages=messages, tools=tools, system=system)
+        logger.info(
+            "  [STEP 7] LLM Call #1  ✓  stop_reason=%s  model_used=%s"
+            "  input_tokens=%d  output_tokens=%d  latency=%dms",
+            llm_response.stop_reason, llm_response.model_used,
+            llm_response.input_tokens, llm_response.output_tokens,
+            int((time.time() - t7) * 1000),
+        )
+        if llm_response.stop_reason == "tool_use":
+            logger.info("  [STEP 7]   → LLM requested tool use — entering tool loop")
 
         # ── Step 8: Tool-use loop ─────────────────────────────────────
+        ag_endpoint = (
+            self._config.get("action_gateway_client", {}).get("endpoint", "http://action_gateway:8005")
+        )
+        logger.info(
+            "  [STEP 8] Tool-Use Loop  →  Action Gateway %s (if tool requested)", ag_endpoint,
+        )
+        t8 = time.time()
         final_text, tool_calls = self._manager_agent.run_turn(
             messages=messages,
             session_id=session_id,
             initial_llm_response=llm_response,
         )
+        if tool_calls:
+            tool_names = [tc.tool_name for tc in tool_calls]
+            logger.info(
+                "  [STEP 8] Tool-Use Loop  ✓  tools_called=%s  latency=%dms",
+                tool_names, int((time.time() - t8) * 1000),
+            )
+        else:
+            logger.info(
+                "  [STEP 8] Tool-Use Loop  ✓  no tool used — direct LLM response  latency=%dms",
+                int((time.time() - t8) * 1000),
+            )
 
         # ── Step 9: Trust check on output ────────────────────────────
+        logger.info(
+            "  [STEP 9] Trust Output Check  →  POST %s/check/output  (session=%s)",
+            trust_endpoint, session_id,
+        )
+        t9 = time.time()
         trust_output = self._trust.check_output(session_id, final_text)
+        logger.info(
+            "  [STEP 9] Trust Output Check  ✓  action=%s  passed=%s  latency=%dms",
+            trust_output.action, trust_output.passed, int((time.time() - t9) * 1000),
+        )
 
         if trust_output.action in ("block", "escalate"):
+            logger.info(
+                "  [STEP 9] ⚠ OUTPUT %s — replacing with safe fallback",
+                trust_output.action.upper(),
+            )
             final_text = self._safe_fallback_message()
 
         # ── Step 10: Build result and return ─────────────────────────
         latency_ms = int((time.time() - start) * 1000)
+        logger.info(
+            "  [STEP 10] Delivering response to caller  (async: memory write + learning emit follow)",
+        )
         result = self._build_result(
             session_id=session_id,
             response_text=final_text,
@@ -245,6 +394,16 @@ class AgentCore(AgentCoreBase):
                 "tool_used": bool(tool_calls),
                 "intent": nlu_result.intent,
             },
+        )
+        logger.info(
+            "\n═══════════════════════════════════════════════════════════════\n"
+            "  TURN COMPLETE  session=%s  intent=%s  tool_used=%s\n"
+            "  model=%s  total_latency=%dms\n"
+            "  response: %r\n"
+            "═══════════════════════════════════════════════════════════════",
+            session_id, nlu_result.intent, bool(tool_calls),
+            llm_response.model_used, latency_ms,
+            final_text[:200],
         )
 
         return result
@@ -433,8 +592,24 @@ class AgentCore(AgentCoreBase):
         Runs in a daemon thread after TurnResult is returned to the caller.
         Any exception here is logged and swallowed — must never crash the thread.
         """
+        memory_endpoint = (
+            self._config.get("memory_client", {}).get("endpoint", "http://memory_layer:8002")
+        )
+        learning_endpoint = (
+            self._config.get("learning_client", {}).get("endpoint", "http://learning_layer:8004")
+        )
+
+        logger.info(
+            "  [STEP 11] [async] Memory Write  →  POST %s/session/write  (session=%s)",
+            memory_endpoint, session_id,
+        )
         try:
+            t11 = time.time()
             self._memory.write_session(session_id, updated_state)
+            logger.info(
+                "  [STEP 11] [async] Memory Write  ✓  history_turns=%d  latency=%dms",
+                len(updated_state.history) // 2, int((time.time() - t11) * 1000),
+            )
         except Exception as e:
             logger.error(
                 "orchestrator.memory_write_failed",
@@ -446,8 +621,17 @@ class AgentCore(AgentCoreBase):
                 },
             )
 
+        logger.info(
+            "  [STEP 12] [async] Learning Emit  →  POST %s/emit/turn  (session=%s)",
+            learning_endpoint, session_id,
+        )
         try:
+            t12 = time.time()
             self._learning.emit_turn(turn_event)
+            logger.info(
+                "  [STEP 12] [async] Learning Emit  ✓  latency=%dms",
+                int((time.time() - t12) * 1000),
+            )
         except Exception as e:
             logger.error(
                 "orchestrator.learning_emit_failed",

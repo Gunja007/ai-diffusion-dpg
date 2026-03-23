@@ -1,10 +1,6 @@
-# automation/docker/docker-compose.yml  (LOCAL BUILD)
+# automation/docker/docker-compose.yml
 #
-# Builds all 7 DPG services from source using each service's Dockerfile.
-# Use this file for local development — images are built on your machine.
-#
-# For pre-built Docker Hub images, use docker-compose.dev.yml instead.
-#
+# Runs all 7 DPG services on a single machine using pre-built Docker Hub images.
 # Each service receives two volume-mounted config files:
 #   /app/config/dpg.yaml    — DPG framework defaults (from dev-kit/dpg/)
 #   /app/config/domain.yaml — domain-specific values (from dev-kit/configs/kkb/)
@@ -20,16 +16,15 @@
 #
 # Prerequisites:
 #   1. export ANTHROPIC_API_KEY=sk-ant-...
-#   2. docker compose build              (build all images from source)
-#   3. docker compose up -d              (runs ingest first, then starts all services)
-#   4. docker compose run --rm reach_layer (interactive CLI session)
+#   2. docker compose up -d               (runs ingest first, then starts all services)
+#   3. docker compose run --rm reach_layer (interactive CLI session)
 #
 # Paths in this file are relative to the docker-compose.yml location.
 # ../../ resolves to the repository root.
 #
 # Resource limits (local testing):
 #   All services: 0.1 CPU, 512 MB RAM
-#   Knowledge Engine (ingest + serve): 0.5 CPU, 2 GB RAM
+#   Knowledge Engine (ingest + serve): 0.2 CPU, 512 MB RAM
 
 services:
 
@@ -37,12 +32,10 @@ services:
   # Memory Layer — session state store (port 8002)
   # ---------------------------------------------------------------------------
   memory_layer:
-    build:
-      context: ../../memory_layer
-      dockerfile: Dockerfile
+    image: srivatsak2002/dpg-memory-layer:latest
     container_name: memory_layer
     volumes:
-      - ../../dev-kit/dpg/memory_layer.yaml:/app/config/dpg.yaml:ro #ro = read only
+      - ../../dev-kit/dpg/memory_layer.yaml:/app/config/dpg.yaml:ro
       - ../../dev-kit/configs/kkb/memory_layer.yaml:/app/config/domain.yaml:ro
     networks:
       - dpg_net
@@ -63,9 +56,7 @@ services:
   # Trust Layer — content safety gate (port 8003)
   # ---------------------------------------------------------------------------
   trust_layer:
-    build:
-      context: ../../trust_layer
-      dockerfile: Dockerfile
+    image: srivatsak2002/dpg-trust-layer:latest
     container_name: trust_layer
     volumes:
       - ../../dev-kit/dpg/trust_layer.yaml:/app/config/dpg.yaml:ro
@@ -89,9 +80,7 @@ services:
   # Learning Layer — async observability (port 8004)
   # ---------------------------------------------------------------------------
   learning_layer:
-    build:
-      context: ../../learning_layer
-      dockerfile: Dockerfile
+    image: srivatsak2002/dpg-learning-layer:latest
     container_name: learning_layer
     volumes:
       - ../../dev-kit/dpg/learning_layer.yaml:/app/config/dpg.yaml:ro
@@ -115,9 +104,7 @@ services:
   # Action Gateway — external API stub / ONEST mock (port 9999)
   # ---------------------------------------------------------------------------
   action_gateway:
-    build:
-      context: ../../action_gateway
-      dockerfile: Dockerfile
+    image: srivatsak2002/dpg-action-gateway:latest
     container_name: action_gateway
     volumes:
       - ../../dev-kit/dpg/action_gateway.yaml:/app/config/dpg.yaml:ro
@@ -142,9 +129,7 @@ services:
   # On startup: runs ingest first, then starts the server.
   # ---------------------------------------------------------------------------
   knowledge_engine:
-    build:
-      context: ../../knowledge_engine
-      dockerfile: Dockerfile
+    image: srivatsak2002/dpg-knowledge-engine:latest
     container_name: knowledge_engine
     user: root                               # needed to write to root-owned chroma_data named volume
     command: ["sh", "-c", "if [ ! -f /app/data/chroma_db/chroma.sqlite3 ]; then echo 'ChromaDB empty — running ingest...' && python -m scripts.ingest --config config/domain.yaml; else echo 'ChromaDB exists — skipping ingest.'; fi && python main.py"]
@@ -172,9 +157,7 @@ services:
   # Agent Core — orchestrator and LLM caller (port 8000)
   # ---------------------------------------------------------------------------
   agent_core:
-    build:
-      context: ../../agent_core
-      dockerfile: Dockerfile
+    image: srivatsak2002/dpg-agent-core:latest
     container_name: agent_core
     environment:
       - ANTHROPIC_API_KEY                  # inherited from shell: export ANTHROPIC_API_KEY=sk-...
@@ -212,9 +195,7 @@ services:
   # Run separately: docker compose run --rm reach_layer
   # ---------------------------------------------------------------------------
   reach_layer:
-    build:
-      context: ../../reach_layer
-      dockerfile: Dockerfile
+    image: srivatsak2002/dpg-reach-layer:latest
     container_name: reach_layer
     volumes:
       - ../../dev-kit/dpg/reach_layer.yaml:/app/config/dpg.yaml:ro

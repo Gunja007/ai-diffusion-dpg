@@ -181,6 +181,12 @@ class ManagerAgent:
                 "error": result.error,
             },
         )
+        logger.info(
+            "  [STEP 8] Action Gateway response  ←  tool=%s  success=%s  result=%s",
+            tool_call.tool_name,
+            result.success,
+            result.result if result.success else f"ERROR: {result.error}",
+        )
         return result
 
     def _append_tool_result(
