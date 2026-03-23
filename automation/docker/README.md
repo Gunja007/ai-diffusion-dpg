@@ -63,15 +63,27 @@ docker compose -f docker-compose.dev.yml up -d --no-deps agent_core
 
 ---
 
-## Force Re-ingest
+## Adding New Documents / Force Re-ingest
 
 Knowledge Engine skips ingest if ChromaDB already has data.
-To force re-ingest (e.g. after adding new documents to `knowledge_engine/data/`):
+To add a new document and re-ingest:
 
 ```bash
+# 1. Copy the new file into the data folder
+cp my_new_doc.pdf ../../knowledge_engine/data/
+
+# 2. Register it in the domain config (add a new entry under sources)
+#    dev-kit/configs/kkb/knowledge_engine.yaml → knowledge.blocks.static_knowledge_base.sources
+
+# 3. Delete the chroma volume to force re-ingest (mandatory)
 docker volume rm docker_chroma_data
+
+# 4. Start services — ingest runs automatically with the new file included
 docker compose -f docker-compose.dev.yml up -d
 ```
+
+> Step 3 is mandatory. Without deleting the volume, ChromaDB already exists and
+> the new file is silently skipped — ingest will not run.
 
 ---
 
