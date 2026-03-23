@@ -19,8 +19,15 @@ RUN pip install --upgrade pip setuptools wheel
 # Copy dependency declarations first — layer is cached unless pyproject.toml changes
 COPY pyproject.toml ./
 
-# Install runtime dependencies into /install prefix (no dev extras)
-RUN pip install --prefix=/install --no-cache-dir .
+# Build inside a venv so pip installs ALL deps (including transitive ones like
+# packaging) into an isolated location, regardless of what is bundled in the
+# base image.  CPU-only torch is installed first so pip never fetches the
+# CUDA/GPU variant (~2.5 GB saved).
+RUN python -m venv /venv \
+    && /venv/bin/pip install --no-cache-dir --upgrade pip \
+    && /venv/bin/pip install --no-cache-dir \
+        "torch>=2.0.0" --index-url https://download.pytorch.org/whl/cpu \
+    && /venv/bin/pip install --no-cache-dir .
 
 # -----------------------------------------------------------------------------
 # Stage 2: runtime
@@ -32,8 +39,8 @@ RUN addgroup --system knowledgeengine && adduser --system --ingroup knowledgeeng
 
 WORKDIR /app
 
-# Copy installed packages from builder
-COPY --from=builder /install /usr/local
+# Copy the venv from builder
+COPY --from=builder /venv /venv
 
 # Copy application source, entrypoint, config, and scripts
 COPY src/ ./src/
@@ -49,7 +56,9 @@ USER knowledgeengine
 # No API keys baked into the image.
 # OPENAI_API_KEY (if needed) must be injected at runtime via environment variable.
 ENV PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1
+    PYTHONDONTWRITEBYTECODE=1 \
+    PATH="/venv/bin:$PATH" \
+    VIRTUAL_ENV=/venv
 
 # ChromaDB vector store is written here at ingest time.
 # Mount a named volume at this path to persist embeddings across container restarts.

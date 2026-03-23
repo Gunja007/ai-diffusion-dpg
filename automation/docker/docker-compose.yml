@@ -7,13 +7,24 @@
 # Services deep-merge these at startup: domain values override DPG defaults.
 # Both config files are mandatory — service will not start if either is missing.
 #
+# Ingestion flow (Knowledge Engine):
+#   On startup, KE runs: python scripts/ingest.py && python main.py
+#   Ingest reads docs from knowledge_engine/data/ (bind-mounted as /app/data),
+#   writes embeddings into chroma_data volume at /app/data/chroma_db (writable named
+#   volume that overrides the read-only bind mount for that subdirectory).
+#   Server starts only after ingest completes successfully.
+#
 # Prerequisites:
-#   1. cp .env.example .env && edit .env  (add ANTHROPIC_API_KEY)
-#   2. docker compose up -d               (start background services)
+#   1. export ANTHROPIC_API_KEY=sk-ant-...
+#   2. docker compose up -d               (runs ingest first, then starts all services)
 #   3. docker compose run --rm reach_layer (interactive CLI session)
 #
 # Paths in this file are relative to the docker-compose.yml location.
 # ../../ resolves to the repository root.
+#
+# Resource limits (local testing):
+#   All services: 0.1 CPU, 512 MB RAM
+#   Knowledge Engine (ingest + serve): 0.2 CPU, 512 MB RAM
 
 services:
 
@@ -28,6 +39,11 @@ services:
       - ../../dev-kit/configs/kkb/memory_layer.yaml:/app/config/domain.yaml:ro
     networks:
       - dpg_net
+    deploy:
+      resources:
+        limits:
+          cpus: '0.1'
+          memory: 512M
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8002/health')\""]
       interval: 10s
@@ -47,6 +63,11 @@ services:
       - ../../dev-kit/configs/kkb/trust_layer.yaml:/app/config/domain.yaml:ro
     networks:
       - dpg_net
+    deploy:
+      resources:
+        limits:
+          cpus: '0.1'
+          memory: 512M
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8003/health')\""]
       interval: 10s
@@ -66,6 +87,11 @@ services:
       - ../../dev-kit/configs/kkb/learning_layer.yaml:/app/config/domain.yaml:ro
     networks:
       - dpg_net
+    deploy:
+      resources:
+        limits:
+          cpus: '0.1'
+          memory: 512M
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8004/health')\""]
       interval: 10s
@@ -85,6 +111,11 @@ services:
       - ../../dev-kit/configs/kkb/action_gateway.yaml:/app/config/domain.yaml:ro
     networks:
       - dpg_net
+    deploy:
+      resources:
+        limits:
+          cpus: '0.1'
+          memory: 512M
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:9999/health')\""]
       interval: 10s
@@ -95,22 +126,31 @@ services:
 
   # ---------------------------------------------------------------------------
   # Knowledge Engine — RAG, NLU, prompt assembly (port 8001)
+  # On startup: runs ingest first, then starts the server.
   # ---------------------------------------------------------------------------
   knowledge_engine:
     image: srivatsak2002/dpg-knowledge-engine:latest
     container_name: knowledge_engine
+    user: root                               # needed to write to root-owned chroma_data named volume
+    command: ["sh", "-c", "python -m scripts.ingest --config config/domain.yaml && python main.py"]
     volumes:
       - ../../dev-kit/dpg/knowledge_engine.yaml:/app/config/dpg.yaml:ro
       - ../../dev-kit/configs/kkb/knowledge_engine.yaml:/app/config/domain.yaml:ro
-      - chroma_data:/app/data/chroma_db    # ChromaDB persistence
+      - ../../knowledge_engine/data:/app/data:ro   # source docs (read-only)
+      - chroma_data:/app/data/chroma_db            # embeddings (writable, overrides :ro for this subdir)
     networks:
       - dpg_net
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 2G
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8001/health')\""]
       interval: 15s
       timeout: 10s
-      retries: 3
-      start_period: 30s     # ChromaDB init takes longer
+      retries: 5
+      start_period: 180s
     restart: unless-stopped
 
   # ---------------------------------------------------------------------------
@@ -119,12 +159,18 @@ services:
   agent_core:
     image: srivatsak2002/dpg-agent-core:latest
     container_name: agent_core
-    env_file: .env                         # injects ANTHROPIC_API_KEY
+    environment:
+      - ANTHROPIC_API_KEY                  # inherited from shell: export ANTHROPIC_API_KEY=sk-...
     volumes:
       - ../../dev-kit/dpg/agent_core.yaml:/app/config/dpg.yaml:ro
       - ../../dev-kit/configs/kkb/agent_core.yaml:/app/config/domain.yaml:ro
     networks:
       - dpg_net
+    deploy:
+      resources:
+        limits:
+          cpus: '0.1'
+          memory: 512M
     depends_on:
       knowledge_engine:
         condition: service_healthy
@@ -156,6 +202,11 @@ services:
       - ../../dev-kit/configs/kkb/reach_layer.yaml:/app/config/domain.yaml:ro
     networks:
       - dpg_net
+    deploy:
+      resources:
+        limits:
+          cpus: '0.1'
+          memory: 512M
     depends_on:
       agent_core:
         condition: service_healthy
@@ -169,4 +220,4 @@ networks:
     driver: bridge
 
 volumes:
-  chroma_data:                             # ChromaDB persistence across container restarts
+  chroma_data:                             # ChromaDB embeddings, persisted across container restarts

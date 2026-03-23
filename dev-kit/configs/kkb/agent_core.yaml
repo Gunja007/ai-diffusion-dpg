@@ -26,11 +26,11 @@ memory_client:
 
 trust_client:
   endpoint: "http://trust_layer:8003"
-  timeout_ms: 2000
+  timeout_ms: 5000
 
 learning_client:
   endpoint: "http://learning_layer:8004"
-  timeout_ms: 2000
+  timeout_ms: 5000
 
 action_gateway_client:
   endpoint: "http://action_gateway:9999/onest/market_lookup"

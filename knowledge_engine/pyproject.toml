@@ -19,6 +19,7 @@ dependencies = [
     "fastapi>=0.111.0",                  # HTTP server (KE exposes /assemble_prompt + /health)
     "uvicorn[standard]>=0.29.0",         # ASGI server
     "python-dotenv>=1.0.0",              # loads .env at startup
+    "packaging>=23.0",                   # required by transformers (transitive dep of sentence-transformers)
 ]
 
 [project.optional-dependencies]
