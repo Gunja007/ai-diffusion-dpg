@@ -62,7 +62,7 @@ ENV PYTHONUNBUFFERED=1 \
 
 # ChromaDB vector store is written here at ingest time.
 # Mount a named volume at this path to persist embeddings across container restarts.
-VOLUME /app/data/chroma_db
+VOLUME /app/chroma_db
 
 EXPOSE 8001
 

@@ -147,12 +147,12 @@ services:
       dockerfile: Dockerfile
     container_name: knowledge_engine
     user: root                               # needed to write to root-owned chroma_data named volume
-    command: ["sh", "-c", "if [ ! -f /app/data/chroma_db/chroma.sqlite3 ]; then echo 'ChromaDB empty — running ingest...' && python -m scripts.ingest --config config/domain.yaml; else echo 'ChromaDB exists — skipping ingest.'; fi && python main.py"]
+    command: ["sh", "-c", "if [ ! -f /app/chroma_db/chroma.sqlite3 ]; then echo 'ChromaDB empty — running ingest...' && python -m scripts.ingest --config config/domain.yaml; else echo 'ChromaDB exists — skipping ingest.'; fi && python main.py"]
     volumes:
       - ../../dev-kit/dpg/knowledge_engine.yaml:/app/config/dpg.yaml:ro
       - ../../dev-kit/configs/kkb/knowledge_engine.yaml:/app/config/domain.yaml:ro
       - ../../knowledge_engine/data:/app/data:ro   # source docs (read-only)
-      - chroma_data:/app/data/chroma_db            # embeddings (writable, overrides :ro for this subdir)
+      - chroma_data:/app/chroma_db                 # embeddings (separate path, not inside the :ro bind mount)
     networks:
       - dpg_net
     deploy:

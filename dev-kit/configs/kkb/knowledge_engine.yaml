@@ -34,7 +34,7 @@ knowledge:
     static_knowledge_base:
       enabled: true
       collection_name: kkb_knowledge
-      chroma_persist_dir: ./data/chroma_db
+      chroma_persist_dir: /app/chroma_db
       sources:
         - path: ./data/labour_schemes.pdf
           type: static
