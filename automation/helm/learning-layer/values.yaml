@@ -1,7 +1,7 @@
 replicaCount: 1
 
 image:
-  repository: ghcr.io/your-org/learning-layer
+  repository: srivatsak2002/dpg-learning-layer
   tag: latest
   pullPolicy: IfNotPresent
 

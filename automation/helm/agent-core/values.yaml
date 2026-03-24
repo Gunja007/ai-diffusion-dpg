@@ -5,10 +5,14 @@
 # All other values mirror dev-kit/configs/kkb/agent_core.yaml merged with
 # dev-kit/dpg/agent_core.yaml.
 
+# ANTHROPIC_API_KEY — do NOT set here. Pass at install time:
+# helm install agent-core ./agent-core -n agent-core --set anthropicApiKey=$ANTHROPIC_API_KEY
+anthropicApiKey: ""
+
 replicaCount: 1
 
 image:
-  repository: ghcr.io/your-org/agent-core
+  repository: srivatsak2002/dpg-agent-core
   tag: latest
   pullPolicy: IfNotPresent
 

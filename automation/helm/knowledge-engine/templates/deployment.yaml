@@ -15,12 +15,44 @@ spec:
       labels:
         app: {{ .Release.Name }}
     spec:
+      initContainers:
+        - name: ingest
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["python", "-m", "scripts.ingest", "--config", "config/domain.yaml"]
+          env:
+            - name: HOME
+              value: "/tmp"
+            - name: HF_HOME
+              value: "/tmp/huggingface"
+            - name: TRANSFORMERS_CACHE
+              value: "/tmp/huggingface/transformers"
+          volumeMounts:
+            - name: domain-config
+              mountPath: /app/config/domain.yaml
+              subPath: domain.yaml
+            - name: chroma-data
+              mountPath: /app/data/chroma_db
+          resources:
+            requests:
+              cpu: {{ .Values.resources.requests.cpu }}
+              memory: {{ .Values.resources.requests.memory }}
+            limits:
+              cpu: {{ .Values.resources.limits.cpu }}
+              memory: {{ .Values.resources.limits.memory }}
       containers:
         - name: knowledge-engine
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           ports:
             - containerPort: 8001
+          env:
+            - name: HOME
+              value: "/tmp"
+            - name: HF_HOME
+              value: "/tmp/huggingface"
+            - name: TRANSFORMERS_CACHE
+              value: "/tmp/huggingface/transformers"
           volumeMounts:
             - name: dpg-config
               mountPath: /app/config/dpg.yaml
