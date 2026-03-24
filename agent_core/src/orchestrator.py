@@ -237,9 +237,15 @@ class AgentCore(AgentCoreBase):
             "  [STEP 5] Intent Gate  →  intent=%s  confidence=%.2f  threshold=%.2f",
             nlu_result.intent, nlu_result.confidence, confidence_threshold,
         )
-        if nlu_result.intent == "unknown" or nlu_result.confidence < confidence_threshold:
+        if nlu_result.confidence < confidence_threshold and nlu_result.intent == "unknown":
+            # Only exit early if BOTH conditions are true: intent is unknown AND confidence
+            # is below threshold. A vague but valid query (e.g. "hi can i get job info?")
+            # that NLU can't classify should still reach the LLM — it can ask a clarifying
+            # question. True unknown input (gibberish, off-topic) will have intent=unknown
+            # AND very low confidence. Trust Layer already blocks harmful content upstream.
             logger.info(
-                "  [STEP 5] ✗ EARLY EXIT — intent below threshold  →  returning unknown-intent response",
+                "  [STEP 5] ✗ EARLY EXIT — intent=unknown and confidence=%.2f below threshold  →  returning unknown-intent response",
+                nlu_result.confidence,
             )
             return self._unknown_intent_response(session_id, start)
         logger.info("  [STEP 5] Intent Gate  ✓  proceeding")
@@ -332,6 +338,7 @@ class AgentCore(AgentCoreBase):
             messages=messages,
             session_id=session_id,
             initial_llm_response=llm_response,
+            system=system,
         )
         if tool_calls:
             tool_names = [tc.tool_name for tc in tool_calls]

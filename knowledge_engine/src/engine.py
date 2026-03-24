@@ -153,7 +153,7 @@ class KnowledgeEngine(KnowledgeEngineBase):
                     },
                 )
 
-        system = self._build_system_prompt()
+        system = self._build_system_prompt(context.detected_language)
         messages = self._build_messages(context)
 
         logger.info(
@@ -198,12 +198,18 @@ class KnowledgeEngine(KnowledgeEngineBase):
     # Private: prompt assembly
     # ------------------------------------------------------------------
 
-    def _build_system_prompt(self) -> str:
+    def _build_system_prompt(self, detected_language: str = "") -> str:
         """
         Build the system prompt string: persona + language instruction + guardrails.
 
         This is passed to the LLM's `system` field — not embedded in the messages list.
         Returns an empty string if no persona is configured.
+
+        Args:
+            detected_language: Language detected by Language Normaliser (e.g. "english",
+                                "hindi", "hinglish", "kannada"). When present, a specific
+                                instruction is appended so the LLM responds in that language
+                                rather than inferring it from context.
         """
         conversation_cfg = self._config.get("conversation", {})
         parts = []
@@ -215,6 +221,9 @@ class KnowledgeEngine(KnowledgeEngineBase):
         language_instruction = conversation_cfg.get("language_instruction", "").strip()
         if language_instruction:
             parts.append(language_instruction)
+
+        if detected_language:
+            parts.append(f"The user's current message is in {detected_language}. Respond in {detected_language}.")
 
         guardrails = conversation_cfg.get("guardrail_reminders", [])
         if guardrails:

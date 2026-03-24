@@ -71,6 +71,7 @@ class ManagerAgent:
         messages: list[dict],
         session_id: str,
         initial_llm_response: LLMResponse,
+        system: str = "",
     ) -> tuple[str, list[ToolCall]]:
         """
         Drive the tool-use loop starting from the initial LLM response.
@@ -80,6 +81,9 @@ class ManagerAgent:
                                   Extended in-place with tool_use and tool_result blocks.
             session_id:           Used for consent checks and gateway calls.
             initial_llm_response: First LLM response from orchestrator's LLM call #1.
+            system:               System prompt from KE — passed to follow-up LLM calls
+                                  so language and persona instructions are preserved after
+                                  tool use.
 
         Returns:
             (final_response_text, list_of_all_tool_calls_executed)
@@ -119,7 +123,7 @@ class ManagerAgent:
             current_response = self._llm.call(
                 messages=messages,
                 tools=self._registry.get_tool_definitions(),
-                system="",
+                system=system,
             )
             logger.info(
                 "manager_agent.llm_followup",
