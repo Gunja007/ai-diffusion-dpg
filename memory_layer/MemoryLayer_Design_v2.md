@@ -1,4 +1,4 @@
-# Memory Layer Design — v2 - will be deleted after implementation
+# Memory Layer Design — v2
 
 > This is the authoritative design document for the Memory Layer redesign.
 > All implementation tasks (B1, B2, A1, D1, G1–G7, K1–K8) must follow this spec exactly.
@@ -8,7 +8,7 @@
 ## 1. Core Principles
 
 - **Memory Layer stores. It does not extract.** Agent Core (via LLM) decides what to extract from user input and calls `write()`. Memory Layer receives key/value/scope and stores it. No logic, no inference.
-- **Redis is the hot path.** Every turn reads from Redis — no Neo4j in the decision loop during an active call.
+- **Redis is the hot path.** Every turn reads from Redis — no Neo4j in the decision loop during an active session.
 - **Neo4j is the knowledge graph.** Persistent user identity, profile, journey history (branches taken, roles offered, drop-off points), and conversational signals all live in Neo4j across sessions. Raw conversation messages (user text, system text) are never stored.
 - **Config-driven schema.** Declared fields come from `domain.yaml`. The Memory Layer code never hardcodes field names, node labels, or relationship types.
 - **Ad-hoc data is first-class.** Anything the user says that is relevant but not in the declared config schema is stored as a child attribute node — not discarded.
@@ -20,10 +20,12 @@
 
 | Store | Technology | What lives here | Lifetime |
 |---|---|---|---|
-| Session | Redis hash, TTL-bound | Hot call state — current node, collection round, current question, signals, language, consent, loop count | Session-scoped (TTL from config) |
+| Session | Redis hash, TTL-bound | Hot session state — current node, collection round, current question, signals, language, consent, loop count | Session-scoped (TTL from config) |
 | Persistent | Neo4j | User identity, profile, journey history, context graph | Permanent (with consent) |
 
-Turn and Broadcast scopes are out of scope for this implementation.
+**Turn scope** is already handled by local variables inside Agent Core's `process_turn()` — `turn_id`, `current_user_message`, `normalised_input`, `nlu_result`, `rag_chunks`, `trust_input_result`. These are ephemeral Python variables that exist for one turn and are discarded after the response. No Memory Layer involvement needed. `turn_id` is generated as `uuid4()` at the start of each turn and passed to Learning Layer in `TurnEvent` for audit.
+
+**Broadcast scope** is out of scope for this implementation.
 
 ---
 
@@ -93,7 +95,7 @@ Turn and Broadcast scopes are out of scope for this implementation.
 | `UserProfile` | Subnode | declared fields from config | Who the user is — identity + capabilities |
 | `UserAttribute` | Ad-hoc child of UserProfile | key, value, raw, turn, journey_id | Anything user says about themselves not in declared fields (e.g. "allergic to sun") |
 | `JourneyHistory` | Subnode | (none — grouping only) | Groups all past journeys for this user |
-| `Journey` | Child of JourneyHistory | journey_id, started_at, ended_at, end_reason, branch_taken, mental_state_at_end | One node per call |
+| `Journey` | Child of JourneyHistory | journey_id, started_at, ended_at, end_reason, branch_taken, mental_state_at_end | One node per session |
 | `Role` | Child of Journey | role_id, title, employer, pay_min, pay_max, shortlisted, committed, follow_up_outcome | Job roles offered or committed to in a journey |
 | `DropOff` | Child of Journey | node, reason, timestamp | Where and why the user dropped off |
 | `ContextGraph` | Subnode | (none — grouping only) | Groups all conversational signals across journeys |
@@ -107,7 +109,7 @@ Turn and Broadcast scopes are out of scope for this implementation.
 | `HAS_PROFILE` | User → UserProfile | User's identity and profile |
 | `HAS_ATTRIBUTE` | UserProfile → UserAttribute | Ad-hoc profile attribute |
 | `HAS_JOURNEY_HISTORY` | User → JourneyHistory | Grouping edge |
-| `JOURNEY` | JourneyHistory → Journey | One journey/call |
+| `JOURNEY` | JourneyHistory → Journey | One journey per session |
 | `OFFERED` | Journey → Role | Role offered to user this journey |
 | `DROPPED_AT` | Journey → DropOff | Where user dropped off |
 | `HAS_CONTEXT` | User → ContextGraph | Grouping edge |
@@ -159,7 +161,7 @@ Fields (all stored as strings — type coercion on read):
 **On subsequent turns:**
 - `redis.hgetall(f"session:{session_id}")` — full hash read, O(1)
 
-**On paused call resume (Redis expired, user calls back):**
+**On paused session resume (Redis expired, user reconnects):**
 - New `session_id` → session init flow runs again
 - `is_returning=true` → prior journey summary loaded from Neo4j into `ContextBundle.journey`
 
@@ -262,13 +264,31 @@ class MemoryLayerBase(ABC):
 
 ### 6.1 ContextBundle
 
+ContextBundle is the **single object that `context_bundle()` returns to Agent Core at the start of every turn.**
+Instead of Agent Core making separate calls to Redis and Neo4j itself, Memory Layer assembles everything into
+one package and hands it over. Think of it as: *"everything the LLM needs to know about this user right now."*
+
+Three fields, three different sources, three different time horizons:
+
+| Field | Source | Time horizon | What it represents |
+|---|---|---|---|
+| `session` | Redis hash | This session only | What's happening right now — current node, question, signals, language |
+| `profile` | Neo4j UserProfile | Across all sessions | Who this user is — trade, location, constraints, ad-hoc attributes |
+| `journey` | Neo4j JourneyHistory | Last session only | What happened last time — roles offered, outcome, drop-off point |
+
+**Why one object instead of separate calls:**
+Without ContextBundle, Agent Core would have to call Redis directly, call Neo4j directly for profile,
+call Neo4j again for journey summary, and know how to parse each store's response format. That violates
+the design rule — Memory Layer stores, Agent Core orchestrates. Agent Core must not know anything about
+Redis or Neo4j internals. `context_bundle()` is the single read boundary.
+
 ```python
 # agent_core/src/models.py
 # Replaces SessionState everywhere in Agent Core
 
 @dataclass
 class ContextBundle:
-    session: dict         # full Redis hash — current call state
+    session: dict         # full Redis hash — current session state
                           # keys: current_node, collection_round, current_question,
                           #       market_signal, skill_match, income_urgency,
                           #       language, is_returning, consent, loop_count
@@ -467,11 +487,11 @@ SCOPE_MAP = {
 8. Returns ContextBundle(session=initial_state, profile={phone: phone}, journey=None)
 ```
 
-### 8.2 Returning User — Call Resumes
+### 8.2 Returning User — Session Resumes
 
 ```
 1. Agent Core calls context_bundle(session_id, phone)
-2. Memory Layer: redis.exists → false (new session_id for new call)
+2. Memory Layer: redis.exists → false (new session_id for new session)
 3. Memory Layer: neo4j.find_user(phone) → User node found
 4. Memory Layer: neo4j.create_journey(phone, journey_id)  (new Journey node)
 5. Memory Layer: neo4j.get_profile(phone)
@@ -596,7 +616,5 @@ This will be implemented as a separate track immediately after the Memory Layer 
 - KE retrieval uses both: structured Neo4j query + semantic ChromaDB search, results merged before returning chunks
 - This is a KE change — does not affect the Memory Layer interface or implementation
 - Requires a separate design pass before implementation begins
-
-**Turn scope** — ephemeral in-process dict. No dependency from current design. Defer indefinitely.
 
 **Broadcast scope** — pub/sub fan-out. No dependency from current design. Defer indefinitely.
