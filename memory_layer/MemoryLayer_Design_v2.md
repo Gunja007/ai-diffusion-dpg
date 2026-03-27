@@ -1,4 +1,4 @@
-# Memory Layer Design — v2 - will be deleted after implementation
+# Memory Layer Design — v2
 
 > This is the authoritative design document for the Memory Layer redesign.
 > All implementation tasks (A1, B1, D1, G1–G7, K1–K7) must follow this spec exactly.
