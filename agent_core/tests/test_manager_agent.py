@@ -222,3 +222,170 @@ def test_consent_denied_returns_consent_required_tool_result():
     tool_result_msg = call_messages[-1]
     assert tool_result_msg["role"] == "user"
     assert "consent_required" in str(tool_result_msg["content"])
+
+
+# ---------------------------------------------------------------------------
+# build_system_prompt — E1
+# ---------------------------------------------------------------------------
+
+CONFIG_WITH_PROMPTS = {
+    "prompt_blocks": {
+        "persona": "You are Kaam Ki Baat, a job advisory assistant.",
+        "language_instruction": "Respond in the user's language.",
+        "guardrail_reminders": ["Stay on employment topics.", "Escalate distress."],
+    }
+}
+
+
+def _make_manager_for_prompt() -> ManagerAgent:
+    agent, *_ = _make_manager([_text_llm_response()])
+    return agent
+
+
+def test_build_system_prompt_includes_persona():
+    agent = _make_manager_for_prompt()
+    result = agent.build_system_prompt({}, {}, "hindi", CONFIG_WITH_PROMPTS)
+    assert "Kaam Ki Baat" in result
+
+
+def test_build_system_prompt_includes_language_instruction():
+    agent = _make_manager_for_prompt()
+    result = agent.build_system_prompt({}, {}, "hindi", CONFIG_WITH_PROMPTS)
+    assert "Respond in the user's language" in result
+
+
+def test_build_system_prompt_includes_detected_language():
+    agent = _make_manager_for_prompt()
+    result = agent.build_system_prompt({}, {}, "kannada", CONFIG_WITH_PROMPTS)
+    assert "kannada" in result
+
+
+def test_build_system_prompt_includes_profile_fields():
+    agent = _make_manager_for_prompt()
+    profile = {"trade": "electrician", "location": "Hubli"}
+    result = agent.build_system_prompt(profile, {}, "hindi", CONFIG_WITH_PROMPTS)
+    assert "electrician" in result
+    assert "Hubli" in result
+
+
+def test_build_system_prompt_empty_config_returns_string():
+    agent = _make_manager_for_prompt()
+    result = agent.build_system_prompt({}, {}, "", {})
+    assert isinstance(result, str)
+
+
+def test_build_system_prompt_guardrails_included():
+    agent = _make_manager_for_prompt()
+    result = agent.build_system_prompt({}, {}, "english", CONFIG_WITH_PROMPTS)
+    assert "employment topics" in result
+
+
+def test_build_system_prompt_node_instruction_injected_for_market_truth():
+    """Node instruction for current_node=market_truth is included in system prompt."""
+    agent = _make_manager_for_prompt()
+    config = {
+        "prompt_blocks": {
+            "persona": "You are KKB.",
+            "node_instructions": {
+                "market_truth": "## Market truth guidance\nShow ONEST results.",
+            },
+        }
+    }
+    session = {"current_node": "market_truth"}
+    result = agent.build_system_prompt({}, session, "hindi", config)
+    assert "Market truth guidance" in result
+    assert "Show ONEST results" in result
+
+
+def test_build_system_prompt_no_node_instruction_when_node_not_in_map():
+    """No extra text added when current_node has no matching node_instruction."""
+    agent = _make_manager_for_prompt()
+    config = {
+        "prompt_blocks": {
+            "persona": "You are KKB.",
+            "node_instructions": {
+                "market_truth": "Market truth guidance.",
+            },
+        }
+    }
+    session = {"current_node": "profile_building"}
+    result = agent.build_system_prompt({}, session, "hindi", config)
+    assert "Market truth guidance" not in result
+
+
+def test_build_system_prompt_no_node_instruction_when_node_missing():
+    """No crash when session has no current_node."""
+    agent = _make_manager_for_prompt()
+    config = {
+        "prompt_blocks": {
+            "persona": "You are KKB.",
+            "node_instructions": {"market_truth": "Market truth guidance."},
+        }
+    }
+    result = agent.build_system_prompt({}, {}, "hindi", config)
+    assert "Market truth guidance" not in result
+
+
+def test_build_system_prompt_no_node_instruction_when_config_missing():
+    """No crash when node_instructions key absent from config."""
+    agent = _make_manager_for_prompt()
+    session = {"current_node": "market_truth"}
+    result = agent.build_system_prompt({}, session, "hindi", CONFIG_WITH_PROMPTS)
+    assert isinstance(result, str)  # no crash
+
+
+# ---------------------------------------------------------------------------
+# build_messages — E2
+# ---------------------------------------------------------------------------
+
+from src.models import RetrievalChunk
+
+
+def test_build_messages_returns_single_user_message():
+    agent = _make_manager_for_prompt()
+    msgs = agent.build_messages("kaam chahiye", [], "")
+    assert len(msgs) == 1
+    assert msgs[0]["role"] == "user"
+
+
+def test_build_messages_empty_user_message_returns_empty():
+    agent = _make_manager_for_prompt()
+    msgs = agent.build_messages("", [], "")
+    assert msgs == []
+
+
+def test_build_messages_current_question_prepended():
+    agent = _make_manager_for_prompt()
+    msgs = agent.build_messages("welder", [], "Aap kaun sa kaam karte hain?")
+    content = msgs[0]["content"]
+    assert "Aap kaun sa kaam karte hain?" in content
+    assert "welder" in content
+
+
+def test_build_messages_rag_chunks_appended():
+    agent = _make_manager_for_prompt()
+    chunks = [RetrievalChunk(text="ITI in Hubli", doc_type="institute", source="", always_include=False)]
+    msgs = agent.build_messages("training kahan hai", chunks, "")
+    content = msgs[0]["content"]
+    assert "ITI in Hubli" in content
+
+
+def test_build_messages_always_include_chunks_separated():
+    agent = _make_manager_for_prompt()
+    chunks = [
+        RetrievalChunk(text="ONEST framing", doc_type="always_include", source="", always_include=True),
+        RetrievalChunk(text="Local scheme info", doc_type="scheme", source="", always_include=False),
+    ]
+    msgs = agent.build_messages("scheme batao", chunks, "")
+    content = msgs[0]["content"]
+    assert "ONEST framing" in content
+    assert "Local scheme info" in content
+    assert "Always include context" in content
+    assert "Relevant knowledge" in content
+
+
+def test_build_messages_no_current_question_no_prefix():
+    agent = _make_manager_for_prompt()
+    msgs = agent.build_messages("hello", [], "")
+    content = msgs[0]["content"]
+    assert "Last question asked" not in content
