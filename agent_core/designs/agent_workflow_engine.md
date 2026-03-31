@@ -150,6 +150,7 @@ Step 1:  Read session state (Memory Layer)
          → if no current_subagent_id: use workflow.start_subagent
 
 Step 2:  Resolve current_subagent = workflow.subagents[current_subagent_id]
+         → if current_subagent.special_handler is set: execute handler, skip Steps 3–9
 
 Step 3:  Safety check on input (Trust Layer) — unchanged
 
@@ -157,7 +158,9 @@ Step 4:  Language Normalisation — unchanged
 
 Step 5:  NLU Processor
          → pass current_subagent.valid_intents + workflow.global_intents as the allowed intent set
-         → NLU classifies ONLY within this scoped set
+         → NLU classifies intent AND extracts entities in a single call
+         → Workflow Gate writes extracted entities to session state synchronously
+           (routing in Step 6 sees current-turn values, not just last-turn state)
 
 Step 6:  Determine next_subagent_id via routing resolution (see Routing Algorithm below)
          → entry guards expressed as routing conditions, not subagent-level fields
