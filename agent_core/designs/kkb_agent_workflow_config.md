@@ -7,13 +7,13 @@ Reference: sample_usecase.pdf (KKB Product & Architecture Document)
 
 ## Overview
 
-This document defines the KKB (Kaam Ki Baat) conversation graph using the Generic Flow Graph Engine schema. It is the reference implementation showing how a deployer maps a real usecase to the graph model.
+This document defines the KKB (Kaam Ki Baat) agent workflow using the Generic Flow Graph Engine schema. It is the reference implementation showing how a deployer maps a real usecase to the graph model.
 
 The primary persona is the ITI Graduate (19–24, trade-certified, first job seeker). The graph covers the full journey from greeting to placement follow-through, including all 5 branches from market truth delivery.
 
 ---
 
-## KKB Conversation Graph — Node Map
+## KKB Agent Workflow — SubAgent Map
 
 ```
                           ┌─────────────┐
@@ -75,8 +75,8 @@ The primary persona is the ITI Graduate (19–24, trade-certified, first job see
 ## Full YAML Config
 
 ```yaml
-conversation_graph:
-  graph_id: kkb_iti_graduate
+agent_workflow:
+  workflow_id: kkb_iti_graduate
   version: "1.0.0"
 
   agent_system_prompt: |
@@ -95,17 +95,17 @@ conversation_graph:
 
   global_routing:
     - intent: counsellor_request
-      next_node: counsellor_request
+      next_subagent: counsellor_request
 
     - intent: termination_intent
-      next_node: ended
+      next_subagent: ended
 
     - intent: whatsapp_handoff_request
-      next_node: normalise_branch
+      next_subagent: normalise_branch
 
-  default_fallback_node: clarification
+  default_fallback_subagent: clarification
 
-  nodes:
+  subagents:
 
     # ─────────────────────────────────────────────────────────────
     # GREETING
@@ -136,7 +136,7 @@ conversation_graph:
 
       routing:
         - intent: "*"
-          next_node: new_returning_check
+          next_subagent: new_returning_check
 
     # ─────────────────────────────────────────────────────────────
     # NEW / RETURNING CHECK
@@ -144,7 +144,7 @@ conversation_graph:
     - id: new_returning_check
       name: New or Returning Caller Check
       description: >
-        System node. Check if user_id matches a stored profile.
+        System subagent. Check if user_id matches a stored profile.
         Returning: load profile and resume from last mental state.
         New: proceed to consent.
       is_start: false
@@ -167,13 +167,13 @@ conversation_graph:
 
       routing:
         - intent: returning_user
-          next_node: market_truth
+          next_subagent: market_truth
 
         - intent: new_user
-          next_node: awaiting_consent
+          next_subagent: awaiting_consent
 
         - intent: "*"
-          next_node: awaiting_consent
+          next_subagent: awaiting_consent
 
     # ─────────────────────────────────────────────────────────────
     # AWAITING CONSENT
@@ -211,13 +211,13 @@ conversation_graph:
 
       routing:
         - intent: consent_granted
-          next_node: profile_building
+          next_subagent: profile_building
 
         - intent: consent_declined
-          next_node: profile_building  # Profile collected for session only — deleted at session end
+          next_subagent: profile_building  # Profile collected for session only — deleted at session end
 
         - intent: "*"
-          next_node: awaiting_consent  # Stay and re-ask gently
+          next_subagent: awaiting_consent  # Stay and re-ask gently
 
     # ─────────────────────────────────────────────────────────────
     # PROFILE BUILDING
@@ -261,20 +261,20 @@ conversation_graph:
 
       routing:
         - intent: profile_complete
-          next_node: market_truth
+          next_subagent: market_truth
 
         - intent: profile_answer
           condition:
             field: profile_minimum_met   # Set by orchestrator when trade + location known
             operator: eq
             value: true
-          next_node: market_truth
+          next_subagent: market_truth
 
         - intent: profile_answer
-          next_node: profile_building  # Continue collecting
+          next_subagent: profile_building  # Continue collecting
 
         - intent: skip_question
-          next_node: profile_building  # Move to next field
+          next_subagent: profile_building  # Move to next field
 
     # ─────────────────────────────────────────────────────────────
     # MARKET TRUTH
@@ -321,25 +321,25 @@ conversation_graph:
 
       routing:
         - intent: interested_engaged
-          next_node: skill_check
+          next_subagent: skill_check
 
         - intent: pay_disappointment
-          next_node: pay_branch
+          next_subagent: pay_branch
 
         - intent: distance_issue
-          next_node: distance_branch
+          next_subagent: distance_branch
 
         - intent: overwhelmed_silent
-          next_node: normalise_branch
+          next_subagent: normalise_branch
 
         - intent: hang_up
-          next_node: capture_dropoff
+          next_subagent: capture_dropoff
 
         - intent: market_truth_query
-          next_node: market_truth    # Stay and answer follow-up
+          next_subagent: market_truth    # Stay and answer follow-up
 
         - intent: "*"
-          next_node: market_truth    # Stay if unclear
+          next_subagent: market_truth    # Stay if unclear
 
     # ─────────────────────────────────────────────────────────────
     # SKILL CHECK
@@ -381,30 +381,30 @@ conversation_graph:
 
       routing:
         - intent: skill_direct_match
-          next_node: evaluation
+          next_subagent: evaluation
 
         - intent: skill_partial_match
-          next_node: evaluation
+          next_subagent: evaluation
 
         - intent: skill_significant_gap
           condition:
             field: income_urgency
             operator: eq
             value: immediate
-          next_node: evaluation   # With bridge_income context set
+          next_subagent: evaluation   # With bridge_income context set
 
         - intent: skill_significant_gap
           condition:
             field: income_urgency
             operator: not_eq
             value: immediate
-          next_node: evaluation   # With training_first context set
+          next_subagent: evaluation   # With training_first context set
 
         - intent: profile_answer
-          next_node: skill_check  # Continue assessment
+          next_subagent: skill_check  # Continue assessment
 
         - intent: "*"
-          next_node: skill_check
+          next_subagent: skill_check
 
     # ─────────────────────────────────────────────────────────────
     # EVALUATION
@@ -441,7 +441,7 @@ conversation_graph:
         Rules:
           - Never say "yeh wala best hai". Present facts, not opinions.
           - Never manufacture urgency ("offer sirf 2 din ke liye hai").
-          - If they are going in circles (node_entry_count >= 3 for this node):
+          - If they are going in circles (subagent_entry_count >= 3 for this subagent):
             gently offer: "Kya aap kisi counsellor se baat karna chahenge?
             Woh aapko aur clearly guide kar sakte hain."
           - If they want to think: offer WhatsApp summary — do not pressure.
@@ -450,29 +450,29 @@ conversation_graph:
 
       routing:
         - intent: ready_to_apply
-          next_node: commitment
+          next_subagent: commitment
 
         - intent: wants_to_think
-          next_node: normalise_branch
+          next_subagent: normalise_branch
 
         - intent: wants_counsellor
-          next_node: counsellor_request
+          next_subagent: counsellor_request
 
         - intent: not_ready_yet
-          next_node: capture_dropoff
+          next_subagent: capture_dropoff
 
         - intent: evaluation_question
-          next_node: evaluation   # Stay and answer
+          next_subagent: evaluation   # Stay and answer
 
         - intent: "*"
           condition:
-            field: node_entry_count.evaluation   # Set by orchestrator
+            field: subagent_entry_count.evaluation   # Set by orchestrator
             operator: gt
             value: 3
-          next_node: counsellor_request   # Decision paralysis → HITL
+          next_subagent: counsellor_request   # Decision paralysis → HITL
 
         - intent: "*"
-          next_node: evaluation
+          next_subagent: evaluation
 
     # ─────────────────────────────────────────────────────────────
     # PAY BRANCH
@@ -512,16 +512,16 @@ conversation_graph:
 
       routing:
         - intent: expectation_adjusted
-          next_node: evaluation
+          next_subagent: evaluation
 
         - intent: interested_engaged
-          next_node: evaluation
+          next_subagent: evaluation
 
         - intent: expectation_firm
-          next_node: capture_dropoff
+          next_subagent: capture_dropoff
 
         - intent: "*"
-          next_node: pay_branch
+          next_subagent: pay_branch
 
     # ─────────────────────────────────────────────────────────────
     # DISTANCE BRANCH
@@ -564,19 +564,19 @@ conversation_graph:
             field: local_options_available
             operator: eq
             value: false
-          next_node: capture_dropoff
+          next_subagent: capture_dropoff
 
         - intent: constraint_hard
-          next_node: evaluation   # Re-run with tight radius options
+          next_subagent: evaluation   # Re-run with tight radius options
 
         - intent: constraint_flexible
-          next_node: evaluation   # Show wider radius options
+          next_subagent: evaluation   # Show wider radius options
 
         - intent: interested_engaged
-          next_node: evaluation
+          next_subagent: evaluation
 
         - intent: "*"
-          next_node: distance_branch
+          next_subagent: distance_branch
 
     # ─────────────────────────────────────────────────────────────
     # NORMALISE BRANCH (WhatsApp Handoff)
@@ -615,22 +615,22 @@ conversation_graph:
 
       routing:
         - intent: whatsapp_accepted
-          next_node: capture_dropoff   # Session ends; WhatsApp takes over
+          next_subagent: capture_dropoff   # Session ends; WhatsApp takes over
 
         - intent: whatsapp_declined
-          next_node: capture_dropoff   # Session ends; passive re-engagement at 7 days
+          next_subagent: capture_dropoff   # Session ends; passive re-engagement at 7 days
 
         - intent: re_engaged
-          next_node: evaluation
+          next_subagent: evaluation
 
         - intent: "*"
-          next_node: capture_dropoff
+          next_subagent: capture_dropoff
 
     # ─────────────────────────────────────────────────────────────
     # COMMITMENT
     # ─────────────────────────────────────────────────────────────
     - id: commitment
-      name: Commitment / Action Node
+      name: Commitment / Action SubAgent
       description: >
         User has decided to act. Consent is mandatory before any action.
         Three action types: apply for job, enrol in course, connect counsellor.
@@ -650,7 +650,7 @@ conversation_graph:
         - knowledge_retrieval   # LLM calls when user asks about course/scheme details before committing
 
       system_prompt: |
-        The user is ready to act. This is the commitment node.
+        The user is ready to act. This is the commitment subagent.
         Rules — non-negotiable:
           1. ALWAYS confirm consent before any action:
              "Kya main [specific role name] ke liye aapki taraf se apply kar doon?
@@ -665,19 +665,19 @@ conversation_graph:
 
       routing:
         - intent: apply_now
-          next_node: follow_through
+          next_subagent: follow_through
 
         - intent: enrol_course
-          next_node: follow_through
+          next_subagent: follow_through
 
         - intent: connect_counsellor
-          next_node: counsellor_request
+          next_subagent: counsellor_request
 
         - intent: action_declined
-          next_node: evaluation   # Return to evaluation — user may reconsider
+          next_subagent: evaluation   # Return to evaluation — user may reconsider
 
         - intent: "*"
-          next_node: commitment
+          next_subagent: commitment
 
     # ─────────────────────────────────────────────────────────────
     # FOLLOW-THROUGH
@@ -709,12 +709,12 @@ conversation_graph:
           - EMPLOYER GHOST (no callback at 72h): Offer next option from original shortlist.
             Do not dismiss or judge the employer publicly. Flag source for ONEST review.
           - JOB MISMATCH (role not as described): Capture mismatch details (pay diff, role diff).
-            Flag Blue Dot source for review. Re-open journey at evaluation node with full context.
+            Flag Blue Dot source for review. Re-open journey at evaluation subagent with full context.
           - NO RESPONSE: Mark outcome as unknown. One re-engagement message at 30 days.
             Do not spam. Respect their silence.
         This is session close. End warmly regardless of outcome.
 
-      routing: []   # Terminal node — no routing
+      routing: []   # Terminal subagent — no routing
 
     # ─────────────────────────────────────────────────────────────
     # COUNSELLOR REQUEST (HITL)
@@ -722,7 +722,7 @@ conversation_graph:
     - id: counsellor_request
       name: Counsellor Request — HITL
       description: >
-        Human-in-the-loop node. Bypasses LLM entirely.
+        Human-in-the-loop subagent. Bypasses LLM entirely.
         Triggered by: explicit user request, distress signal, or loop_count >= 3.
         Returns fixed config response and schedules callback.
       is_start: false
@@ -734,7 +734,7 @@ conversation_graph:
         - counsellor_schedule
 
       system_prompt: |
-        This node uses the special_handler: hitl.
+        This subagent uses the special_handler: hitl.
         The orchestrator returns the fixed hitl_response message from config.
         No LLM call is made. The counsellor_schedule tool is called directly.
         Fixed response (from config): "Hum ek counsellor se aapko connect karenge.
@@ -772,7 +772,7 @@ conversation_graph:
           - Market scarcity: DOP_MS (alert when ONEST signal appears)
           - Skill-income mismatch: DOP_SI (re-engage in 90 days)
           - Repeated no-action: DOP_RL (counsellor referral offer)
-        The orchestrator infers the drop-off code from the node the user was at
+        The orchestrator infers the drop-off code from the subagent the user was at
         before arriving here.
 
       routing: []   # Terminal
@@ -805,7 +805,7 @@ conversation_graph:
     - id: clarification
       name: Clarification
       description: >
-        Fallback node for unknown or unclassifiable intent.
+        Fallback subagent for unknown or unclassifiable intent.
         Re-prompt gently without revealing system internals.
       is_start: false
       is_terminal: false
@@ -826,7 +826,7 @@ conversation_graph:
 
       routing:
         - intent: "*"
-          next_node: clarification   # Orchestrator will re-evaluate after re-prompt
+          next_subagent: clarification   # Orchestrator will re-evaluate after re-prompt
                                      # Loop detection: if stuck here > 2 turns → counsellor_request
 ```
 
@@ -834,7 +834,7 @@ conversation_graph:
 
 ## Routing Summary — Quick Reference
 
-| From Node | Intent | Condition | Next Node |
+| From SubAgent | Intent | Condition | Next SubAgent |
 |---|---|---|---|
 | greeting | * | — | new_returning_check |
 | new_returning_check | returning_user | — | market_truth |
@@ -875,28 +875,28 @@ conversation_graph:
 | Field | Set by | Used in routing at |
 |---|---|---|
 | `user_id` | Reach Layer at session start | new_returning_check |
-| `consent_status` | awaiting_consent node | awaiting_consent routing |
+| `consent_status` | awaiting_consent subagent | awaiting_consent routing |
 | `profile_minimum_met` | Orchestrator (when trade+location known) | profile_building → market_truth |
-| `income_urgency` | profile_building node | skill_check routing |
+| `income_urgency` | profile_building subagent | skill_check routing |
 | `local_options_available` | Orchestrator (from ONEST response) | distance_branch routing |
-| `node_entry_count.evaluation` | Orchestrator (incremented per turn) | evaluation → counsellor_request |
+| `subagent_entry_count.evaluation` | Orchestrator (incremented per turn) | evaluation → counsellor_request |
 | `is_returning_user` | new_returning_check | new_returning_check routing |
 
 ---
 
 ## domain.yaml Refactor Notes for KKB
 
-After this graph config is adopted, the following sections in the existing `domain.yaml` are superseded:
+After this agent workflow config is adopted, the following sections in the existing `domain.yaml` are superseded:
 
 | Old Section | Status | Replacement |
 |---|---|---|
-| `conversation.workflow.steps[]` | **Remove** | Node ids in this graph |
-| `conversation.workflow.transitions{}` | **Remove** | `routing[]` in each node |
-| `conversation.prompt_blocks.node_instructions{}` | **Remove** | `system_prompt` in each node |
+| `conversation.workflow.steps[]` | **Remove** | SubAgent ids in this graph |
+| `conversation.workflow.transitions{}` | **Remove** | `routing[]` in each subagent |
+| `conversation.prompt_blocks.node_instructions{}` | **Remove** | `system_prompt` in each subagent |
 | `conversation.prompt_blocks.persona` | **Remove** | `agent_system_prompt` in this graph |
-| `preprocessing.nlu.intents[]` | **Keep** | Must contain all intents referenced across all nodes |
-| `connectors` | **Keep** | Tool names in `node.tools[]` must match connector names here |
+| `preprocessing.nlu.intents[]` | **Keep** | Must contain all intents referenced across all subagents |
+| `connectors` | **Keep** | Tool names in `subagent.tools[]` must match connector names here |
 | `trust` | **Keep** | Unchanged |
-| `hitl` | **Simplify** | `loop_count_threshold` now becomes `node_entry_count` condition in evaluation node |
+| `hitl` | **Simplify** | `loop_count_threshold` now becomes `subagent_entry_count` condition in evaluation subagent |
 | `agent` | **Keep** | Model config unchanged |
 | `messages` | **Keep** | Fixed messages (blocked, escalation, etc.) unchanged |
