@@ -79,9 +79,8 @@ conversation_graph:
   graph_id: kkb_iti_graduate
   version: "1.0.0"
 
-  global_persona: |
+  agent_system_prompt: |
     You are Kaam Ki Baat (KKB), a trusted employment advisor for workers in India.
-    You speak in the language the user uses — Hindi, Kannada, Hinglish, or English.
     You never make promises. You never say "guaranteed", "pakka milega", or "100% placement".
     Every job or pay figure you quote must trace back to a verified ONEST Blue Dot source.
     You use ranges, never absolutes: say "₹14,000–18,000/month" not "₹18,000/month".
@@ -120,9 +119,6 @@ conversation_graph:
       is_terminal: false
       special_handler: null
 
-      required_inputs: []
-      outputs: [detected_language]
-
       valid_intents:
         - greeting
         - any_input       # Accept any first utterance — do not block on unknown intent here
@@ -154,9 +150,6 @@ conversation_graph:
       is_start: false
       is_terminal: false
       special_handler: null
-
-      required_inputs: [user_id]
-      outputs: [is_returning_user]
 
       valid_intents:
         - any_input       # Transparent to user — no user action needed
@@ -194,9 +187,6 @@ conversation_graph:
       is_start: false
       is_terminal: false
       special_handler: null
-
-      required_inputs: []
-      outputs: [consent_status]
 
       valid_intents:
         - consent_granted
@@ -242,14 +232,6 @@ conversation_graph:
       is_start: false
       is_terminal: false
       special_handler: null
-
-      required_inputs: [consent_status]
-      outputs:
-        - trade_or_stream   # Hard minimum
-        - location          # Hard minimum
-        - age_bracket       # Optional but high value
-        - income_urgency    # Drives routing at skill_check
-        - education_level   # Determines round 3 conditional
 
       valid_intents:
         - profile_answer
@@ -307,14 +289,6 @@ conversation_graph:
       is_terminal: false
       special_handler: null
 
-      required_inputs:
-        - trade_or_stream
-        - location
-
-      outputs:
-        - market_signal_strength   # strong / weak / absent
-        - options_presented
-
       valid_intents:
         - interested_engaged
         - pay_disappointment
@@ -325,6 +299,7 @@ conversation_graph:
 
       tools:
         - onest_market_lookup
+        - knowledge_retrieval     # LLM calls when it needs trade/scheme/market context from KE
 
       system_prompt: |
         You are delivering verified market intelligence. This is the most important moment.
@@ -379,20 +354,14 @@ conversation_graph:
       is_terminal: false
       special_handler: null
 
-      required_inputs:
-        - trade_or_stream
-        - options_presented
-
-      outputs:
-        - skill_match_level   # direct / partial / significant_gap
-
       valid_intents:
         - skill_direct_match
         - skill_partial_match
         - skill_significant_gap
         - profile_answer        # User may reveal more about their skills here
 
-      tools: []
+      tools:
+        - knowledge_retrieval   # LLM calls when it needs training/course/scheme info from KE
 
       system_prompt: |
         You are assessing whether the user's skills match the roles you just presented.
@@ -450,11 +419,6 @@ conversation_graph:
       is_terminal: false
       special_handler: null
 
-      required_inputs:
-        - options_presented
-
-      outputs: []
-
       valid_intents:
         - ready_to_apply
         - wants_to_think
@@ -462,7 +426,8 @@ conversation_graph:
         - not_ready_yet
         - evaluation_question    # Follow-up questions about options
 
-      tools: []
+      tools:
+        - knowledge_retrieval   # LLM calls when user asks about role details, growth, schemes
 
       system_prompt: |
         The user is in the evaluation state — comparing real options. This is the highest-value
@@ -521,9 +486,6 @@ conversation_graph:
       is_terminal: false
       special_handler: null
 
-      required_inputs: []
-      outputs: []
-
       valid_intents:
         - expectation_adjusted    # User recalibrates after honest framing
         - expectation_firm        # User holds their expectation
@@ -573,10 +535,6 @@ conversation_graph:
       is_terminal: false
       special_handler: null
 
-      required_inputs: []
-      outputs:
-        - max_commute_km   # Update session profile with confirmed constraint
-
       valid_intents:
         - constraint_hard     # Distance is non-negotiable
         - constraint_flexible # Willing to reconsider distance
@@ -584,6 +542,7 @@ conversation_graph:
 
       tools:
         - onest_market_lookup
+        - knowledge_retrieval     # LLM calls when it needs trade/scheme context from KE
 
       system_prompt: |
         The user has raised a distance concern. Test gently whether this is a hard constraint.
@@ -632,9 +591,6 @@ conversation_graph:
       is_terminal: false
       special_handler: whatsapp_handoff
 
-      required_inputs: []
-      outputs: []
-
       valid_intents:
         - whatsapp_accepted
         - whatsapp_declined
@@ -682,14 +638,6 @@ conversation_graph:
       is_terminal: false
       special_handler: null
 
-      required_inputs:
-        - options_presented
-        - consent_status
-
-      outputs:
-        - action_taken     # applied / enrolled / counsellor_connected
-        - reference_number
-
       valid_intents:
         - apply_now
         - enrol_course
@@ -699,6 +647,7 @@ conversation_graph:
       tools:
         - onest_apply
         - counsellor_schedule
+        - knowledge_retrieval   # LLM calls when user asks about course/scheme details before committing
 
       system_prompt: |
         The user is ready to act. This is the commitment node.
@@ -742,13 +691,6 @@ conversation_graph:
       is_terminal: true
       special_handler: null
 
-      required_inputs:
-        - action_taken
-        - reference_number
-
-      outputs:
-        - outcome     # success / employer_ghost / job_mismatch / no_response
-
       valid_intents:
         - outcome_positive
         - outcome_employer_ghost
@@ -787,10 +729,6 @@ conversation_graph:
       is_terminal: true
       special_handler: hitl
 
-      required_inputs: []
-      outputs:
-        - counsellor_scheduled
-
       valid_intents: []   # LLM not called — no intent classification needed
       tools:
         - counsellor_schedule
@@ -816,11 +754,6 @@ conversation_graph:
       is_start: false
       is_terminal: true
       special_handler: null
-
-      required_inputs: []
-      outputs:
-        - drop_off_reason     # DOP_MT / DOP_OP / DOP_EV / DOP_WA / DOP_MS / DOP_SI / DOP_RL
-        - reengagement_days   # When to re-engage
 
       valid_intents:
         - drop_off_acknowledged
@@ -854,8 +787,6 @@ conversation_graph:
       is_terminal: true
       special_handler: null
 
-      required_inputs: []
-      outputs: []
       valid_intents: []
       tools: []
 
@@ -879,9 +810,6 @@ conversation_graph:
       is_start: false
       is_terminal: false
       special_handler: null
-
-      required_inputs: []
-      outputs: []
 
       valid_intents:
         - any_input
@@ -947,7 +875,7 @@ conversation_graph:
 | Field | Set by | Used in routing at |
 |---|---|---|
 | `user_id` | Reach Layer at session start | new_returning_check |
-| `consent_status` | awaiting_consent node | profile_building entry guard |
+| `consent_status` | awaiting_consent node | awaiting_consent routing |
 | `profile_minimum_met` | Orchestrator (when trade+location known) | profile_building → market_truth |
 | `income_urgency` | profile_building node | skill_check routing |
 | `local_options_available` | Orchestrator (from ONEST response) | distance_branch routing |
@@ -965,7 +893,7 @@ After this graph config is adopted, the following sections in the existing `doma
 | `conversation.workflow.steps[]` | **Remove** | Node ids in this graph |
 | `conversation.workflow.transitions{}` | **Remove** | `routing[]` in each node |
 | `conversation.prompt_blocks.node_instructions{}` | **Remove** | `system_prompt` in each node |
-| `conversation.prompt_blocks.persona` | **Remove** | `global_persona` in this graph |
+| `conversation.prompt_blocks.persona` | **Remove** | `agent_system_prompt` in this graph |
 | `preprocessing.nlu.intents[]` | **Keep** | Must contain all intents referenced across all nodes |
 | `connectors` | **Keep** | Tool names in `node.tools[]` must match connector names here |
 | `trust` | **Keep** | Unchanged |

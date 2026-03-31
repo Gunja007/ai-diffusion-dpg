@@ -39,12 +39,6 @@ nodes:
     special_handler: <string|null>      # Optional. Bypasses LLM entirely.
                                         # Values: "hitl" | "whatsapp_handoff" | null
 
-    required_inputs: [<field_name>]     # Session fields that MUST be populated before
-                                        # entering this node. Guard enforced by orchestrator.
-
-    outputs: [<field_name>]             # Fields this node is expected to produce/confirm
-                                        # in session state by the end of the turn.
-
     valid_intents: [<intent_name>]      # NLU classifies ONLY within this set + global_intents.
                                         # Scopes intent classification to what is meaningful here.
 
@@ -56,7 +50,7 @@ nodes:
       <text>                            # Defines: role at this stage, what to ask/say,
                                         # rules to follow, what NOT to do, tone, format.
                                         # This is the primary driver of LLM behaviour here.
-                                        # Merged with global persona at runtime.
+                                        # Merged with agent_system_prompt at runtime.
 
     routing:                            # Ordered list of routing rules. First match wins.
       - intent: <intent_name>
@@ -94,9 +88,13 @@ conversation_graph:
   graph_id: <string>                    # Usecase identifier (e.g. "kkb_iti_graduate")
   version: <string>                     # Semver. Logged with every turn for auditability.
 
-  global_persona: |                     # Injected into every node's system prompt.
-    <text>                              # Defines the agent identity, brand voice, tone.
-                                        # Never overrides node-level instructions.
+  agent_system_prompt: |               # Defines the entire use case at the agent level.
+    <text>                             # Covers: what this agent is, its purpose, who it serves,
+                                       # what it must never do, and any hard rules that apply
+                                       # unconditionally across every node and every turn.
+                                       # This is the foundational instruction layer.
+                                       # Channel tone and language style are injected at runtime
+                                       # by the Reach Layer / Language Normalisation — not here.
 
   global_intents: [<intent_name>]       # Intents valid at ANY node regardless of current node.
                                         # Examples: counsellor_request, termination_intent,
@@ -153,40 +151,41 @@ Step 1:  Read session state (Memory Layer)
 
 Step 2:  Resolve current_node = graph.nodes[current_node_id]
 
-Step 3:  Check required_inputs guard
-         → if any field in current_node.required_inputs is absent from session:
-           route to the node that collects those fields (configured as fallback)
+Step 3:  Safety check on input (Trust Layer) — unchanged
 
-Step 4:  Safety check on input (Trust Layer) — unchanged
+Step 4:  Language Normalisation — unchanged
 
-Step 5:  Language Normalisation — unchanged
-
-Step 6:  NLU Processor
+Step 5:  NLU Processor
          → pass current_node.valid_intents + graph.global_intents as the allowed intent set
          → NLU classifies ONLY within this scoped set
 
-Step 7:  Determine next_node_id via routing resolution (see Routing Algorithm below)
+Step 6:  Determine next_node_id via routing resolution (see Routing Algorithm below)
+         → entry guards expressed as routing conditions, not node-level fields
+           (e.g. "don't enter evaluation unless profile_complete == true" is a
+           condition on the routing rule that points to evaluation, not a
+           required_inputs declaration on evaluation itself)
 
-Step 8:  ManagerAgent assembles prompt (internal — no external call)
-         → system prompt = global_persona + current_node.system_prompt
+Step 7:  ManagerAgent assembles prompt (internal — no external call)
+         → system prompt = agent_system_prompt
+                         + channel/language context (from Reach Layer / Language Normalisation)
+                         + current_node.system_prompt
          → messages built from current_question and session context
 
-Step 8b: [conditional] RAG retrieval (Knowledge Engine)
-         → called only when relevant knowledge is needed for this turn
-           (e.g. scheme info, trade descriptions, training institutes)
-         → NOT called on every turn
-         → retrieved chunks appended to messages if called
+Step 8:  LLM call #1 with scoped tools (current_node.tools only)
+         → tool set may include knowledge_retrieval (KE) if listed in node.tools
 
-Step 9:  LLM call #1 with scoped tools (current_node.tools only)
+Step 9:  Tool-use loop (Manager Agent + Action Gateway)
+         → if LLM calls knowledge_retrieval: orchestrator calls Knowledge Engine,
+           appends retrieved chunks as tool_result, LLM continues
+         → if LLM calls any other tool: routed to Action Gateway as before
+         → loop continues until LLM returns a non-tool_use response
 
-Step 10: Tool-use loop (Manager Agent + Action Gateway) — unchanged
+Step 10: Safety check on output (Trust Layer) — unchanged
 
-Step 11: Safety check on output (Trust Layer) — unchanged
+Step 11: Return TurnResult
 
-Step 12: Return TurnResult
-
-Step 13: [async] Write session state including next_node_id → Memory Layer
-Step 14: [async] Emit turn event → Learning Layer
+Step 12: [async] Write session state including next_node_id → Memory Layer
+Step 13: [async] Emit turn event → Learning Layer
 ```
 
 ---
@@ -274,19 +273,22 @@ This improves classification accuracy: NLU is not asked to distinguish between i
 
 ## System Prompt Assembly
 
-Prompt assembly is done by **ManagerAgent internally** — not by the Knowledge Engine. KE is only invoked when RAG retrieval is needed for the turn.
+Prompt assembly is done by **ManagerAgent internally**.
 
 The LLM receives a system prompt assembled as:
 
 ```
-[global_persona]
+[agent_system_prompt]               ← from conversation_graph — use case purpose, hard rules
 
-[current_node.system_prompt]
+[channel/language context]          ← injected at runtime by Reach Layer / Language Normalisation
+                                      (e.g. channel type, detected language, response format hints)
+
+[current_node.system_prompt]        ← from the active node — what to do on this specific turn
 ```
 
-The global persona establishes identity and tone. The node system prompt defines exactly what the LLM should do, ask, avoid, and produce at this stage. Node instructions take precedence where they conflict.
+`agent_system_prompt` defines the agent's mission and non-negotiable constraints. Channel and language context comes from Reach Layer and Language Normalisation — it is not hardcoded in the graph. The node system prompt governs behaviour for this specific conversation state. Node instructions take precedence where they conflict with the use-case prompt.
 
-RAG chunks from KE (when retrieved) are appended to the messages array, not to the system prompt.
+RAG chunks from Knowledge Engine are returned as `tool_result` in the messages array — the LLM calls `knowledge_retrieval` as a tool when it needs them. KE is never called on a fixed schedule; the LLM decides when retrieval is needed based on the user's query.
 
 ---
 
@@ -294,13 +296,15 @@ RAG chunks from KE (when retrieved) are appended to the messages array, not to t
 
 Only tools listed in `current_node.tools` are passed to the LLM. This prevents the LLM from calling actions not appropriate for the current stage (e.g. `onest_apply` should never be available during profile building).
 
+`knowledge_retrieval` is one of the available tool names. Nodes that may need RAG include it in their `tools` list; nodes that never need it (e.g. greeting, awaiting_consent) do not. The LLM calls it like any other tool — the orchestrator routes it to Knowledge Engine and returns the result as `tool_result`.
+
 ```python
 # Orchestrator builds scoped tool set per turn
 active_tools = [
     tool_registry.get_definition(name)
     for name in current_node.tools
 ]
-# Passed to ManagerAgent and Knowledge Engine
+# Passed to ManagerAgent — includes knowledge_retrieval if listed on this node
 ```
 
 ---
@@ -314,7 +318,7 @@ Nodes with `special_handler` bypass LLM inference entirely.
 | `hitl` | Orchestrator returns the fixed `hitl_response` message from config. No LLM call. Triggers counsellor scheduling via Action Gateway. |
 | `whatsapp_handoff` | Orchestrator triggers WhatsApp message delivery with session summary. No LLM call. |
 
-These handlers are checked by the orchestrator before Step 8 (prompt assembly). If `current_node.special_handler` is set, skip Steps 8–10 entirely.
+These handlers are checked by the orchestrator before Step 7 (prompt assembly). If `current_node.special_handler` is set, skip Steps 7–9 entirely.
 
 ---
 
@@ -327,7 +331,7 @@ This design replaces the following existing sections in domain.yaml:
 | `conversation.workflow.steps[]` | `conversation_graph.nodes[].id` |
 | `conversation.workflow.transitions{}` | `conversation_graph.nodes[].routing[]` |
 | `conversation.prompt_blocks.node_instructions{}` | `conversation_graph.nodes[].system_prompt` |
-| `conversation.prompt_blocks.persona` | `conversation_graph.global_persona` |
+| `conversation.prompt_blocks.persona` | `conversation_graph.agent_system_prompt` |
 
 Sections that remain unchanged: `agent`, `preprocessing`, `connectors`, `trust`, `knowledge`, `hitl`, `messages`.
 
