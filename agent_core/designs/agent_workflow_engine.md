@@ -52,6 +52,12 @@ subagents:
                                         # This is the primary driver of LLM behaviour here.
                                         # Merged with agent_system_prompt at runtime.
 
+    output_format: <json_schema|null>   # Optional. When set, the LLM response is constrained
+                                        # to this JSON schema (passed as structured output spec).
+                                        # Null = free-form text response (default for most subagents).
+                                        # Use for subagents that must return machine-readable output
+                                        # (e.g. data extraction, eligibility check results).
+
     routing:                            # Ordered list of routing rules. First match wins.
       - intent: <intent_name>
         next_subagent: <subagent_id>
@@ -176,6 +182,7 @@ Step 7:  ManagerAgent assembles prompt (internal — no external call)
 
 Step 8:  LLM call #1 with scoped tools (current_subagent.tools only)
          → tool set may include knowledge_retrieval (KE) if listed in subagent.tools
+         → if current_subagent.output_format is set: passed as structured output schema to LLM
 
 Step 9:  Tool-use loop (Manager Agent + Action Gateway)
          → if LLM calls knowledge_retrieval: orchestrator calls Knowledge Engine,
