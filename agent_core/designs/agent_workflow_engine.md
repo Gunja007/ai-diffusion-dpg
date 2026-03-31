@@ -185,9 +185,13 @@ Step 8:  LLM call #1 with scoped tools (current_subagent.tools only)
          → if current_subagent.output_format is set: passed as structured output schema to LLM
 
 Step 9:  Tool-use loop (Manager Agent + Action Gateway)
+         # OPEN: Decide whether the orchestrator drives the full tool-use loop (Step 9 as written),
+         # or the LLM handles tool calling autonomously
+         # Current design: orchestrator owns the loop — appends tool_result and re-calls LLM until
+         # a non-tool_use response is returned.
          → if LLM calls knowledge_retrieval: orchestrator calls Knowledge Engine,
            appends retrieved chunks as tool_result, LLM continues
-         → if LLM calls any other tool: routed to Action Gateway as before
+         → if LLM calls any other tool: routed to Action Gateway
          → loop continues until LLM returns a non-tool_use response
 
 Step 10: Safety check on output (Trust Layer) — unchanged
