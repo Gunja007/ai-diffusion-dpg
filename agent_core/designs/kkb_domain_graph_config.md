@@ -148,14 +148,14 @@ conversation_graph:
     - id: new_returning_check
       name: New or Returning Caller Check
       description: >
-        System node. Check if phone number matches a stored profile.
+        System node. Check if user_id matches a stored profile.
         Returning: load profile and resume from last mental state.
         New: proceed to consent.
       is_start: false
       is_terminal: false
       special_handler: null
 
-      required_inputs: [phone]
+      required_inputs: [user_id]
       outputs: [is_returning_user]
 
       valid_intents:
@@ -165,7 +165,7 @@ conversation_graph:
 
       system_prompt: |
         This is a system checkpoint. Do not display anything to the user yet.
-        The orchestrator checks whether a profile exists for this phone number.
+        The orchestrator checks whether a profile exists for this user_id.
         If returning: greet them by name if known, acknowledge you remember them,
         and briefly recap where they left off. Then continue from that point.
         Example: "Arjun bhai, pichli baar hum electrician roles dekh rahe the Hubli mein.
@@ -275,7 +275,7 @@ conversation_graph:
         - Once trade_or_stream and location are known, you may proceed to market truth
           if income_urgency is "immediate". Do not make them wait.
         - Once all 5 fields are collected (or skipped), move to market truth.
-        - Do not ask for phone number, full address, or government ID.
+        - Do not ask for user_id, full address, or government ID.
 
       routing:
         - intent: profile_complete
@@ -946,7 +946,7 @@ conversation_graph:
 
 | Field | Set by | Used in routing at |
 |---|---|---|
-| `phone` | Reach Layer at session start | new_returning_check |
+| `user_id` | Reach Layer at session start | new_returning_check |
 | `consent_status` | awaiting_consent node | profile_building entry guard |
 | `profile_minimum_met` | Orchestrator (when trade+location known) | profile_building → market_truth |
 | `income_urgency` | profile_building node | skill_check routing |
