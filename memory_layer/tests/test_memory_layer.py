@@ -3,8 +3,8 @@ memory_layer/tests/test_memory_layer.py
 
 Unit tests for MemoryLayer — the top-level orchestrator.
 
-All store dependencies (RedisSessionStore, Neo4jUserStore, Neo4jJourneyStore,
-Neo4jContextStore) are injected as mocks. No real Redis or Neo4j connections.
+All store dependencies (RedisSessionStore, GraphUserStore, GraphJourneyStore,
+GraphContextStore) are injected as mocks. No real Redis or Memgraph connections.
 
 Covers:
 - Normal execution: all 5 public methods return correct results
@@ -30,7 +30,7 @@ from src.memory_layer import MemoryLayer, _build_initial_session, _build_scope_m
 
 MINIMAL_CONFIG = {
     "redis": {"host": "localhost", "port": 6379, "db": 0},
-    "neo4j": {
+    "memgraph": {
         "uri": "bolt://localhost:7687",
         "user": "neo4j",
         "password": "test",
@@ -76,19 +76,22 @@ def _make_layer() -> tuple[MemoryLayer, dict]:
     """
     with (
         patch("src.memory_layer.RedisSessionStore") as MockRedis,
-        patch("src.memory_layer.Neo4jUserStore") as MockUser,
-        patch("src.memory_layer.Neo4jJourneyStore") as MockJourney,
-        patch("src.memory_layer.Neo4jContextStore") as MockContext,
+        patch("src.memory_layer.GraphUserStore") as MockUser,
+        patch("src.memory_layer.GraphJourneyStore") as MockJourney,
+        patch("src.memory_layer.GraphContextStore") as MockContext,
+        patch("src.memory_layer.SQLiteAuditStore") as MockAudit,
         patch("src.memory_layer.GraphDatabase") as MockGDB,
     ):
         mock_redis = MagicMock()
         mock_user = MagicMock()
         mock_journey = MagicMock()
         mock_context = MagicMock()
+        mock_audit = MagicMock()
         MockRedis.return_value = mock_redis
         MockUser.return_value = mock_user
         MockJourney.return_value = mock_journey
         MockContext.return_value = mock_context
+        MockAudit.return_value = mock_audit
         MockGDB.driver.return_value = MagicMock()
 
         layer = MemoryLayer(MINIMAL_CONFIG)
@@ -98,6 +101,7 @@ def _make_layer() -> tuple[MemoryLayer, dict]:
         "user": mock_user,
         "journey": mock_journey,
         "context": mock_context,
+        "audit": mock_audit,
     }
     return layer, stores
 
@@ -106,19 +110,22 @@ def _make_layer_with_config(config: dict) -> tuple[MemoryLayer, dict]:
     """Construct a MemoryLayer with a custom config."""
     with (
         patch("src.memory_layer.RedisSessionStore") as MockRedis,
-        patch("src.memory_layer.Neo4jUserStore") as MockUser,
-        patch("src.memory_layer.Neo4jJourneyStore") as MockJourney,
-        patch("src.memory_layer.Neo4jContextStore") as MockContext,
+        patch("src.memory_layer.GraphUserStore") as MockUser,
+        patch("src.memory_layer.GraphJourneyStore") as MockJourney,
+        patch("src.memory_layer.GraphContextStore") as MockContext,
+        patch("src.memory_layer.SQLiteAuditStore") as MockAudit,
         patch("src.memory_layer.GraphDatabase") as MockGDB,
     ):
         mock_redis = MagicMock()
         mock_user = MagicMock()
         mock_journey = MagicMock()
         mock_context = MagicMock()
+        mock_audit = MagicMock()
         MockRedis.return_value = mock_redis
         MockUser.return_value = mock_user
         MockJourney.return_value = mock_journey
         MockContext.return_value = mock_context
+        MockAudit.return_value = mock_audit
         MockGDB.driver.return_value = MagicMock()
 
         layer = MemoryLayer(config)
@@ -128,6 +135,7 @@ def _make_layer_with_config(config: dict) -> tuple[MemoryLayer, dict]:
         "user": mock_user,
         "journey": mock_journey,
         "context": mock_context,
+        "audit": mock_audit,
     }
     return layer, stores
 
@@ -558,7 +566,7 @@ def test_get_active_sessions_redis_error_returns_empty():
 # delete_user
 # ---------------------------------------------------------------------------
 
-def test_delete_user_calls_neo4j_and_redis():
+def test_delete_user_calls_graph_and_redis():
     layer, stores = _make_layer()
     layer.delete_user("user-1")
     stores["user"].delete_user.assert_called_once_with("user-1")
