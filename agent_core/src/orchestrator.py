@@ -21,6 +21,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+import uuid
 from typing import Any, Optional
 
 from src.base import AgentCoreBase
@@ -133,6 +134,7 @@ class AgentCore(AgentCoreBase):
         session_id = turn_input.session_id
         # PoC fallback: use session_id as user_id if caller didn't provide one
         user_id: str = turn_input.user_id or session_id
+        turn_id = str(uuid.uuid4())
 
         logger.info(
             "orchestrator.turn_start",
@@ -187,10 +189,10 @@ class AgentCore(AgentCoreBase):
             # so the Trust Layer's "exactly twice per turn" contract is honoured.
             trust_input = self._trust.check_input(session_id, turn_input.user_message)
             if trust_input.action == "block":
-                return self._blocked_response(session_id, trust_input, start, trust_input)
+                return self._blocked_response(session_id, trust_input, start, trust_input, turn_id, intent="unknown", user_id=user_id, user_message=turn_input.user_message)
             if trust_input.action == "escalate":
                 self._schedule_flush(session_id, user_id, "escalation_trust_input")
-                return self._escalated_response(session_id, trust_input, start, trust_input)
+                return self._escalated_response(session_id, trust_input, start, trust_input, turn_id, intent="unknown", user_id=user_id, user_message=turn_input.user_message)
             return self._handle_special(
                 handler=current_subagent.special_handler,
                 current_subagent=current_subagent,
@@ -200,6 +202,8 @@ class AgentCore(AgentCoreBase):
                 turn_input=turn_input,
                 start=start,
                 trust_input=trust_input,
+                turn_id=turn_id,
+                intent="special_handler",
             )
 
         # ── Step 3: Trust check on input ─────────────────────────────
@@ -223,7 +227,7 @@ class AgentCore(AgentCoreBase):
                 "  [STEP 3] INPUT BLOCKED — reason=%s  →  returning blocked response",
                 trust_input.reason,
             )
-            return self._blocked_response(session_id, trust_input, start, trust_input)
+            return self._blocked_response(session_id, trust_input, start, trust_input, turn_id, intent="unknown", user_id=user_id, user_message=turn_input.user_message)
 
         if trust_input.action == "escalate":
             logger.info(
@@ -231,7 +235,7 @@ class AgentCore(AgentCoreBase):
                 trust_input.reason,
             )
             self._schedule_flush(session_id, user_id, "escalation_trust_input")
-            return self._escalated_response(session_id, trust_input, start, trust_input)
+            return self._escalated_response(session_id, trust_input, start, trust_input, turn_id, intent="unknown", user_id=user_id, user_message=turn_input.user_message)
 
         # ── Step 4: Language Normalisation ───────────────────────────
         lang_model = (
@@ -426,6 +430,8 @@ class AgentCore(AgentCoreBase):
                 model_used="",
                 latency_ms=int((time.time() - start) * 1000),
                 turn_input=turn_input,
+                turn_id=turn_id,
+                intent=nlu_result.intent,
                 tool_calls=[],
                 trust_input=trust_input,
                 trust_output=TrustCheckResult(passed=True, action="allow"),
@@ -533,6 +539,8 @@ class AgentCore(AgentCoreBase):
             model_used=llm_response.model_used,
             latency_ms=latency_ms,
             turn_input=turn_input,
+            turn_id=turn_id,
+            intent=nlu_result.intent,
             tool_calls=tool_calls,
             trust_input=trust_input,
             trust_output=trust_output,
@@ -682,6 +690,8 @@ class AgentCore(AgentCoreBase):
         turn_input: TurnInput,
         start: float,
         trust_input: TrustCheckResult,
+        turn_id: str,
+        intent: str,
     ) -> TurnResult:
         """
         Handle subagents with special_handler set — bypasses Steps 3–9 (LLM/tools).
@@ -699,11 +709,34 @@ class AgentCore(AgentCoreBase):
             if trust_output.action in ("block", "escalate"):
                 hitl_msg = self._safe_fallback_message()
             self._schedule_flush(session_id, user_id, "hitl_special_handler")
+            latency_ms = int((time.time() - start) * 1000)
+            turn_event = TurnEvent(
+                session_id=session_id,
+                turn_id=turn_id,
+                response_text=hitl_msg,
+                tool_calls=[],
+                trust_input_result=trust_input,
+                trust_output_result=trust_output,
+                model_used="",
+                intent=intent,
+                input_tokens=0,
+                output_tokens=0,
+                latency_ms=latency_ms,
+                timestamp_ms=int(time.time() * 1000),
+            )
+            # NOTE: daemon thread means audit write may be lost on abrupt process exit.
+            thread = threading.Thread(
+                target=self._post_turn,
+                args=(session_id, user_id, turn_id, hitl_msg, turn_input.user_message, turn_event, False, ""),
+                daemon=True,
+            )
+            thread.start()
             return TurnResult(
                 session_id=session_id,
+                turn_id=turn_id,
                 response_text=hitl_msg,
                 was_escalated=True,
-                latency_ms=int((time.time() - start) * 1000),
+                latency_ms=latency_ms,
             )
 
         if handler == "whatsapp_handoff":
@@ -716,11 +749,34 @@ class AgentCore(AgentCoreBase):
             if trust_output.action in ("block", "escalate"):
                 handoff_msg = self._safe_fallback_message()
             self._schedule_flush(session_id, user_id, "whatsapp_handoff")
+            latency_ms = int((time.time() - start) * 1000)
+            turn_event = TurnEvent(
+                session_id=session_id,
+                turn_id=turn_id,
+                response_text=handoff_msg,
+                tool_calls=[],
+                trust_input_result=trust_input,
+                trust_output_result=trust_output,
+                model_used="",
+                intent=intent,
+                input_tokens=0,
+                output_tokens=0,
+                latency_ms=latency_ms,
+                timestamp_ms=int(time.time() * 1000),
+            )
+            # NOTE: daemon thread means audit write may be lost on abrupt process exit.
+            thread = threading.Thread(
+                target=self._post_turn,
+                args=(session_id, user_id, turn_id, handoff_msg, turn_input.user_message, turn_event, False, ""),
+                daemon=True,
+            )
+            thread.start()
             return TurnResult(
                 session_id=session_id,
+                turn_id=turn_id,
                 response_text=handoff_msg,
                 was_escalated=False,
-                latency_ms=int((time.time() - start) * 1000),
+                latency_ms=latency_ms,
             )
 
         # Unknown handler — log and return a safe fallback.
@@ -732,11 +788,34 @@ class AgentCore(AgentCoreBase):
             "unknown_intent_message",
             "I didn't quite understand that. Could you tell me more?",
         )
+        latency_ms = int((time.time() - start) * 1000)
+        turn_event = TurnEvent(
+            session_id=session_id,
+            turn_id=turn_id,
+            response_text=fallback_msg,
+            tool_calls=[],
+            trust_input_result=trust_input,
+            trust_output_result=TrustCheckResult(passed=True, action="allow"),
+            model_used="",
+            intent=intent,
+            input_tokens=0,
+            output_tokens=0,
+            latency_ms=latency_ms,
+            timestamp_ms=int(time.time() * 1000),
+        )
+        # NOTE: daemon thread means audit write may be lost on abrupt process exit.
+        thread = threading.Thread(
+            target=self._post_turn,
+            args=(session_id, user_id, turn_id, fallback_msg, turn_input.user_message, turn_event, False, ""),
+            daemon=True,
+        )
+        thread.start()
         return TurnResult(
             session_id=session_id,
+            turn_id=turn_id,
             response_text=fallback_msg,
             was_escalated=False,
-            latency_ms=int((time.time() - start) * 1000),
+            latency_ms=latency_ms,
         )
 
     # ------------------------------------------------------------------
@@ -749,6 +828,10 @@ class AgentCore(AgentCoreBase):
         trust_result: TrustCheckResult,
         start: float,
         trust_input: TrustCheckResult,
+        turn_id: str,
+        intent: str,
+        user_id: str = "",
+        user_message: str = "",
     ) -> TurnResult:
         """
         Build a TurnResult for input that was blocked by the Trust Layer.
@@ -758,6 +841,10 @@ class AgentCore(AgentCoreBase):
             trust_result: The blocking TrustCheckResult.
             start:        Turn start timestamp.
             trust_input:  Same as trust_result for input blocks (kept for API symmetry).
+            turn_id:      Unique identifier for this turn.
+            intent:       NLU intent (or "unknown" for early-exit paths).
+            user_id:      User identifier for audit recording.
+            user_message: Original user message for audit recording.
 
         Returns:
             TurnResult with the configured blocked message.
@@ -775,12 +862,43 @@ class AgentCore(AgentCoreBase):
             "blocked_message",
             "I'm unable to help with that request.",
         )
+        latency_ms = int((time.time() - start) * 1000)
+
+        # Assemble TurnEvent for audit (Step 11b / async logging)
+        turn_event = TurnEvent(
+            session_id=session_id,
+            turn_id=turn_id,
+            response_text=blocked_text,
+            tool_calls=[],
+            trust_input_result=trust_input,
+            trust_output_result=TrustCheckResult(passed=True, action="allow"),
+            model_used="",
+            intent=intent,
+            input_tokens=0,
+            output_tokens=0,
+            latency_ms=latency_ms,
+            timestamp_ms=int(time.time() * 1000),
+        )
+
+        # NOTE: daemon thread means audit write may be lost on abrupt process exit.
+        # Blocked turns are compliance-critical; this is a known data-loss window.
+        thread = threading.Thread(
+            target=self._post_turn,
+            args=(
+                session_id, user_id, turn_id, blocked_text,
+                user_message, turn_event, False, "",
+            ),
+            daemon=True,
+        )
+        thread.start()
+
         return TurnResult(
             session_id=session_id,
+            turn_id=turn_id,
             response_text=blocked_text,
             was_escalated=False,
             model_used="",
-            latency_ms=int((time.time() - start) * 1000),
+            latency_ms=latency_ms,
         )
 
     def _escalated_response(
@@ -789,6 +907,10 @@ class AgentCore(AgentCoreBase):
         trust_result: TrustCheckResult,
         start: float,
         trust_input: TrustCheckResult,
+        turn_id: str,
+        intent: str,
+        user_id: str = "",
+        user_message: str = "",
     ) -> TurnResult:
         """
         Build a TurnResult for input or output that triggered escalation.
@@ -798,6 +920,10 @@ class AgentCore(AgentCoreBase):
             trust_result: The escalating TrustCheckResult.
             start:        Turn start timestamp.
             trust_input:  Input trust result (kept for API symmetry).
+            turn_id:      Unique identifier for this turn.
+            intent:       NLU intent (or "unknown" for early-exit paths).
+            user_id:      User identifier for audit recording.
+            user_message: Original user message for audit recording.
 
         Returns:
             TurnResult with the configured escalation message.
@@ -815,12 +941,43 @@ class AgentCore(AgentCoreBase):
             "escalation_message",
             "I'm connecting you to a human agent who can better assist you.",
         )
+        latency_ms = int((time.time() - start) * 1000)
+
+        # Assemble TurnEvent for audit (Step 11b / async logging)
+        turn_event = TurnEvent(
+            session_id=session_id,
+            turn_id=turn_id,
+            response_text=escalation_text,
+            tool_calls=[],
+            trust_input_result=trust_input,
+            trust_output_result=TrustCheckResult(passed=True, action="allow"),
+            model_used="",
+            intent=intent,
+            input_tokens=0,
+            output_tokens=0,
+            latency_ms=latency_ms,
+            timestamp_ms=int(time.time() * 1000),
+        )
+
+        # NOTE: daemon thread means audit write may be lost on abrupt process exit.
+        # Escalated turns are compliance-critical; this is a known data-loss window.
+        thread = threading.Thread(
+            target=self._post_turn,
+            args=(
+                session_id, user_id, turn_id, escalation_text,
+                user_message, turn_event, False, "",
+            ),
+            daemon=True,
+        )
+        thread.start()
+
         return TurnResult(
             session_id=session_id,
+            turn_id=turn_id,
             response_text=escalation_text,
             was_escalated=True,
             model_used="",
-            latency_ms=int((time.time() - start) * 1000),
+            latency_ms=latency_ms,
         )
 
 
@@ -895,6 +1052,8 @@ class AgentCore(AgentCoreBase):
         model_used: str,
         latency_ms: int,
         turn_input: TurnInput,
+        turn_id: str,
+        intent: str,
         tool_calls: list[ToolCall],
         trust_input: TrustCheckResult,
         trust_output: TrustCheckResult,
@@ -929,6 +1088,7 @@ class AgentCore(AgentCoreBase):
         """
         result = TurnResult(
             session_id=session_id,
+            turn_id=turn_id,
             response_text=response_text,
             was_escalated=was_escalated,
             was_tool_used=was_tool_used,
@@ -938,11 +1098,13 @@ class AgentCore(AgentCoreBase):
 
         turn_event = TurnEvent(
             session_id=session_id,
+            turn_id=turn_id,
             response_text=response_text,
             tool_calls=tool_calls,
             trust_input_result=trust_input,
             trust_output_result=trust_output,
             model_used=model_used,
+            intent=intent,
             input_tokens=0,
             output_tokens=0,
             latency_ms=latency_ms,
@@ -952,8 +1114,8 @@ class AgentCore(AgentCoreBase):
         thread = threading.Thread(
             target=self._post_turn,
             args=(
-                session_id, user_id, response_text,
-                turn_event, do_flush, flush_reason,
+                session_id, user_id, turn_id, response_text,
+                turn_input.user_message, turn_event, do_flush, flush_reason,
             ),
             daemon=True,
         )
@@ -965,7 +1127,9 @@ class AgentCore(AgentCoreBase):
         self,
         session_id: str,
         user_id: str,
+        turn_id: str,
         response_text: str,
+        user_message: str,
         turn_event: TurnEvent,
         do_flush: bool,
         flush_reason: str,
@@ -996,6 +1160,37 @@ class AgentCore(AgentCoreBase):
         learning_endpoint = (
             self._config.get("learning_client", {}).get("endpoint", "http://learning_layer:8004")
         )
+
+        # ── Step 11b: Record Audit Turn ─────────────────────────────
+        logger.info(
+            "  [STEP 11b] [async] Audit Record  →  POST %s/audit/turn  (session=%s)",
+            memory_endpoint, session_id,
+        )
+        try:
+            self._memory.record_audit_turn(
+                session_id=session_id,
+                user_id=user_id,
+                turn_id=turn_id,
+                user_message=user_message,
+                system_message=response_text,
+                metadata={
+                    "subagent_id": turn_event.model_used,
+                    "model": turn_event.model_used,
+                    "latency_ms": turn_event.latency_ms,
+                    "intent": turn_event.intent,
+                }
+            )
+        except Exception as e:
+            logger.error(
+                "orchestrator.audit_record_failed",
+                extra={
+                    "operation": "orchestrator._post_turn",
+                    "status": "failure",
+                    "session_id": session_id,
+                    "turn_id": turn_id,
+                    "error": f"{type(e).__name__}: {e}",
+                },
+            )
 
         # ── Step 12: Write last_response ─────────────────────────────
         # Entities, current_subagent_id, and subagent_entry_count are already
