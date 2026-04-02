@@ -23,6 +23,7 @@ Run standalone:
 
 from __future__ import annotations
 
+import json
 import logging
 import random
 import string
@@ -61,6 +62,13 @@ _FIXTURES: dict[str, dict] = {
     },
     "plumber": {
         "trade": "plumber",
+        "salary_range": "₹12k–₹22k",
+        "market_signal": "growing 9% QoQ",
+        "top_employers": ["Hubli Municipal Corp", "KA Infrastructure Projects"],
+        "source": "ONEST",
+    },
+    "plumbing": {
+        "trade": "plumbing",
         "salary_range": "₹12k–₹22k",
         "market_signal": "growing 9% QoQ",
         "top_employers": ["Hubli Municipal Corp", "KA Infrastructure Projects"],
@@ -143,6 +151,21 @@ class HealthResponse(BaseModel):
     status: str
 
 
+class ExecuteRequest(BaseModel):
+    tool_name: str
+    tool_use_id: str
+    input_params: dict
+    session_id: Optional[str] = None
+
+
+class ExecuteResponse(BaseModel):
+    tool_use_id: str
+    success: bool
+    result: dict = {}
+    result_text: str = ""
+    error: Optional[str] = None
+
+
 # ---------------------------------------------------------------------------
 # App factory
 # ---------------------------------------------------------------------------
@@ -221,6 +244,71 @@ def create_mock_server() -> FastAPI:
             employer=request.employer,
             trade=request.trade,
         )
+
+    @app.post("/execute", response_model=ExecuteResponse)
+    def execute(request: ExecuteRequest) -> ExecuteResponse:
+        """
+        Generic tool execution router.
+        Bridges the generic Agent Core call to specific domain connectors.
+        """
+        logger.info(
+            "mock_server.execute",
+            extra={
+                "operation": "mock_server.execute",
+                "tool_name": request.tool_name,
+                "session_id": request.session_id,
+            },
+        )
+
+        try:
+            if request.tool_name == "onest_market_lookup":
+                # Convert generic dict to specific Pydantic model
+                lookup_req = MarketLookupRequest(**request.input_params)
+                res = market_lookup(lookup_req)
+                
+                logger.info(
+                    "mock_server.tool_result",
+                    extra={
+                        "tool": "onest_market_lookup",
+                        "trade_requested": lookup_req.trade,
+                        "match_found": lookup_req.trade.lower() in _FIXTURES
+                    }
+                )
+                
+                return ExecuteResponse(
+                    tool_use_id=request.tool_use_id,
+                    success=True,
+                    result=res.dict(),
+                    result_text=json.dumps(res.dict()),
+                )
+
+            if request.tool_name == "onest_apply":
+                # Convert generic dict to specific Pydantic model
+                apply_req = ApplyRequest(**request.input_params)
+                res = apply(apply_req)
+                return ExecuteResponse(
+                    tool_use_id=request.tool_use_id,
+                    success=True,
+                    result=res.dict(),
+                    result_text=json.dumps(res.dict()),
+                )
+
+            # Fallback for unknown tools
+            return ExecuteResponse(
+                tool_use_id=request.tool_use_id,
+                success=False,
+                result_text="",
+                error=f"Unknown tool: {request.tool_name}",
+            )
+
+        except Exception as e:
+            logger.error("mock_server.execute_error", extra={"error": str(e)})
+            return ExecuteResponse(
+                tool_use_id=request.tool_use_id,
+                success=False,
+                result_text="",
+                error=f"Execution failed: {str(e)}",
+            )
 
     @app.get("/health", response_model=HealthResponse)
     def health() -> HealthResponse:

@@ -14,7 +14,6 @@ state:
       #
       # Declare all domain-specific session fields below.
       # These are initialised with their defaults when a new session starts.
-      current_node:      { type: string,  default: "awaiting_consent" }
       mental_state:      { type: enum,    values: [fog, orientation, evaluation, commitment, follow_through],  default: "fog" }
       market_signal:     { type: enum,    values: [strong, weak, absent],                                      default: "absent" }
       skill_match:       { type: enum,    values: [direct, partial, gap],                                      default: "gap" }
@@ -23,7 +22,10 @@ state:
       current_question:  { type: string,  default: "" }
       options_presented: { type: list,    default: [] }
       loop_count:        { type: int,     default: 0 }
-      consent:           { type: bool,    default: false }
+      # user_storage_mode is written by the agent_core routing rule session_writes
+      # when the user expresses a preference. Values: "saved" or "anonymous".
+      # If absent, Memory Layer falls back to user_data_persistence.default_mode.
+      user_storage_mode: { type: string,  default: "" }
 
   persistent:
     backend: neo4j
@@ -36,9 +38,6 @@ state:
         UserProfile:
           rel: HAS_PROFILE
           declared_fields:
-            - language
-            - consent_flag
-            - anonymous_flag
             # Identity layer
             - name
             - age_bracket
@@ -108,7 +107,13 @@ state:
       - session_field: options_presented
         target: Role    # creates OFFERED edges for each role_id in the list
 
-  reengagement:
+user_data_persistence:
+  # Default storage mode when user_storage_mode is absent from session.
+  # "saved"     — profile is retained in Neo4j across sessions.
+  # "anonymous" — Neo4j data is deleted at session end (DPDP-compliant).
+  default_mode: saved
+
+reengagement:
     triggers:
       - event: DOP_MT              # drop-off after market truth
         delay_hours: 72
