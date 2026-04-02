@@ -3,22 +3,34 @@ trust_layer/main.py
 
 Entry point for the Trust Layer FastAPI service.
 
-Loads config from config/config.yaml, instantiates BasicTrustLayer,
-creates the FastAPI app, and starts uvicorn on the configured port (default 8003).
+Loads config from config/config.yaml (or CONFIG_FOLDER/trust_layer.yaml if set),
+instantiates BasicTrustLayer, creates the FastAPI app, and starts uvicorn on the
+configured port (default 8003).
 
 Run:
     python -m main                   (from trust_layer/ directory)
     uvicorn main:app --reload        (dev hot-reload)
+
+Environment:
+    CONFIG_FOLDER — optional path to a folder containing trust_layer.yaml.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from pathlib import Path
 
 import uvicorn
 import yaml
+from dotenv import load_dotenv
+
+# Load .env.local first (developer overrides), then .env (shared defaults).
+# Neither file is required; missing files are silently ignored.
+_env_local = Path(__file__).parent.parent / ".env.local"
+_env_local_warn = _env_local.exists() and not load_dotenv(_env_local)
+load_dotenv()
 
 # Add src/ to path so imports within the package work cleanly.
 _SRC = str(Path(__file__).parent / "src")
@@ -38,6 +50,16 @@ logging.basicConfig(
     stream=sys.stdout,
 )
 logger = logging.getLogger(__name__)
+
+if _env_local_warn:
+    logger.warning(
+        "config.env_local_not_loaded",
+        extra={
+            "operation": "load_dotenv",
+            "status": "skipped",
+            "error": f"{_env_local} exists but no variables were loaded — check for syntax errors.",
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -64,6 +86,44 @@ def _deep_merge(base: dict, override: dict) -> dict:
     return result
 
 
+def _domain_config_path(service: str) -> Path:
+    """Resolve the domain config path.
+
+    Returns the path from CONFIG_FOLDER env var if set, otherwise the
+    block-local config/domain.yaml fallback. An empty string CONFIG_FOLDER
+    is treated the same as unset.
+
+    Args:
+        service: Service name matching the filename in the configs folder.
+
+    Returns:
+        Absolute or relative Path to the domain config YAML file.
+
+    Raises:
+        ValueError: If CONFIG_FOLDER is set to a path that is not a directory.
+        FileNotFoundError: If CONFIG_FOLDER is set but the resolved service
+            YAML does not exist.
+    """
+    config_folder = os.getenv("CONFIG_FOLDER")
+    if config_folder:
+        config_dir = Path(config_folder)
+        if not config_dir.is_dir():
+            raise ValueError(
+                f"CONFIG_FOLDER='{config_folder}' is not a directory. "
+                f"Set CONFIG_FOLDER to the folder containing service YAML files, "
+                f"not a file path. Check .env.local."
+            )
+        resolved = config_dir / f"{service}.yaml"
+        if not resolved.exists():
+            raise FileNotFoundError(
+                f"CONFIG_FOLDER='{config_folder}' is set but "
+                f"'{resolved}' does not exist. "
+                f"Check CONFIG_FOLDER in .env.local."
+            )
+        return resolved
+    return Path("config/domain.yaml")  # relative to cwd, consistent with config/dpg.yaml loading
+
+
 # ---------------------------------------------------------------------------
 # App construction — exposed at module level for uvicorn --reload
 # ---------------------------------------------------------------------------
@@ -71,7 +131,7 @@ def _deep_merge(base: dict, override: dict) -> dict:
 
 def _build_app():
     dpg_config = _load_config("config/dpg.yaml")
-    domain_config = _load_config("config/domain.yaml")
+    domain_config = _load_config(str(_domain_config_path("trust_layer")))
     config = _deep_merge(dpg_config, domain_config)
 
     trust = BasicTrustLayer(config)
