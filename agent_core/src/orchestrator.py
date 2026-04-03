@@ -31,6 +31,7 @@ from src.interfaces.learning_layer import LearningLayerBase
 from src.interfaces.memory_layer import MemoryLayerBase
 from src.interfaces.reach_layer import ReachLayerBase
 from src.interfaces.trust_layer import TrustLayerBase
+from src.http_clients.trust_layer import TrustLayerConstraintError
 from src.preprocessing.language_normalisation import LanguageNormaliser
 from src.llm_wrapper.base import LLMWrapperBase
 from src.manager_agent import ManagerAgent
@@ -175,6 +176,48 @@ class AgentCore(AgentCoreBase):
             bundle.session.get("is_returning", False),
             int((time.time() - t1) * 1000),
         )
+
+        # ── Consent gate (Step 1b) ────────────────────────────────────
+        ask_for_consent: bool = self._config.get("agent", {}).get("ask_for_consent", False)
+        if ask_for_consent:
+            user_storage_mode: str | None = bundle.session.get("user_storage_mode")
+            turn_count: int = bundle.session.get("turn_count", 0)
+
+            if user_storage_mode is None and turn_count == 0:
+                # Turn 1: deliver consent prompt, no LLM call, no Trust Layer call
+                consent_prompt_text: str = self._config.get("agent", {}).get("consent_prompt", "")
+                logger.info(
+                    "orchestrator.consent_gate",
+                    extra={
+                        "operation": "orchestrator.consent_gate",
+                        "status": "prompt_delivered",
+                        "session_id": session_id,
+                    },
+                )
+                return TurnResult(
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    response_text=consent_prompt_text,
+                    latency_ms=int((time.time() - start) * 1000),
+                )
+
+            if user_storage_mode is None and turn_count > 0:
+                # Turn 2: evaluate response, write storage mode, continue to workflow
+                granted: bool = self._trust.verify_consent(session_id, turn_input.user_message)
+                new_storage_mode = "saved" if granted else "anonymous"
+                logger.info(
+                    "orchestrator.consent_gate",
+                    extra={
+                        "operation": "orchestrator.consent_gate",
+                        "status": "consent_evaluated",
+                        "session_id": session_id,
+                        "granted": granted,
+                        "user_storage_mode": new_storage_mode,
+                    },
+                )
+                self._write_memory_sync(session_id, user_id, "session", "user_storage_mode", new_storage_mode)
+                bundle.session["user_storage_mode"] = new_storage_mode
+            # if user_storage_mode is set → fall through, skip consent gate entirely
 
         # ── Step 2: Resolve current subagent + special handler ────────
         current_subagent: SubAgent = self._workflow.subagents[current_subagent_id]
@@ -393,7 +436,45 @@ class AgentCore(AgentCoreBase):
 
         # Check for resumption signal from Memory Layer
         is_resumption = bundle.session.get("was_adopted", False)
-        
+
+        # ── Step 6b: Assemble guardrail constraints (pre-LLM) ─────────
+        guardrail_constraints: dict | None = None
+        if nlu_result.active_risks:
+            try:
+                guardrail_constraints = self._trust.assemble_constraints(
+                    session_id=session_id,
+                    workflow_step=next_subagent_id,
+                    active_risks=nlu_result.active_risks,
+                    user_segment=bundle.profile.get("user_segment"),
+                )
+                logger.info(
+                    "orchestrator.guardrails_assembled",
+                    extra={
+                        "operation": "orchestrator.assemble_constraints",
+                        "status": "success",
+                        "session_id": session_id,
+                        "active_risks": nlu_result.active_risks,
+                        "constraints_count": len(guardrail_constraints.get("prompt_constraints", [])),
+                        "latency_ms": 0,
+                    },
+                )
+            except Exception as e:
+                logger.error(
+                    "orchestrator.assemble_constraints_failed",
+                    extra={
+                        "operation": "orchestrator.assemble_constraints",
+                        "status": "failure",
+                        "session_id": session_id,
+                        "error": f"{type(e).__name__}: {e}",
+                    },
+                )
+                return self._blocked_response(
+                    session_id, None, start, None, turn_id,
+                    intent="guardrail_unavailable",
+                    user_id=user_id,
+                    user_message=turn_input.user_message,
+                )
+
         system = self._manager_agent.build_system_prompt(
             agent_system_prompt=self._workflow.agent_system_prompt,
             subagent_system_prompt=next_subagent.system_prompt,
@@ -401,6 +482,7 @@ class AgentCore(AgentCoreBase):
             channel=turn_input.channel,
             profile=profile_context,
             is_resumption=is_resumption,
+            guardrail_constraints=guardrail_constraints,
         )
 
         # Clear resumption flag in session so it only affects the first turn
@@ -514,6 +596,8 @@ class AgentCore(AgentCoreBase):
         )
 
         if trust_output.action in ("block", "escalate"):
+            # TODO(GH-hitl): When action=="escalate", call self._trust.escalate(...) to
+            # queue a HiTL ticket. Currently deferred — tracked in the HiTL queue issue.
             logger.info(
                 "  [STEP 10] OUTPUT %s — replacing with safe fallback",
                 trust_output.action.upper(),
