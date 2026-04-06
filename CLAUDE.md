@@ -21,15 +21,14 @@ Ports: Agent Core `:8000`, Knowledge Engine `:8001`, Memory Layer `:8002`, Trust
 **Run tests (per module):**
 ```bash
 cd agent_core          # or knowledge_engine/, memory_layer/, etc.
-pip install -e ".[dev]"
-pytest                                          # all tests
-pytest tests/test_orchestrator.py              # single file
-pytest --cov=src --cov-report=term-missing     # with coverage
+uv run pytest                                          # all tests
+uv run pytest tests/test_orchestrator.py              # single file
+uv run pytest --cov=src --cov-report=term-missing     # with coverage
 ```
 
 **KE document ingestion:**
 ```bash
-cd knowledge_engine && python -m scripts.ingest --config config/domain.yaml
+cd knowledge_engine && uv run python scripts/ingest.py --config config/domain.yaml
 ```
 
 **Config loading:** Each module deep-merges two YAML files at startup — `dev-kit/dpg/<module>.yaml` (framework defaults) overridden by `dev-kit/configs/<domain>/<module>.yaml` (domain values). Reference domain: `dev-kit/configs/kkb/`.
@@ -50,17 +49,17 @@ The framework assembles AI-powered voice/chat systems from **7 standardised DPG 
 
 ### Block responsibilities
 
-**Agent Core** — sole orchestrator and sole LLM caller. Runs Language Normalisation and NLU internally, then calls Knowledge Engine to assemble the prompt. Owns the tool execution loop (LLM → tool → LLM), retry, and fallback model switching. Stateless between turns — any instance can handle any session. All Anthropic API calls go through `agent_core/src/llm_wrapper/claude_wrapper.py`. Also exposes `POST /internal/llm/call` as a future LLM proxy (implemented, not yet wired).
+**Agent Core** — sole orchestrator and sole LLM caller. Runs Language Normalisation and NLU internally, then builds the system prompt. Owns the tool execution loop (LLM → tool → LLM), retry, and fallback model switching. Knowledge Engine is called only when the LLM invokes the `knowledge_retrieval` internal tool (subagents that do not include `knowledge_retrieval` in their tool list never trigger a KE call). Stateless between turns — any instance can handle any session. All Anthropic API calls go through `agent_core/src/llm_wrapper/claude_wrapper.py`. Also exposes `POST /internal/llm/call` as a future LLM proxy (implemented, not yet wired).
 
 **Knowledge Engine** — assembles the full LLM prompt. Receives NLU results and session state from Agent Core in the request body; does **not** call Memory Layer directly. Stateless. Internal components: Glossary & Domain Vocabulary, Static Knowledge Base (semantic RAG), Multimodal Input Handler.
 
-**Memory Layer** — manages state at three scopes: Turn (current cycle), Session (conversation), Persistent (cross-session user profile). Agent Core reads at turn start and writes asynchronously after response delivery.
+**Memory Layer** — manages state at three scopes: Turn/Session (Redis with RedisJSON, TTL), Context Graph (Memgraph — typed attribute nodes per session), and Persistent cross-session profile. Agent Core reads at turn start and writes asynchronously after response delivery.
 
-**Trust Layer** — mandatory safety gate. Runs **twice per turn**: once on input before the LLM, once on output before delivery. Never skipped. Enforces content rules, output rules, consent rules (DPDP Act), escalation rules, and topic firewall.
+**Trust Layer** — mandatory safety gate. Runs **twice per turn**: once on input before the LLM, once on output before delivery. Never skipped. Four sub-blocks: ContentBlock, GuardrailsBlock, ConsentBlock, HiTLBlock. Exposes endpoints: `/check/input`, `/assemble_constraints`, `/check/output`, `/consent/verify`, `/check/consent`, `/escalate`. Enforces content rules, output rules, consent rules (DPDP Act), escalation rules, and topic firewall.
 
 **Action Gateway** — sole interface with external systems. Executes tool calls expressed by the LLM; the LLM never calls APIs directly. Returns normalised results to Agent Core. Write/identity connectors require Trust Layer consent before execution.
 
-**Reach Layer** — normalises inbound channels (VOIP, WhatsApp, Web, Mobile SDK) and delivers responses. Manages outbound campaigns and cross-channel handoffs.
+**Reach Layer** — normalises inbound channels (VOIP, WhatsApp, Web, Mobile SDK) and delivers responses. Manages outbound campaigns and cross-channel handoffs. Also includes a web channel adapter; see approved exception below regarding `GET /user-history` calling Memory Layer directly.
 
 **Observability Layer** — async-only observability. Emits turn events after response delivery; never in the response path. Produces audit log, quality scores, feedback signals, and outcome tracking.
 
@@ -69,13 +68,15 @@ The framework assembles AI-powered voice/chat systems from **7 standardised DPG 
 ```
 Reach Layer (input)
   → Agent Core: read state ← Memory Layer
-  → Agent Core: input safety check → Trust Layer
+  → Agent Core: consent gate (if ask_for_consent: true in config)
+  → Agent Core: NLU (internal) → early exit if low-confidence
+  → Agent Core: input safety check → Trust Layer /check/input
   → Agent Core: Language Normalisation (internal)
-  → Agent Core: NLU (internal) → early exit if unknown/low-confidence
-  → Agent Core: assemble prompt → Knowledge Engine
+  → Agent Core: POST /assemble_constraints → Trust Layer (if active_risks present)
+  → Agent Core: Manager Agent selects subagent + tools
   → Agent Core: LLM call #1
   → [tool_use] Agent Core: execute tool → Action Gateway → LLM call #2
-  → Agent Core: output safety check → Trust Layer
+  → Agent Core: output safety check → Trust Layer /check/output
   → Agent Core: deliver response → Reach Layer
   → [async] write state → Memory Layer
   → [async] emit events → Observability Layer
@@ -102,12 +103,13 @@ Only Agent Core initiates calls to other blocks. No other cross-module calls exi
 - **Tool execution pattern:** LLM returns a `tool_use` block → Agent Core routes to Tool Registry → calls Action Gateway → appends `tool_result` → second LLM call. LLM sees only normalised results, never raw API responses.
 - **Latency target:** 800–1200ms per turn (voice-first). One LLM call for most turns, two for tool turns.
 - **Hard routing:** Escalation topics are enforced by Trust Layer before the LLM is called. LLM-driven routing handles everything else via tool selection.
+- **Three-Tier config model:** Tier 1 (Configuration Agent) is implemented as a FastAPI + React app in `dev-kit/dev_kit/agent/`. Tier 2 (YAML) is the runtime source of truth. Tier 3 (Live Tuning Dashboard) is not yet built.
 
 ### PoC scope
 
-Full implementations: **Agent Core**, **Knowledge Engine**, **Domain Configuration Kit**.
+Full implementations: **Agent Core** (414 tests), **Knowledge Engine** (117 tests), **Memory Layer** (200 tests, Redis + Memgraph + SQLite), **Domain Configuration Kit**.
 
-Stubs (same interfaces, lightweight behaviour): Memory Layer (in-process store), Trust Layer (blocked-phrase checks), Action Gateway (mock JSON responses), Reach Layer (CLI stdin/stdout), Observability Layer (OTel instrumentation).
+Stubs (same interfaces, lightweight behaviour): Trust Layer (39 tests — ContentBlock, GuardrailsBlock, ConsentBlock, HiTLBlock; sub-block test suites pending), Action Gateway (mock JSON responses), Reach Layer (CLI stdin/stdout + web adapter), Observability Layer (OTel instrumentation; audit trail via Loki + Jaeger through OTel Collector; Grafana dashboards pending).
 
 **Stub interfaces must exactly match the real interface** — they must be replaceable without changing Agent Core or other modules.
 
