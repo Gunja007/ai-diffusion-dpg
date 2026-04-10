@@ -43,3 +43,5 @@ action_gateway_client:
 observability:
   otel:
     collector_endpoint: "http://otelcol:4317"
+    sample_rate: 1.0
+    export_interval_ms: 5000

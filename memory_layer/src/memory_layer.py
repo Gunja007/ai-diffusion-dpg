@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from typing import Any
 
@@ -102,9 +103,9 @@ class MemoryLayer:
 
         # Initialise Memgraph driver + stores (neo4j driver connects via Bolt — Apache 2.0)
         memgraph_cfg = config.get("memgraph", {})
-        memgraph_uri = memgraph_cfg.get("uri", "bolt://localhost:7687")
-        memgraph_user = memgraph_cfg.get("user", "memgraph")
-        memgraph_password = memgraph_cfg.get("password", "")
+        memgraph_uri = os.environ.get("MEMGRAPH_URI") or memgraph_cfg.get("uri", "bolt://localhost:7687")
+        memgraph_user = os.environ.get("MEMGRAPH_USER") or memgraph_cfg.get("user", "memgraph")
+        memgraph_password = os.environ.get("MEMGRAPH_PASSWORD") or memgraph_cfg.get("password", "")
         memgraph_timeout = memgraph_cfg.get("connection_timeout_s", 5)
 
         self._graph_driver = GraphDatabase.driver(
@@ -479,8 +480,9 @@ class MemoryLayer:
                         "last_accessed": last_accessed,
                     })
                 else:
-                    # Lazy cleanup: session expired, remove stale field
+                    # Lazy cleanup: session expired, remove stale Redis + SQLite audit
                     self._redis.remove_stale_session_field(user_id, session_id)
+                    self._audit.delete_session_audit(session_id)
 
             # Sort by last_accessed descending (most recent first)
             alive.sort(key=lambda s: s["last_accessed"], reverse=True)
