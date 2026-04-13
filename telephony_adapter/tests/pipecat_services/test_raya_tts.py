@@ -130,16 +130,17 @@ async def test_run_tts_sends_correct_payload(config):
 
 
 @pytest.mark.asyncio
-async def test_run_tts_http_error_yields_error_frame(config):
+@respx.mock
+async def test_run_tts_yields_error_frame_on_http_error(config):
     from src.pipecat_services.raya_tts import RayaTTSService
 
-    with respx.mock:
-        respx.post("https://hub.getraya.app/v1/text-to-speech/stream").mock(
-            return_value=httpx.Response(500, json={"error": "server error"})
-        )
-        svc = RayaTTSService(config)
-        frames = [f async for f in svc.run_tts("hello", context_id="ctx1")]
-
+    respx.post("https://hub.getraya.app/v1/text-to-speech/stream").mock(
+        return_value=httpx.Response(500, text="error")
+    )
+    tts = RayaTTSService(config)
+    frames = []
+    async for frame in tts.run_tts("hello", "ctx-1"):
+        frames.append(frame)
     assert len(frames) == 1
     assert isinstance(frames[0], ErrorFrame)
 
@@ -148,3 +149,96 @@ def test_missing_api_key_raises():
     from src.pipecat_services.raya_tts import RayaTTSService
     with pytest.raises(ValueError, match="api_key"):
         RayaTTSService({})
+
+
+# ---------------------------------------------------------------------------
+# Task 4: TTSServiceBase inheritance + synthesize() tests
+# ---------------------------------------------------------------------------
+from src.pipecat_services.tts_base import TTSServiceBase
+
+
+def _make_f32le_chunk(n_samples: int = 160) -> bytes:
+    samples = np.zeros(n_samples, dtype=np.float32)
+    return samples.tobytes()
+
+
+def _sse_line(chunk_b64: str, done: bool = False) -> str:
+    if done:
+        return 'data: {"done": true}\n\n'
+    payload = json.dumps({"type": "chunk", "status_code": 206, "done": False, "data": chunk_b64})
+    return f"data: {payload}\n\n"
+
+
+def test_raya_tts_is_tts_service_base(config):
+    from src.pipecat_services.raya_tts import RayaTTSService
+    tts = RayaTTSService(config)
+    assert isinstance(tts, TTSServiceBase)
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_synthesize_yields_pcm16_chunks(config):
+    from src.pipecat_services.raya_tts import RayaTTSService
+    chunk = _make_f32le_chunk(160)
+    chunk_b64 = base64.b64encode(chunk).decode()
+    sse_body = _sse_line(chunk_b64) + _sse_line("", done=True)
+    respx.post("https://hub.getraya.app/v1/text-to-speech/stream").mock(
+        return_value=httpx.Response(200, text=sse_body)
+    )
+    tts = RayaTTSService(config)
+    chunks = [c async for c in tts.synthesize("नमस्ते")]
+    assert len(chunks) == 1
+    assert len(chunks[0]) == 160 * 2  # float32 → int16: same sample count, half bytes
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_synthesize_yields_nothing_on_http_error(config):
+    from src.pipecat_services.raya_tts import RayaTTSService
+    respx.post("https://hub.getraya.app/v1/text-to-speech/stream").mock(
+        return_value=httpx.Response(500, text="error")
+    )
+    tts = RayaTTSService(config)
+    chunks = [c async for c in tts.synthesize("hi")]
+    assert chunks == []
+
+
+@pytest.mark.asyncio
+async def test_synthesize_retries_once_on_connect_error(config):
+    """TTS must retry once on connection error before giving up."""
+    from src.pipecat_services.raya_tts import RayaTTSService
+    from unittest.mock import patch, AsyncMock
+
+    f32_chunk = _make_f32le_chunk(160)
+    chunk_b64 = base64.b64encode(f32_chunk).decode()
+    sse_body = _sse_line(chunk_b64) + _sse_line("", done=True)
+
+    with patch("src.pipecat_services.raya_tts.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+        with respx.mock:
+            route = respx.post("https://hub.getraya.app/v1/text-to-speech/stream").mock(
+                side_effect=[
+                    httpx.ConnectError("refused"),
+                    httpx.Response(200, text=sse_body),
+                ]
+            )
+            tts = RayaTTSService(config)
+            chunks = [c async for c in tts.synthesize("hello")]
+
+    assert len(route.calls) == 2
+    mock_sleep.assert_called_once()
+    assert len(chunks) == 1
+
+
+@pytest.mark.asyncio
+async def test_synthesize_yields_nothing_on_connection_error(config):
+    from src.pipecat_services.raya_tts import RayaTTSService
+    from unittest.mock import patch, AsyncMock, MagicMock
+
+    mock_cm = MagicMock()
+    mock_cm.__aenter__ = AsyncMock(side_effect=httpx.ConnectError("refused"))
+    mock_cm.__aexit__ = AsyncMock(return_value=False)
+
+    with patch("httpx.AsyncClient.stream", return_value=mock_cm):
+        tts = RayaTTSService(config)
+        chunks = [c async for c in tts.synthesize("hi")]
+    assert chunks == []

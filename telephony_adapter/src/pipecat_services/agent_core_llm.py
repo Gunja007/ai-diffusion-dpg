@@ -30,14 +30,16 @@ class AgentCoreLLMProcessor(FrameProcessor):
 
     Args:
         config: Full merged config dict. Reads telephony_adapter.agent_core section.
-        call_sid: Opaque Vobiz call identifier, used as user_id in Agent Core requests.
+        call_sid: Opaque Vobiz call identifier.
         session_id: Stable session UUID for this call's lifetime.
+        user_id: Caller E.164 phone number — stable cross-call identifier passed to
+            Agent Core so the Memory Layer can recognise returning callers.
 
     Raises:
         ValueError: If agent_core.base_url is missing or empty.
     """
 
-    def __init__(self, config: dict, *, call_sid: str, session_id: str) -> None:
+    def __init__(self, config: dict, *, call_sid: str, session_id: str, user_id: str = "") -> None:
         super().__init__()
         if config is None:
             raise ValueError("config must not be None")
@@ -56,6 +58,7 @@ class AgentCoreLLMProcessor(FrameProcessor):
         )
         self._call_sid = call_sid
         self._session_id = session_id
+        self._user_id = user_id
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         """Route TranscriptionFrames to Agent Core; pass all other frames through.
@@ -83,7 +86,7 @@ class AgentCoreLLMProcessor(FrameProcessor):
             "session_id": self._session_id,
             "user_message": frame.text,
             "channel": "telephony",
-            "user_id": self._call_sid,
+            "user_id": self._user_id,
             "timestamp_ms": int(start * 1000),
         }
 
@@ -107,19 +110,31 @@ class AgentCoreLLMProcessor(FrameProcessor):
                     },
                 )
             else:
-                data = response.json()
-                response_text = data.get("response_text", self._fallback_phrase)
-                was_escalated = data.get("was_escalated", False)
-                logger.info(
-                    "agent_core_llm.process_turn",
-                    extra={
-                        "operation": "agent_core_llm.process_turn",
-                        "status": "success",
-                        "latency_ms": latency_ms,
-                        "was_escalated": was_escalated,
-                        "was_tool_used": data.get("was_tool_used", False),
-                    },
-                )
+                try:
+                    data = response.json()
+                    response_text = data.get("response_text", self._fallback_phrase)
+                    was_escalated = data.get("was_escalated", False)
+                    logger.info(
+                        "agent_core_llm.process_turn",
+                        extra={
+                            "operation": "agent_core_llm.process_turn",
+                            "status": "success",
+                            "latency_ms": latency_ms,
+                            "was_escalated": was_escalated,
+                            "was_tool_used": data.get("was_tool_used", False),
+                        },
+                    )
+                except (ValueError, KeyError) as exc:
+                    logger.error(
+                        "agent_core_llm.parse_error",
+                        extra={
+                            "operation": "agent_core_llm.process_turn",
+                            "status": "failure",
+                            "error": f"{type(exc).__name__}: {exc}",
+                            "latency_ms": latency_ms,
+                        },
+                    )
+                    # response_text stays as fallback_phrase
 
         except httpx.ConnectError as exc:
             latency_ms = int((time.time() - start) * 1000)

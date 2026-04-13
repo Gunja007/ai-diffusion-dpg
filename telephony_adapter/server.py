@@ -96,6 +96,29 @@ def create_app(config: dict | None = None) -> FastAPI:
         raise ValueError("telephony_adapter.public_url is required in config")
     ws_url = public_url.replace("https://", "wss://").replace("http://", "ws://")
 
+    # Maps call_sid → caller_id (E.164) so the WebSocket endpoint can retrieve it.
+    # Populated by /answer; consumed and cleared by /ws/{call_sid}.
+    # Capped at 1000 entries to prevent unbounded growth from orphaned calls
+    # (Vobiz called /answer but WebSocket never connected).
+    from collections import OrderedDict
+    _caller_id_map: OrderedDict[str, str] = OrderedDict()
+    _CALLER_ID_MAP_MAX = 1000
+
+    # Operator singleton for XML generation — created once, stateless.
+    from src.operators.vobiz_operator import VobizOperator as _VobizOperator
+    try:
+        _operator = _VobizOperator(config)
+    except ValueError as exc:
+        logger.warning(
+            "server.operator_init_failed",
+            extra={
+                "operation": "server.create_operator",
+                "status": "failure",
+                "error": str(exc),
+            },
+        )
+        _operator = None
+
     app = FastAPI(
         title="Telephony Adapter",
         description="DPG Reach Layer telephony channel adapter — Vobiz + Raya + Agent Core.",
@@ -123,16 +146,24 @@ def create_app(config: dict | None = None) -> FastAPI:
         /ws/{call_sid}.
         """
         form = await request.form()
-        call_sid = form.get("CallUUID") or form.get("CallSid") or "unknown"
+        call_sid = str(form.get("CallUUID") or form.get("CallSid") or "unknown")
+        caller_id = str(form.get("From") or "")
+        _caller_id_map[call_sid] = caller_id
+        # Evict oldest entries when the map exceeds its cap (orphaned calls)
+        while len(_caller_id_map) > _CALLER_ID_MAP_MAX:
+            _caller_id_map.popitem(last=False)
         stream_url = f"{ws_url}/ws/{call_sid}"
-        xml = (
-            '<?xml version="1.0" encoding="UTF-8"?>\n'
-            "<Response>\n"
-            f'  <Stream bidirectional="true" keepCallAlive="true"'
-            f' contentType="audio/x-mulaw;rate=8000">'
-            f"{stream_url}</Stream>\n"
-            "</Response>"
-        )
+        if _operator is not None:
+            xml = _operator.webhook_response_xml(stream_url)
+        else:
+            xml = (
+                '<?xml version="1.0" encoding="UTF-8"?>\n'
+                "<Response>\n"
+                f'  <Stream bidirectional="true" keepCallAlive="true"'
+                f' contentType="audio/x-mulaw;rate=8000">'
+                f"{stream_url}</Stream>\n"
+                "</Response>"
+            )
         return Response(content=xml, media_type="application/xml")
 
     @app.websocket("/ws/{call_sid}")
@@ -152,8 +183,9 @@ def create_app(config: dict | None = None) -> FastAPI:
             },
         )
         await websocket.accept()
+        caller_id = _caller_id_map.pop(call_sid, "")
         try:
-            await bot.run_bot(websocket, call_sid, _config)
+            await bot.run_bot(websocket, call_sid, caller_id, _config)
         except Exception as exc:
             logger.error(
                 "server.ws_error",
