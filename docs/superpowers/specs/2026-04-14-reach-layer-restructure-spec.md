@@ -73,20 +73,33 @@ reach_layer/
 
 ### ReachLayerBase (`reach_layer/base/reach_layer_base.py`)
 
+`assembly_mode` is read from domain YAML at startup (`reach_layer.channels.<name>.assembly_mode`). Valid values: `"session"` | `"direct"`.
+
+- **`session`** — channel delivers partial segments (VAD, streaming input). Each segment posted to TurnAssembler via `POST /sessions/{id}/input`. Events received via `GET /sessions/{id}/events` SSE.
+- **`direct`** — channel delivers complete assembled utterances. Each utterance posted directly to `POST /process_turn`. Synchronous JSON response, no SSE.
+
 ```python
 class ReachLayerBase(ABC):
 
     @abstractmethod
-    async def submit_segment(self, session_id: str, text: str, is_final: bool = False) -> None:
-        """Submit one text segment to Agent Core TurnAssembler (POST /sessions/{id}/input)."""
+    async def submit_input(self, session_id: str, text: str) -> None:
+        """Submit text to Agent Core. Routes to session or direct path based on assembly_mode.
+
+        session mode: POST /sessions/{id}/input  →  TurnAssembler  →  SSE events
+        direct mode:  POST /process_turn          →  sync TurnResult JSON
+        """
 
     @abstractmethod
     async def subscribe_events(self, session_id: str) -> AsyncGenerator[StreamEvent, None]:
-        """Open SSE subscription to Agent Core (GET /sessions/{id}/events)."""
+        """Open SSE subscription to Agent Core (GET /sessions/{id}/events).
+        Only called in assembly_mode: session. Not used in direct mode.
+        """
 
     @abstractmethod
     async def cancel_turn(self, session_id: str) -> None:
-        """Interrupt the active turn (DELETE /sessions/{id}/active_turn)."""
+        """Interrupt the active turn (DELETE /sessions/{id}/active_turn).
+        Only meaningful in assembly_mode: session.
+        """
 
     @abstractmethod
     async def on_session_start(self, session_id: str, user_id: str) -> None:
@@ -136,17 +149,15 @@ class VoiceChannelBase(ReachLayerBase, ABC):
 
 ### CLIReachLayer (TextChannelBase)
 
-`run_loop()`: reads from stdin line-by-line. Each line → `submit_segment()`. Subscribes to `subscribe_events()` and writes `SentenceEvent.text` to stdout as sentences arrive. Signal events optionally printed as status lines if `--verbose` flag set. On EOF → `on_session_end()`.
+`assembly_mode: session`. `run_loop()`: reads from stdin line-by-line. Each line → `submit_input()` (routes to `POST /sessions/{id}/input`). Subscribes to `subscribe_events()` and writes `SentenceEvent.text` to stdout as sentences arrive. Signal events optionally printed as status lines if `--verbose` flag set. On EOF → `on_session_end()`.
 
 Turn assembler config: `silence_ms: 200`, `max_wait_ms: 10000` (generous for interactive typing).
 
 ### WebReachLayer (TextChannelBase)
 
-Browser sends message via `POST /chat` → `server.py` calls `submit_segment()`. Browser opens `GET /chat/stream/{session_id}` → `server.py` calls `subscribe_events()`, forwards `StreamEvent`s as SSE to browser. `SentenceEvent`s produce typing-indicator effect; `SignalEvent`s can render "thinking…" states. Cancel from browser → `cancel_turn()`.
+`assembly_mode: direct`. Browser sends complete message via `POST /chat` → `server.py` calls `submit_input()` (routes to `POST /process_turn`). Receives synchronous `TurnResult` JSON, returns response to browser. No SSE subscription needed — `subscribe_events()` and `cancel_turn()` are not used in direct mode.
 
 **Preserved:** `GET /user-history/{user_id}` direct Memory Layer call (approved exception per CLAUDE.md). Google SSO (`auth.py`) migrated unchanged. All existing browser-facing routes preserved.
-
-Turn assembler config: `silence_ms: 1500`, `max_wait_ms: 15000`.
 
 ### TelephonyAdapterBase → VoiceChannelBase (voice/)
 
@@ -157,7 +168,7 @@ Turn assembler config: `silence_ms: 1500`, `max_wait_ms: 15000`.
 | Event | Action |
 |---|---|
 | Call start | `on_session_start(session_id, caller_id)` + open `subscribe_events()` subscription |
-| `TranscriptionFrame` from STT | `submit_segment(session_id, text)` |
+| `TranscriptionFrame` from STT | `submit_input(session_id, text)` (routes to `POST /sessions/{id}/input`) |
 | `SentenceEvent` received | Push `TTSSpeakFrame` downstream to RayaTTSService |
 | `SignalEvent(stage="tool_start")` | Optionally play hold music / filler phrase |
 | `DoneEvent(was_escalated=True)` | Push `EndFrame` to hang up |
@@ -177,12 +188,23 @@ Turn assembler config: `silence_ms: 400`, `max_wait_ms: 8000`.
 ```yaml
 reach_layer:
   channels:
-    - cli      # starts reach_layer_cli service
-    - web      # starts reach_layer_web service
-    - voice    # starts reach_layer_voice service
+    cli:
+      assembly_mode: session   # partial segments → TurnAssembler → SSE events
+      turn_assembler:
+        semantic_gate: {enabled: true, confidence_threshold: 0.75}
+        silence_trigger: {silence_ms: 200}
+        max_wait_ceiling: {max_wait_ms: 10000}
+    web:
+      assembly_mode: direct    # complete utterances → POST /process_turn → JSON
+    voice:
+      assembly_mode: session   # VAD segments → TurnAssembler → SSE events
+      turn_assembler:
+        semantic_gate: {enabled: true, confidence_threshold: 0.75}
+        silence_trigger: {silence_ms: 400}
+        max_wait_ceiling: {max_wait_ms: 8000}
 ```
 
-Framework default (`dev-kit/dpg/reach_layer.yaml`): `channels: []` — domain config must declare explicitly.
+`turn_assembler` config is only read when `assembly_mode: session`. Framework default (`dev-kit/dpg/reach_layer.yaml`): `channels: {}` — domain config must declare each channel explicitly.
 
 ### Docker Compose (`automation/docker/docker-compose.dev.yml`)
 

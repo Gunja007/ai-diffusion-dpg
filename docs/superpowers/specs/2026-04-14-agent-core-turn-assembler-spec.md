@@ -78,12 +78,30 @@ class TurnAssemblerBase(ABC):
 
 ### TurnAssembler concrete class
 
-Holds `_sessions: dict[str, SessionBuffer]` in memory.
+Holds `_sessions: dict[str, SessionBuffer]` in memory. Constructed with a reference to the `AgentCore` instance — injected at server startup.
 
 - `add_segment()`: creates buffer if new session, appends text, evaluates policy stack (see below).
 - `subscribe()`: creates buffer if needed, yields from `event_queue` until `DoneEvent` received, calls `session_end()` after.
 - `cancel()`: acquires lock, transitions to `INTERRUPTED` (if `INVOKED`) or `ABANDONED` (if `WAITING`), cancels all asyncio tasks, pushes `DoneEvent(turn_status=...)` to queue.
 - `session_end()`: cancels all tasks, removes buffer from `_sessions`.
+
+### Invocation path (no HTTP hop)
+
+When a policy triggers, `TurnAssembler._invoke(session_id)` is called as a private async method:
+
+```python
+async def _invoke(self, session_id: str) -> None:
+    buffer = self._sessions[session_id]
+    assembled_text = " ".join(buffer.segments)
+    turn_input = TurnInput(session_id=session_id, user_message=assembled_text, ...)
+
+    async for event in self._agent_core.stream_turn(turn_input):
+        await buffer.event_queue.put(event)
+        if isinstance(event, DoneEvent):
+            break
+```
+
+`TurnAssembler` calls `agent_core.stream_turn()` **directly as a Python method** — in-process, no HTTP, no serialisation. The `StreamEvent`s are pushed into `SessionBuffer.event_queue`. The open `GET /sessions/{id}/events` connection drains the queue and forwards events to the reach layer as SSE.
 
 ---
 
@@ -173,28 +191,19 @@ The async memory write task (`_schedule_flush()`) is cancelled when `stream_turn
 
 ## Config placement
 
-All `turn_assembler` config lives under the channel namespace in domain YAML:
+All `turn_assembler` config lives under the channel namespace in domain YAML, nested under `reach_layer.channels.<name>.turn_assembler`. It is only read for channels with `assembly_mode: session`. Config is owned by spec #73 (Reach Layer). Agent Core reads config once at startup. No runtime re-reads.
 
+Example (voice channel):
 ```yaml
 reach_layer:
-  cli:
-    turn_assembler:
-      semantic_gate: {enabled: true, confidence_threshold: 0.75}
-      silence_trigger: {silence_ms: 200}
-      max_wait_ceiling: {max_wait_ms: 10000}
-  web:
-    turn_assembler:
-      semantic_gate: {enabled: true, confidence_threshold: 0.75}
-      silence_trigger: {silence_ms: 1500}
-      max_wait_ceiling: {max_wait_ms: 15000}
-  voice:
-    turn_assembler:
-      semantic_gate: {enabled: true, confidence_threshold: 0.75}
-      silence_trigger: {silence_ms: 400}
-      max_wait_ceiling: {max_wait_ms: 8000}
+  channels:
+    voice:
+      assembly_mode: session
+      turn_assembler:
+        semantic_gate: {enabled: true, confidence_threshold: 0.75}
+        silence_trigger: {silence_ms: 400}
+        max_wait_ceiling: {max_wait_ms: 8000}
 ```
-
-Agent Core reads config once at startup. No runtime re-reads.
 
 ---
 
