@@ -209,7 +209,7 @@ class AgentCore(AgentCoreBase):
             memory_endpoint, session_id,
         )
         t1 = time.time()
-        bundle = self._memory.context_bundle(session_id, user_id)
+        bundle = self._memory.context_bundle(session_id, user_id, adopt=not turn_input.fresh)
         current_subagent_id: str = (
             bundle.session.get("current_subagent_id")
             or self._workflow.start_subagent_id
@@ -386,11 +386,25 @@ class AgentCore(AgentCoreBase):
             .get("nlu_processor", {})
             .get("model_override", "haiku")
         )
+
+        # Collect existing profile keys (declared + ad-hoc) so the NLU prompt
+        # can instruct the LLM to reuse them instead of inventing synonyms.
+        profile_data = bundle.profile or {}
+        existing_profile_keys: list[str] = [
+            k for k in profile_data if k != "attributes"
+        ]
+        for attr in profile_data.get("attributes", []):
+            attr_key = attr.get("key", "") if isinstance(attr, dict) else ""
+            if attr_key:
+                existing_profile_keys.append(attr_key)
+
         logger.info(
             "  [STEP 5] NLU Processor  →  LLM call (model_override=%s)"
-            "  current_subagent_id=%s  allowed_intents=%d  current_question=%r",
+            "  current_subagent_id=%s  allowed_intents=%d  current_question=%r"
+            "  existing_profile_keys=%d",
             nlu_model, current_subagent_id, len(allowed_intents),
             current_question[:60] if current_question else "",
+            len(existing_profile_keys),
         )
         t5 = time.time()
         nlu_result = self._nlu_processor.process(
@@ -399,6 +413,7 @@ class AgentCore(AgentCoreBase):
             current_subagent_id=current_subagent_id,
             llm=self._llm,
             allowed_intents=allowed_intents,
+            existing_profile_keys=existing_profile_keys,
         )
         logger.info(
             "  [STEP 5] NLU Processor  ✓  intent=%s  confidence=%.2f  entities=%s"
