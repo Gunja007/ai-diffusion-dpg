@@ -61,7 +61,7 @@ Example subagent (condensed from KKB reference):
 """
 
 
-def get_phase_addition(phase: str, available_connectors: list[str] | None = None) -> str:
+def get_phase_addition(phase: str, available_tools: list[str] | None = None) -> str:
     """Return schema context to append to the base system prompt for a given phase.
 
     Injects the YAML template for the relevant block(s) so Claude sees the
@@ -70,7 +70,7 @@ def get_phase_addition(phase: str, available_connectors: list[str] | None = None
 
     Args:
         phase: Current conversation phase name.
-        available_connectors: Connector names declared in agent_core (used in workflow phase).
+        available_tools: Tool IDs declared in the Tools phase (used in workflow phase).
 
     Returns:
         Additional system prompt text for the phase, or empty string if none.
@@ -85,7 +85,7 @@ def get_phase_addition(phase: str, available_connectors: list[str] | None = None
             "3. knowledge — RAG knowledge base, persona, document sources\n"
             "4. memory    — session state fields, persistent graph, consent mode\n"
             "5. trust     — blocked phrases, escalation topics, safety guardrails\n"
-            "6. connectors — external API connectors (or confirm none needed)\n"
+            "6. tools      — external API / MCP tools (or confirm none needed)\n"
             "7. workflow  — subagent state machine, routing rules\n"
             "8. observability — outcome lifecycle states, metrics, domain name\n"
             "9. reach     — web UI branding (app name, icon, tagline)\n"
@@ -172,37 +172,60 @@ def get_phase_addition(phase: str, available_connectors: list[str] | None = None
             "```yaml\n"
             + load_template_text("trust_layer")
             + "```\n\n"
-            "➡️ When input rules, output rules, and consent phrases are set, call `set_phase('connectors')`."
+            "➡️ When input rules, output rules, and consent phrases are set, call `set_phase('tools')`."
         )
 
-    if phase == "connectors":
+    if phase == "tools":
         return (
-            "## Connectors phase — valid fields\n\n"
-            "There are TWO separate configs to write:\n\n"
-            "**1. Agent Core connectors** (tool definitions shown to the LLM — input schema, descriptions):\n"
-            "   section=`connectors`, values={read: [...], write: [...], identity: [...], internal: [...]}\n"
-            "   Each item: {name, description, input_schema: {type: object, properties: {...}, required: [...]}}\n\n"
-            "**2. Action Gateway** (endpoint URLs only — no input schema, no type, no params lists):\n"
-            "   block=`action_gateway`, section=`action_gateway`, values={connectors: {connector_name: {endpoint, timeout_ms}}}\n"
-            "   ❌ NEVER add: action_gateway.connectors.read, .write, .internal subsections\n"
-            "   ❌ NEVER add: authentication, type, required_params, optional_params to action_gateway\n"
-            "   The action_gateway ONLY maps connector_name → {endpoint: url, timeout_ms: number}\n\n"
-            "The `update_config` tool will return an ERROR if you use wrong key names. Read the error and retry.\n\n"
-            "**agent_core connectors section:**\n"
-            "```yaml\n"
-            + _extract_template_sections("agent_core", ["connectors"])
-            + "```\n\n"
-            "**action_gateway template:**\n"
+            "## Tools phase\n\n"
+            "In this phase you configure the external tools the agent can call via the Action Gateway.\n\n"
+            "**Path A — User has an OpenAPI spec:**\n"
+            "  1. Ask them to paste or upload it, then call `parse_openapi_spec` to extract candidate tools.\n"
+            "  2. Present the candidates and confirm which ones to add.\n"
+            "  3. Call `add_rest_api_tool` once per confirmed tool.\n"
+            "  4. After adding, go to **After each path** below.\n\n"
+            "**Path B — User has an MCP server:**\n"
+            "  1. Ask for the MCP server URL and transport type (sse or streamable_http).\n"
+            "     Use streamable_http for hosted servers like GitBook, Notion, etc.\n"
+            "  2. Call `discover_mcp_tools` to fetch available tools and present the list.\n"
+            "  3. Call `add_mcp_tool` ONCE for the server — NOT once per tool.\n"
+            "     Choose a short snake_case namespace id (e.g. 'obsrv_docs') that will prefix\n"
+            "     all discovered tool names (e.g. 'obsrv_docs.searchDocumentation').\n"
+            "  4. Note the namespaced tool names — they are used in subagent tools lists.\n"
+            "  5. After adding, go to **After each path** below.\n\n"
+            "**Path C — Manual REST API (no spec, no MCP):**\n"
+            "  Collect: tool ID, description, base URL, auth type, and at least one endpoint.\n"
+            "  Then call `add_rest_api_tool`. After adding, go to **After each path** below.\n\n"
+            "**After each path — ALWAYS do this:**\n"
+            "  Ask: 'Are there any other tools to add? (OpenAPI spec, MCP server, or describe manually)'\n"
+            "  - If yes: repeat the appropriate path above.\n"
+            "  - If no: proceed to the completion step.\n\n"
+            "**If no external tools are needed at all:**\n"
+            "  Confirm with the user and proceed directly.\n\n"
+            "REST API tools (`add_rest_api_tool`) automatically create a matching connector\n"
+            "in agent_core.connectors — subagents reference these by their bare id.\n"
+            "MCP tools (`add_mcp_tool`) do NOT create connectors — tool schemas come from\n"
+            "the server at runtime. Subagents reference MCP tools by their namespaced names\n"
+            "(e.g. 'obsrv_docs.searchDocumentation'), not the bare adapter id.\n\n"
+            "Use EXACTLY the key names shown in the template below:\n\n"
             "```yaml\n"
             + load_template_text("action_gateway")
             + "```\n\n"
-            "➡️ When connectors are defined (or confirmed empty), call `set_phase('workflow')`."
+            "➡️ When all tools are configured (or confirmed none needed), call `set_phase('workflow')`."
         )
 
     if phase == "workflow":
         connector_note = ""
-        if available_connectors:
-            connector_note = f"\n\nAvailable connectors (declared in Connectors phase): {', '.join(available_connectors)}"
+        if available_tools:
+            connector_note = (
+                "\n\nAvailable tools (configured in Tools phase): "
+                + ", ".join(available_tools)
+                + "\n\nIMPORTANT — tool name format per type:\n"
+                "- REST API tools: use the bare id (e.g. 'onest_market_lookup') — a connector entry exists in agent_core.\n"
+                "- MCP tools: use '{adapter_id}.{mcp_tool_name}' (e.g. 'obsrv_docs.searchDocumentation') — "
+                "no connector entry exists; the MCP adapter discovers tool names at startup. "
+                "Use the exact tool names returned by `discover_mcp_tools` prefixed with the adapter id."
+            )
         return (
             "## Workflow Design phase\n\n"
             "**CRITICAL — forbidden keys that will cause validation failure:**\n"
@@ -259,33 +282,38 @@ def get_phase_addition(phase: str, available_connectors: list[str] | None = None
 
     if phase == "reach":
         return (
-            "## Reach phase — valid fields\n\n"
+            "## Reach phase — multi-channel deployment\n\n"
             "Use `update_config` with block=`reach_layer`. "
             f"Valid top-level sections: {', '.join(get_valid_sections('reach_layer'))}\n\n"
-            "**What to collect from the user — Web UI branding only:**\n"
-            "   - `app_name`: App name shown in browser tab and chat header\n"
-            "   - `app_tagline`: Short subtitle shown under the app name\n"
-            "   - `app_icon`: Emoji representing the app (e.g. 💊 health, 🌾 farming, 💼 jobs)\n"
-            "   - `agent_avatar`: Emoji shown on agent chat bubbles (usually same as app_icon)\n"
-            "   - `user_avatar`: Emoji shown on user chat bubbles (default '👤', or '👨‍🌾' for farmers)\n"
-            "   - `setup_heading`: Heading on the user ID entry screen — include both local language and English\n"
-            "   - `setup_subtitle`: Subtitle under the heading — tell user what to enter\n"
-            "   - `user_id_placeholder`: Hint inside the user ID field (e.g. 'e.g. ramesh_up')\n"
-            "   - `user_id_hint`: Secondary hint below the field (e.g. 'Use your name and village')\n"
-            "   - `start_btn_label`: Label on the start button — include local language + English\n"
-            "   - `new_session_msg`: First message shown to a brand new user — include local language + English\n"
-            "   - `returning_user_msg`: First message shown to a returning user — include local language + English\n"
-            "   - `storage_key`: localStorage key for the user ID (snake_case + '_user_id', e.g. 'fasal_doctor_uid')\n"
-            "   - `theme_storage_key`: localStorage key for theme (snake_case + '_theme', e.g. 'fasal_doctor_theme')\n\n"
-            "**CRITICAL — exact section path:**\n"
-            "- section=`ui`, values={all fields above as a single dict}\n"
-            "  ❌ NEVER write `agent_core_client` or `memory_layer_client` — those are DPG framework defaults\n\n"
+            "**Step 1 — Channel selection (do this first):**\n"
+            "Ask the user which channels they want to deploy on: web, CLI (terminal), voice.\n"
+            "Then call `set_reach_channels` with the list (e.g. `['web']` or `['web', 'voice']`).\n\n"
+            "**Step 2 — Configure ONLY selected channels:**\n\n"
+            "**Web channel** (if selected):\n"
+            "  - UI branding: section=`reach_layer.channels.web.ui`\n"
+            "    Keys: app_name, app_tagline, app_icon, agent_avatar, user_avatar,\n"
+            "    setup_heading, setup_subtitle, user_id_placeholder, user_id_hint,\n"
+            "    start_btn_label, new_session_msg, returning_user_msg,\n"
+            "    storage_key, theme_storage_key, sign_out_confirm, switch_user_confirm,\n"
+            "    delete_conversation_confirm\n"
+            "  - Auth (optional): section=`reach_layer.channels.web.auth`\n"
+            "    Keys: enabled (bool), google_client_id (str), cookie_secure (bool)\n\n"
+            "**CLI channel** (if selected):\n"
+            "  - Prompts: section=`reach_layer.channels.cli`\n"
+            "    Keys: prompt (e.g. 'You: '), agent_prefix (e.g. 'Agent: ')\n\n"
+            "**Voice channel** (if selected):\n"
+            "  - STT/TTS: section=`reach_layer.channels.voice.raya`\n"
+            "    Keys: stt_language (BCP-47, e.g. 'hi'), tts_language (BCP-47), voice_id\n"
+            "  - Agent settings: section=`reach_layer.channels.voice.agent_core`\n"
+            "    Keys: timeout_ms (default 15000), greeting (first spoken message), fallback_phrase\n\n"
+            "**Domain (all channels):**\n"
+            "  section=`reach_layer.common.observability`, values={domain: 'your_domain_slug'}\n\n"
             "The `update_config` tool will return an ERROR if you use wrong key names. Read the error and retry.\n\n"
             "Use EXACTLY the key names shown in the template below:\n\n"
             "```yaml\n"
             + load_template_text("reach_layer")
             + "```\n\n"
-            "➡️ When all ui fields are set, call `set_phase('review')`."
+            "➡️ When all selected channels are configured, call `set_phase('review')`."
         )
 
     if phase == "review":
@@ -300,7 +328,9 @@ def get_phase_addition(phase: str, available_connectors: list[str] | None = None
             "- knowledge_engine: knowledge.blocks.static_knowledge_base.collection_name\n"
             "- memory_layer: state.session, state.persistent.backend, state.persistent.graph.user_node\n"
             "- observability_layer: observability.domain, observability.outcomes.lifecycle (at least one state)\n"
-            "- reach_layer: ui.app_name, ui.app_icon, ui.storage_key\n\n"
+            "- reach_layer: channels selected (call set_reach_channels if missing); "
+            "  for web: reach_layer.channels.web.ui.app_name, .app_icon, .storage_key; "
+            "  for voice: reach_layer.channels.voice.raya.stt_language\n\n"
             "Call `finalize_config` for each block that is complete.\n"
             "The user can now view configs in the dashboard and edit them directly."
         )

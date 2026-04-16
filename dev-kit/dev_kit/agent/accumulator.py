@@ -31,7 +31,7 @@ PHASES: list[str] = [
     "knowledge",
     "memory",
     "trust",
-    "connectors",
+    "tools",
     "workflow",
     "observability",
     "reach",
@@ -209,6 +209,54 @@ class ConfigAccumulator:
         subagents[:] = [sa for sa in subagents if sa.get("id") != subagent_id]
         return len(subagents) < original_len
 
+    def add_action_gateway_tool(self, tool: dict) -> None:
+        """Add a tool definition to the action_gateway tools list.
+
+        Args:
+            tool: Tool dict. Must include 'id' and 'type' ('rest_api' or 'mcp') keys.
+
+        Raises:
+            ValueError: If tool has no 'id' key.
+            ValueError: If a tool with the same id already exists.
+        """
+        if "id" not in tool:
+            raise ValueError("Tool must have an 'id' key")
+        tools: list[dict] = self._data["action_gateway"].setdefault("tools", [])
+        if any(t.get("id") == tool["id"] for t in tools):
+            raise ValueError(f"Tool with id {tool['id']!r} already exists")
+        tools.append(deepcopy(tool))
+
+    def get_action_gateway_tools(self) -> list[dict]:
+        """Return the current list of action_gateway tool definitions.
+
+        Returns:
+            Deep copy of the tools list (empty list if none configured).
+        """
+        return deepcopy(self._data["action_gateway"].get("tools", []))
+
+    def set_reach_channel_selection(self, channels: list[str]) -> None:
+        """Store the selected deployment channels in reach_layer config.
+
+        Args:
+            channels: List of selected channel names (e.g. ['web', 'cli']).
+        """
+        self._data["reach_layer"]["_selected_channels"] = list(channels)
+
+    def set_agent_core_connector(self, category: str, connector: dict) -> None:
+        """Add or replace a connector in agent_core.connectors[category].
+
+        Args:
+            category: Connector category ('read', 'write', or 'identity').
+            connector: Connector dict with at minimum a 'name' key.
+        """
+        connectors_block = self._data["agent_core"].setdefault("connectors", {})
+        connector_list: list = connectors_block.setdefault(category, [])
+        for i, c in enumerate(connector_list):
+            if c.get("name") == connector.get("name"):
+                connector_list[i] = connector
+                return
+        connector_list.append(connector)
+
     def add_routing_rule(
         self,
         from_subagent_id: str,
@@ -290,8 +338,13 @@ class ConfigAccumulator:
             data = self._data[block]
             status = self._statuses[block].value
             if data:
-                keys = list(data.keys())[:4]
-                lines.append(f"  {block} ({status}): {', '.join(keys)}")
+                if block == "action_gateway":
+                    tool_ids = [t.get("id", "?") for t in data.get("tools", [])]
+                    detail = f"tools: [{', '.join(tool_ids)}]" if tool_ids else "tools: []"
+                else:
+                    keys = list(data.keys())[:4]
+                    detail = ", ".join(keys)
+                lines.append(f"  {block} ({status}): {detail}")
             else:
                 lines.append(f"  {block} ({status}): empty")
         return "\n".join(lines)
