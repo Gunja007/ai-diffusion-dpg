@@ -64,5 +64,10 @@ agent_workflow:
   default_fallback_subagent_id: ""  # Required. Subagent to route to when no routing rule matches.
   subagents: []              # Required. List of subagent definitions. See dev-kit/configs/kkb/agent_core.yaml for full example.
 
+# reach_layer: Optional. Per-channel turn assembler overrides.
+# Defaults come from dpg.yaml. Only add this block if your domain needs
+# different turn assembler tuning per channel. See dev-kit/configs/kkb/agent_core.yaml
+# for a full example.
+
 observability:
   domain: ""  # Required. Domain identifier (e.g. "kkb", "farmer_friendly").

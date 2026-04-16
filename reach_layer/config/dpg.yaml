@@ -1,52 +1,94 @@
-# reach_layer/config/dpg.yaml — DPG framework defaults.
-# These values are the same for any domain deployment.
-# Domain-specific values (app_name, app_icon, etc.) belong in domain.yaml.
-
-server:
-  host: 0.0.0.0
-  port: 8005
+# =============================================================================
+# reach_layer/config/dpg.yaml — Reach Layer framework (infrastructure) defaults.
+# =============================================================================
+# Non-domain-specific config only: endpoints, ports, timeouts, protocol flags,
+# and technical tuning. Anything that changes by DOMAIN (branding, UI text,
+# language, voice, greeting) lives in `domain.yaml` and is merged on top of
+# this file at startup.
+#
+# Each service reads only its own slice under `reach_layer.channels.<name>`
+# plus the shared `reach_layer.common` block. Unused channel sections are
+# ignored at runtime — this file is safe to ship into every channel image.
+# =============================================================================
 
 reach_layer:
-  cli:
-    prompt: "You: "
-    agent_prefix: "Agent: "
-  # Sidebar conversations list — max recent sessions returned to the UI.
-  sessions:
-    limit: 25
 
-agent_core_client:
-  endpoint: "http://localhost:8000/process_turn"
-  timeout_s: 30.0
+  # ---------------------------------------------------------------------------
+  # Shared — every channel service inherits these.
+  # ---------------------------------------------------------------------------
+  common:
+    agent_core_client:
+      endpoint: "http://localhost:8000/process_turn"   # base URL is derived; path is stripped
+      timeout_s: 30.0
+    memory_layer_client:
+      endpoint: "http://localhost:8002"
+      timeout_s: 10.0
+    observability:
+      otel:
+        collector_endpoint: "http://localhost:4317"
+        sample_rate: 1.0
+        export_interval_ms: 5000
+      # domain identifier is set in domain.yaml
 
-memory_layer_client:
-  endpoint: "http://localhost:8002"
-  timeout_s: 10.0
+  # ---------------------------------------------------------------------------
+  # Per-channel sections — each service reads ONLY its own slice.
+  # `enabled: false` makes the service refuse to start (selective deployment).
+  # `assembly_mode` is the single switch for routing:
+  #   - session → POST /sessions/{id}/input + SSE events (via TurnAssembler)
+  #   - direct  → POST /process_turn (synchronous)
+  # ---------------------------------------------------------------------------
+  channels:
 
-# UI framework defaults — avatars and copy that are the same across all deployments.
-# app_name, app_tagline, app_icon, user_id_placeholder must be set in domain.yaml.
-ui:
-  agent_avatar: "🤖"
-  user_avatar: "👤"
-  setup_heading: "Start a session"
-  setup_subtitle: "Enter your user ID to begin. Returning users will have their previous conversation restored automatically."
-  user_id_hint: "Use the same ID across sessions to restore your conversation history."
-  start_btn_label: "Start chatting →"
-  new_session_msg: "New session started. How can I help you today?"
-  returning_user_msg: "Welcome back! Continuing your previous conversation."
-  storage_key: "dpg_user_id"
-  # Sidebar / conversations-list copy. English defaults; domains may
-  # override any of these in domain.yaml for localisation.
-  new_chat_label: "New chat"
-  conversations_heading: "Conversations"
-  no_conversations_msg: "No previous chats"
-  delete_conversation_confirm: "Delete this conversation? This cannot be undone."
-  delete_conversation_tooltip: "Delete conversation"
-  sign_out_confirm: "Sign out of your account?"
-  switch_user_confirm: "Switch user? Your current session will be closed."
+    # ─── CLI ─────────────────────────────────────────────────────────────────
+    cli:
+      enabled: true
+      assembly_mode: session
+      # prompt / agent_prefix are locale-specific → domain.yaml
 
-# Observability — OTel collector endpoint for trace/metric export.
-observability:
-  otel:
-    collector_endpoint: "http://localhost:4317"
-    sample_rate: 1.0
-    export_interval_ms: 5000
+    # ─── Web ─────────────────────────────────────────────────────────────────
+    web:
+      enabled: true
+      assembly_mode: session
+      server:
+        host: 0.0.0.0
+        port: 8005
+      sessions:
+        limit: 25                                      # sidebar recent-sessions cap
+      auth:
+        # enabled, google_client_id, cookie_secure are per-domain → domain.yaml
+        session_cookie_name: "reach_session"
+        session_ttl_s: 86400
+        cookie_samesite: "lax"
+      # ui.* (avatars, copy, storage keys) is domain-specific → domain.yaml
+
+    # ─── Voice ───────────────────────────────────────────────────────────────
+    # Voice-channel keys mirror the legacy `telephony_adapter.*` shape exactly;
+    # the config loader aliases this section under `telephony_adapter` for
+    # backward compatibility with the existing pipecat code.
+    voice:
+      enabled: true
+      assembly_mode: session
+      port: 8006
+      public_url: ${PUBLIC_URL}
+      vobiz:
+        auth_id: ${VOBIZ_AUTH_ID}
+        auth_token: ${VOBIZ_AUTH_TOKEN}
+        api_base: "https://api.vobiz.ai/api/v1"
+        from_number: ${VOBIZ_FROM_NUMBER}
+      vad:
+        stop_secs: 0.35
+        min_volume: 0.3
+        confidence: 0.4
+        start_secs: 0.1
+        smoothing_factor: 0.1
+      raya:
+        api_key: ${RAYA_API_KEY}
+        stt_wss_url: "https://hub.getraya.app/transcribe"
+        tts_base_url: "https://hub.getraya.app/v1"
+        tts_model: "standard"
+        tts_speed: 1.0
+        # language, voice_id are per-domain → domain.yaml
+      agent_core:
+        base_url: "http://agent_core:8000"
+        timeout_ms: 5000
+        # greeting, fallback_phrase are per-domain (spoken text) → domain.yaml

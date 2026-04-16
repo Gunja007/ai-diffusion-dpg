@@ -1,64 +1,98 @@
-# reach_layer/config/dpg.yaml — DPG framework defaults.
-
-server:
-  host: 0.0.0.0
-  port: 8005
+# =============================================================================
+# dev-kit/dpg/reach_layer.yaml — Deploy-time Reach Layer framework defaults.
+# =============================================================================
+# Non-domain-specific config only: endpoints, ports, timeouts, protocol flags,
+# and technical tuning. Mounted by docker-compose (and by Helm/Kustomize in
+# real deploys) as the Reach Layer's `config/dpg.yaml` inside every channel
+# container.
+#
+# Shares the exact schema of `reach_layer/config/dpg.yaml`; the only
+# difference is that service endpoints point at in-cluster DNS names rather
+# than localhost.
+#
+# Domain-specific values (branding, UI text, language, greeting, etc.) live
+# in `dev-kit/configs/<domain>/reach_layer.yaml` and are deep-merged on top
+# of this file at startup.
+# =============================================================================
 
 reach_layer:
-  cli:
-    prompt: "You: "
-    agent_prefix: "Agent: "
-  # Sidebar conversations list — max recent sessions returned to the UI.
-  sessions:
-    limit: 25
 
-agent_core_client:
-  endpoint: "http://agent_core:8000/process_turn"
-  timeout_s: 30.0
+  # ---------------------------------------------------------------------------
+  # Shared — inherited by all three channel services.
+  # ---------------------------------------------------------------------------
+  common:
+    agent_core_client:
+      endpoint: "http://agent_core:8000/process_turn"
+      timeout_s: 30.0
+    memory_layer_client:
+      endpoint: "http://memory_layer:8002"
+      timeout_s: 10.0
+    observability:
+      otel:
+        collector_endpoint: "http://otelcol:4317"
+        sample_rate: 1.0
+        export_interval_ms: 5000
+      # domain identifier is set in dev-kit/configs/<domain>/reach_layer.yaml
 
-memory_layer_client:
-  endpoint: "http://memory_layer:8002"
-  timeout_s: 10.0
+  # ---------------------------------------------------------------------------
+  # Per-channel sections. Each channel service reads only its own slice plus
+  # `common`. `enabled: false` makes the service refuse to start.
+  # `assembly_mode` is the single switch:
+  #   - session → POST /sessions/{id}/input + SSE events (via TurnAssembler)
+  #   - direct  → POST /process_turn (synchronous)
+  # ---------------------------------------------------------------------------
+  channels:
 
-# Authentication — Google Sign-On.
-# When `enabled: false` (default) the legacy SetupScreen path is used and
-# no cookies are issued. When true, /chat and /user-history require a
-# valid session cookie and the SPA boots into the LoginScreen.
-# `google_client_id` is the OAuth 2.0 Web client_id from Google Cloud
-# Console. The HMAC secret for session JWTs is read from the
-# REACH_SESSION_SECRET env var (never commit this value).
-auth:
-  enabled: false
-  google_client_id: ""        # set per domain or via GOOGLE_CLIENT_ID env
-  session_cookie_name: "reach_session"
-  session_ttl_s: 86400        # 24h
-  cookie_secure: true         # set false only for plain-http local dev
-  cookie_samesite: "lax"
+    # ─── CLI ─────────────────────────────────────────────────────────────────
+    cli:
+      enabled: true
+      assembly_mode: session
+      # prompt / agent_prefix are locale-specific → dev-kit/configs/<domain>/
 
-ui:
-  agent_avatar: "🤖"
-  user_avatar: "👤"
-  setup_heading: "Start a session"
-  setup_subtitle: "Enter your user ID to begin or resume a conversation."
-  user_id_hint: "Use letters, numbers, or underscores."
-  start_btn_label: "Start chatting →"
-  new_session_msg: "New session started. How can I help you?"
-  returning_user_msg: "Welcome back! How can I help you today?"
-  storage_key: "dpg_user_id"
-  theme_storage_key: "dpg_theme"
-  # Sidebar / conversations-list copy. English defaults; domains may
-  # override any of these in domain.yaml for localisation.
-  new_chat_label: "New chat"
-  conversations_heading: "Conversations"
-  no_conversations_msg: "No previous chats"
-  delete_conversation_confirm: "Delete this conversation? This cannot be undone."
-  delete_conversation_tooltip: "Delete conversation"
-  sign_out_confirm: "Sign out of your account?"
-  switch_user_confirm: "Switch user? Your current session will be closed."
+    # ─── Web ─────────────────────────────────────────────────────────────────
+    web:
+      enabled: true
+      assembly_mode: session
+      server:
+        host: 0.0.0.0
+        port: 8005
+      sessions:
+        limit: 25
+      auth:
+        # enabled, google_client_id, cookie_secure are per-domain → dev-kit/configs/<domain>/
+        session_cookie_name: "reach_session"
+        session_ttl_s: 86400
+        cookie_samesite: "lax"
+      # ui.* (avatars, copy, storage keys) is domain-specific → dev-kit/configs/<domain>/
 
-# Observability — OTel collector endpoint for trace/metric export.
-observability:
-  otel:
-    collector_endpoint: "http://otelcol:4317"
-    sample_rate: 1.0
-    export_interval_ms: 5000
+    # ─── Voice ───────────────────────────────────────────────────────────────
+    # Voice-channel keys mirror the legacy `telephony_adapter.*` shape so the
+    # config loader can alias this block under `telephony_adapter` without
+    # touching the ~28 files that read those keys today.
+    voice:
+      enabled: true
+      assembly_mode: session
+      port: 8006
+      public_url: ${PUBLIC_URL}
+      vobiz:
+        auth_id: ${VOBIZ_AUTH_ID}
+        auth_token: ${VOBIZ_AUTH_TOKEN}
+        api_base: "https://api.vobiz.ai/api/v1"
+        from_number: ${VOBIZ_FROM_NUMBER}
+      vad:
+        stop_secs: 0.35
+        min_volume: 0.3
+        confidence: 0.4
+        start_secs: 0.1
+        smoothing_factor: 0.1
+      raya:
+        api_key: ${RAYA_API_KEY}
+        stt_wss_url: "https://hub.getraya.app/transcribe"
+        tts_base_url: "https://hub.getraya.app/v1"
+        tts_model: "standard"
+        tts_speed: 1.0
+        # language, voice_id are per-domain → dev-kit/configs/<domain>/
+      agent_core:
+        base_url: "http://agent_core:8000"
+        timeout_ms: 5000
+        # greeting, fallback_phrase are per-domain (spoken text) → dev-kit/configs/<domain>/
