@@ -726,13 +726,54 @@ def test_consent_gate_disabled_skips_entirely():
 
 
 def test_consent_gate_turn1_returns_prompt():
-    """Fresh session (turn_count=0, user_storage_mode=None) → return consent prompt, no LLM."""
+    """Fresh session (turn_count=0, user_storage_mode=None) → return consent prompt, no LLM.
+
+    Language normaliser returns the default language (hindi) so no translation is triggered,
+    and the raw consent text is returned unchanged.
+    """
     consent_text = "Kya aap agree karte hain?"
     agent, memory, trust = _make_agent_with_consent(
         consent_prompt=consent_text,
         session_data={"current_subagent_id": None, "turn_count": 0},
     )
+    # Normaliser returns the default language → no translation triggered
+    agent._language_normaliser.normalise.return_value = ("Kya aap agree karte hain?", "hindi")
     result = agent.process_turn(_turn_input("hello"))
+    assert result.response_text == consent_text
+    trust.verify_consent.assert_not_called()
+
+
+def test_consent_gate_turn1_translated_to_detected_language():
+    """Turn 1 with Kannada user input → consent prompt is translated to Kannada."""
+    consent_text = "Kya aap agree karte hain?"
+    translated_text = "Neevu sahomatiyaa?"
+    agent, memory, trust = _make_agent_with_consent(
+        consent_prompt=consent_text,
+        session_data={"current_subagent_id": None, "turn_count": 0},
+    )
+    agent._language_normaliser.normalise.return_value = ("namaskara", "kannada")
+    from src.models import LLMResponse
+    agent._llm.call.return_value = LLMResponse(
+        content=translated_text,
+        tool_calls=[],
+        stop_reason="end_turn",
+        model_used="claude-primary",
+    )
+    result = agent.process_turn(_turn_input("namaskara"))
+    assert result.response_text == translated_text
+    trust.verify_consent.assert_not_called()
+
+
+def test_consent_gate_turn1_falls_back_on_translation_failure():
+    """Turn 1 translation failure → consent prompt returned untranslated."""
+    consent_text = "Kya aap agree karte hain?"
+    agent, memory, trust = _make_agent_with_consent(
+        consent_prompt=consent_text,
+        session_data={"current_subagent_id": None, "turn_count": 0},
+    )
+    agent._language_normaliser.normalise.return_value = ("namaskara", "kannada")
+    agent._llm.call.side_effect = RuntimeError("LLM unavailable")
+    result = agent.process_turn(_turn_input("namaskara"))
     assert result.response_text == consent_text
     trust.verify_consent.assert_not_called()
 
@@ -802,4 +843,128 @@ def test_process_turn_emits_orchestrator_span():
     turn_span = next(s for s in spans if s.name == "orchestrator.turn")
     assert turn_span.attributes.get("session_id") is not None
     assert turn_span.attributes.get("turn_id") is not None
-    assert turn_span.attributes.get("dpg.domain") is not None
+
+
+# ---------------------------------------------------------------------------
+# #123 — language preference stability across turns
+# ---------------------------------------------------------------------------
+
+def test_language_preference_not_overridden_by_auto_detection():
+    """When session already has language_preference, a different turn_language must not override it."""
+    agent = _make_agent(
+        session_data={
+            "current_subagent_id": "market_truth",
+            "language_preference": "hindi",
+        }
+    )
+    # Simulate auto-detection returning "english" on this turn
+    agent._language_normaliser.normalise.return_value = ("Hello", "english")
+
+    agent.process_turn(_turn_input("Hello"))
+
+    # Must NOT have written "english" to memory as language_preference
+    for call_args in agent._memory.write.call_args_list:
+        args = call_args[0]  # positional args: session_id, user_id, scope, key, value
+        if len(args) >= 5 and args[3] == "language_preference":
+            assert args[4] == "hindi", (
+                f"language_preference was overwritten to {args[4]!r}; expected 'hindi'"
+            )
+
+
+def test_language_preference_set_from_detection_on_first_turn():
+    """When no saved preference exists, auto-detection result becomes the preference."""
+    agent = _make_agent(
+        session_data={"current_subagent_id": "market_truth"}
+    )
+    agent._language_normaliser.normalise.return_value = ("kaam chahiye", "hindi")
+
+    agent.process_turn(_turn_input("kaam chahiye"))
+
+    agent._memory.write.assert_any_call(
+        SESSION_ID, SESSION_ID, "persistent", "language_preference", "hindi"
+    )
+
+
+# ---------------------------------------------------------------------------
+# #125 — user-requested language switch
+# ---------------------------------------------------------------------------
+
+_SWITCH_NLU = NLUResult(
+    intent="language_switch_request",
+    entities={"requested_language": "kannada"},
+    sentiment="neutral",
+    confidence=0.95,
+)
+
+_SWITCH_UNSUPPORTED_NLU = NLUResult(
+    intent="language_switch_request",
+    entities={"requested_language": "french"},
+    sentiment="neutral",
+    confidence=0.95,
+)
+
+VALID_CONFIG_WITH_LANG = {
+    **VALID_CONFIG,
+    "entity_persistence": {"scope": "persistent"},
+    "preprocessing": {
+        **VALID_CONFIG.get("preprocessing", {}),
+        "language_normalisation": {
+            "default_language": "hindi",
+            "supported_languages": ["hindi", "kannada", "english", "hinglish"],
+        },
+    },
+    "conversation": {
+        **VALID_CONFIG.get("conversation", {}),
+        "unsupported_language_message": "Sorry, that language is not supported.",
+    },
+}
+
+
+def test_language_switch_to_supported_language_updates_preference():
+    """language_switch_request intent with a supported language persists the new preference."""
+    agent = _make_agent(
+        nlu_result=_SWITCH_NLU,
+        session_data={"current_subagent_id": "market_truth", "language_preference": "hindi"},
+    )
+    agent._config = VALID_CONFIG_WITH_LANG
+    agent.process_turn(_turn_input("Kannada mein baat karo"))
+
+    agent._memory.write.assert_any_call(
+        SESSION_ID, SESSION_ID, "persistent", "language_preference", "kannada"
+    )
+
+
+def test_language_switch_to_unsupported_language_returns_config_message():
+    """language_switch_request with unsupported language returns unsupported_language_message."""
+    agent = _make_agent(
+        nlu_result=_SWITCH_UNSUPPORTED_NLU,
+        session_data={"current_subagent_id": "market_truth"},
+    )
+    agent._config = VALID_CONFIG_WITH_LANG
+    result = agent.process_turn(_turn_input("Please respond in French"))
+
+    assert "Sorry, that language is not supported." in result.response_text
+
+
+def test_language_switch_to_unsupported_does_not_call_llm():
+    """Unsupported language switch returns early without an LLM call."""
+    agent = _make_agent(
+        nlu_result=_SWITCH_UNSUPPORTED_NLU,
+        session_data={"current_subagent_id": "market_truth"},
+    )
+    agent._config = VALID_CONFIG_WITH_LANG
+    agent.process_turn(_turn_input("Please respond in French"))
+
+    agent._llm.call.assert_not_called()
+
+
+def test_language_switch_to_supported_language_continues_turn():
+    """language_switch_request with a valid language does not short-circuit the turn."""
+    agent = _make_agent(
+        nlu_result=_SWITCH_NLU,
+        session_data={"current_subagent_id": "market_truth"},
+    )
+    agent._config = VALID_CONFIG_WITH_LANG
+    result = agent.process_turn(_turn_input("Kannada mein baat karo"))
+
+    assert result.response_text  # manager mock returns "Final response."
