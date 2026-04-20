@@ -224,6 +224,10 @@ class AgentCore(AgentCoreBase):
             "═══════════════════════════════════════════════════════════════",
             session_id, turn_input.channel, turn_input.user_message[:120],
         )
+        # Validate channel before any memory read or LLM call — unsupported
+        # channels must fail fast without consuming LLM resources.
+        channel_config = self._resolve_channel_config(turn_input.channel)
+
         # ── Step 1: Read session state ────────────────────────────────
         memory_endpoint = (
             self._config.get("memory_client", {}).get("endpoint", "http://memory_layer:8002")
@@ -698,6 +702,7 @@ class AgentCore(AgentCoreBase):
             detected_language=final_language,
             channel=turn_input.channel,
             profile=profile_context,
+            channel_config=channel_config,
             is_resumption=is_resumption,
             guardrail_constraints=guardrail_constraints,
         )
@@ -1722,6 +1727,28 @@ class AgentCore(AgentCoreBase):
         return message
 
     # ------------------------------------------------------------------
+    # Private: channel config resolver
+    # ------------------------------------------------------------------
+
+    def _resolve_channel_config(self, channel: str) -> dict:
+        """Resolve per-channel config from agent.channels, raising for unsupported channels.
+
+        Args:
+            channel: Channel name from the inbound TurnInput.
+
+        Returns:
+            Channel config dict with at least system_prompt_suffix key.
+
+        Raises:
+            ValueError: If the channel is not present in agent.channels config.
+        """
+        channels = self._config.get("agent", {}).get("channels", {})
+        config = channels.get(channel)
+        if config is None:
+            raise ValueError(f"Unsupported channel: {channel}")
+        return config
+
+    # ------------------------------------------------------------------
     # Private: synchronous memory write helper
     # ------------------------------------------------------------------
 
@@ -1816,6 +1843,8 @@ class AgentCore(AgentCoreBase):
             "═══════════════════════════════════════════════════════════════",
             session_id, turn_input.channel, turn_input.user_message[:120],
         )
+
+        channel_config = self._resolve_channel_config(turn_input.channel)
 
         memory_endpoint = (
             self._config.get("memory_client", {}).get("endpoint", "http://memory_layer:8002")
@@ -2175,6 +2204,7 @@ class AgentCore(AgentCoreBase):
                 detected_language=final_language,
                 channel=turn_input.channel,
                 profile=profile_context,
+                channel_config=channel_config,
                 is_resumption=is_resumption,
                 guardrail_constraints=guardrail_constraints,
             )
