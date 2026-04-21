@@ -144,17 +144,16 @@ class TestReachChannelPhaseFlow:
         assert "web" in result and "cli" in result
         assert acc._data["reach_layer"]["_selected_channels"] == ["web", "cli"]
 
-    def test_reach_phase_prompt_has_set_reach_channels_instruction(self):
-        """Reach phase prompt instructs agent to call set_reach_channels first."""
+    def test_reach_phase_prompt_mentions_channel_adapters(self):
+        """GH-137: Reach phase prompt frames channel adapters at pedagogy level."""
         addition = get_phase_addition("reach")
-        assert "set_reach_channels" in addition
+        assert "channel" in addition.lower()
 
-    def test_reach_phase_prompt_has_all_channel_paths(self):
-        """Reach phase prompt shows all three channel section paths."""
+    def test_reach_phase_prompt_mentions_voice_and_web(self):
+        """GH-137: Reach phase prompt covers voice and web adapters."""
         addition = get_phase_addition("reach")
-        assert "reach_layer.channels.web.ui" in addition
-        assert "reach_layer.channels.cli" in addition
-        assert "reach_layer.channels.voice.raya" in addition
+        assert "voice" in addition.lower()
+        assert "web" in addition.lower()
 
     def test_update_config_web_ui_stored_correctly(self):
         """Updating web UI via update_config writes to correct path."""
@@ -188,8 +187,8 @@ class TestPhaseSequenceWithNewTools:
         handler = ToolHandler(acc, state)
         return acc, state, handler
 
-    def test_tools_is_phase_7_in_sequence(self):
-        assert PHASES[6] == "tools"
+    def test_tools_is_phase_8_in_sequence(self):
+        assert PHASES[7] == "tools"
 
     def test_cannot_skip_tools_to_workflow(self):
         acc, state, handler = self._make_handler(phase="trust")

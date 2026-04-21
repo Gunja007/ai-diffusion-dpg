@@ -53,12 +53,11 @@ SESSION_ID = "sess_orch_001"
 TIMESTAMP = int(time.time() * 1000)
 
 VALID_CONFIG = {
-    "agent": {
-        "channels": {
-            "cli": {"system_prompt_suffix": ""},
-            "voice": {"system_prompt_suffix": "Respond in 1-2 short sentences."},
-            "web": {"system_prompt_suffix": ""},
-        },
+    "agent": {},
+    "channels": {
+        "cli": {"system_prompt_suffix": ""},
+        "voice": {"system_prompt_suffix": "Respond in 1-2 short sentences."},
+        "web": {"system_prompt_suffix": ""},
     },
     "conversation": {
         "unknown_intent_message": "I didn't understand that.",
@@ -124,6 +123,7 @@ def _make_subagent(subagent_id: str = "market_truth", special_handler=None) -> M
     sa.system_prompt = f"Test prompt for {subagent_id}."
     sa.output_format = None
     sa.routing = []  # empty — falls through to global_routing, then default_fallback
+    sa.opening_phrase = ""  # GH-137: default to empty so opening-phrase gate no-ops in tests
     return sa
 
 
@@ -997,11 +997,64 @@ def test_process_turn_unsupported_channel_raises_value_error():
 
 
 def test_process_turn_passes_channel_config_to_build_system_prompt():
-    """channel_config resolved from agent.channels is forwarded to build_system_prompt."""
+    """channel_config resolved from top-level channels is forwarded to build_system_prompt."""
     agent = _make_agent()
     agent.process_turn(_turn_input())   # channel="cli"
     call_kwargs = agent._manager_agent.build_system_prompt.call_args.kwargs
     assert call_kwargs["channel_config"] == {"system_prompt_suffix": ""}
+
+
+def test_resolve_channel_config_reads_top_level_channels():
+    """_resolve_channel_config returns the entry from the top-level channels block."""
+    agent = _make_agent()
+    result = agent._resolve_channel_config("voice")
+    assert result == {"system_prompt_suffix": "Respond in 1-2 short sentences."}
+
+
+def test_resolve_channel_config_rejects_legacy_agent_channels():
+    """Legacy agent.channels path is rejected at resolve time (GH-137 hard cut)."""
+    agent = _make_agent()
+    agent._config = {
+        **VALID_CONFIG,
+        "agent": {"channels": {"voice": {"system_prompt_suffix": "old"}}},
+    }
+    with pytest.raises(ValueError, match="agent.channels"):
+        agent._resolve_channel_config("voice")
+
+
+# ── Opening-phrase gate tests (GH-137) ───────────────────────────────────────
+
+def test_opening_phrase_emitted_on_first_turn_when_configured():
+    """When opening_phrase is set on the start subagent, it is emitted on turn 0."""
+    agent = _make_agent(session_data={})   # fresh session — no opening_phrase_emitted flag
+    agent._workflow.subagents["market_truth"].opening_phrase = "नमस्ते।"
+    agent._workflow.start_subagent_id = "market_truth"
+
+    result = agent.process_turn(_turn_input(""))
+    assert result.response_text == "नमस्ते।"
+
+
+def test_opening_phrase_skipped_when_already_emitted():
+    """opening_phrase_emitted flag in session prevents re-emission."""
+    agent = _make_agent(
+        session_data={"current_subagent_id": "market_truth", "opening_phrase_emitted": True},
+    )
+    agent._workflow.subagents["market_truth"].opening_phrase = "नमस्ते।"
+
+    result = agent.process_turn(_turn_input("hello"))
+    assert result.response_text != "नमस्ते।"
+
+
+def test_opening_phrase_empty_sets_flag_and_falls_through():
+    """Empty opening_phrase still sets opening_phrase_emitted flag; turn proceeds."""
+    agent = _make_agent(session_data={"current_subagent_id": "market_truth"})
+    agent._workflow.subagents["market_truth"].opening_phrase = ""
+
+    agent.process_turn(_turn_input("hello"))
+    # Gate wrote the flag
+    agent._memory.write.assert_any_call(
+        SESSION_ID, SESSION_ID, "session", "opening_phrase_emitted", True
+    )
 
 
 # ── User-state model init tests (GH-139) ─────────────────────────────────────
@@ -1065,3 +1118,138 @@ def test_agentcore_init_user_state_disabled_empty_cache():
     assert agent._user_state_enabled is False
     assert agent._user_state_guidance_by_id == {}
     assert agent._user_state_default == ""
+
+
+# ---------------------------------------------------------------------------
+# GH-137: session_end_eval + end_session tool registration
+# ---------------------------------------------------------------------------
+
+
+def _config_with_session_end_eval(enabled: bool, prompt: str = "") -> dict:
+    """Clone VALID_CONFIG and inject conversation.session_end_eval."""
+    cfg = {k: (v.copy() if isinstance(v, dict) else v) for k, v in VALID_CONFIG.items()}
+    conv = dict(cfg.get("conversation", {}))
+    conv["session_end_eval"] = {"enabled": enabled, "prompt": prompt}
+    cfg["conversation"] = conv
+    return cfg
+
+
+def _make_agent_with_config(config: dict, workflow: MagicMock = None) -> AgentCore:
+    """Build an AgentCore with a specific config and a real-ish tool_registry mock."""
+    memory = MagicMock()
+    memory.context_bundle.return_value = ContextBundle(
+        session={"current_subagent_id": "market_truth"}, profile={}, journey=None
+    )
+    trust = MagicMock()
+    trust.check_input.return_value = ALLOW
+    trust.check_output.return_value = ALLOW
+    knowledge_engine = MagicMock()
+    llm = MagicMock()
+    llm.call.return_value = LLMResponse(
+        content="LLM response.", tool_calls=[], stop_reason="end_turn",
+        model_used="claude-primary",
+    )
+    tool_registry = MagicMock()
+    tool_registry.get_tool_definitions.return_value = []
+    # Record register_internal calls so tests can assert on them.
+    manager = MagicMock()
+    manager.build_system_prompt.return_value = ""
+    manager.build_messages.return_value = [{"role": "user", "content": "Hello"}]
+    manager.run_turn.return_value = ("Final response.", [], [])
+    manager.session_ended = False
+    learning = MagicMock()
+    if workflow is None:
+        workflow = _make_workflow()
+
+    agent = AgentCore(
+        config=config,
+        llm_wrapper=llm,
+        memory=memory,
+        trust=trust,
+        knowledge_engine=knowledge_engine,
+        tool_registry=tool_registry,
+        manager_agent=manager,
+        learning=learning,
+        workflow=workflow,
+    )
+    agent._language_normaliser = MagicMock()
+    agent._language_normaliser.normalise.return_value = ("Hello", "english")
+    agent._nlu_processor = MagicMock()
+    agent._nlu_processor.process.return_value = _DEFAULT_NLU
+    return agent
+
+
+def test_session_end_eval_disabled_by_default():
+    """VALID_CONFIG has no session_end_eval — orchestrator caches disabled + empty prompt."""
+    agent = _make_agent()
+    assert agent._session_end_eval_enabled is False
+    assert agent._session_end_eval_prompt == ""
+
+
+def test_session_end_eval_enabled_registers_end_session_tool():
+    """When enabled, orchestrator calls tool_registry.register_internal for end_session."""
+    cfg = _config_with_session_end_eval(enabled=True, prompt="Call end_session at goodbye.")
+    agent = _make_agent_with_config(cfg)
+    assert agent._session_end_eval_enabled is True
+    assert agent._session_end_eval_prompt == "Call end_session at goodbye."
+    # register_internal should have been called with name=end_session, route=orchestrator.
+    agent._tool_registry.register_internal.assert_called_once()
+    kwargs = agent._tool_registry.register_internal.call_args.kwargs
+    assert kwargs["name"] == "end_session"
+    assert kwargs["route"] == "orchestrator"
+    assert "reason" in kwargs["input_schema"]["properties"]
+
+
+def test_session_end_eval_disabled_does_not_register_end_session():
+    """When disabled, no register_internal call is made."""
+    cfg = _config_with_session_end_eval(enabled=False)
+    agent = _make_agent_with_config(cfg)
+    agent._tool_registry.register_internal.assert_not_called()
+
+
+def test_session_end_eval_enabled_extends_subagent_tool_defs():
+    """When enabled, every subagent's tool_defs entry gains end_session."""
+    cfg = _config_with_session_end_eval(enabled=True, prompt="p")
+    wf = _make_workflow()
+    # Seed with a pre-existing tool in the subagent's defs list.
+    wf.tool_defs = {"market_truth": [{"name": "existing_tool"}]}
+    _ = _make_agent_with_config(cfg, workflow=wf)
+    names = {t["name"] for t in wf.tool_defs["market_truth"]}
+    assert "end_session" in names
+    assert "existing_tool" in names
+
+
+def test_session_end_eval_prompt_passed_into_build_system_prompt():
+    """process_turn passes session_end_eval_prompt to build_system_prompt when enabled."""
+    cfg = _config_with_session_end_eval(enabled=True, prompt="Call end_session at goodbye.")
+    agent = _make_agent_with_config(cfg)
+    agent.process_turn(_turn_input())
+    kwargs = agent._manager_agent.build_system_prompt.call_args.kwargs
+    assert kwargs.get("session_end_eval_prompt") == "Call end_session at goodbye."
+
+
+def test_session_end_eval_prompt_none_when_disabled():
+    """When disabled, session_end_eval_prompt arg is None."""
+    cfg = _config_with_session_end_eval(enabled=False, prompt="ignored")
+    agent = _make_agent_with_config(cfg)
+    agent.process_turn(_turn_input())
+    kwargs = agent._manager_agent.build_system_prompt.call_args.kwargs
+    assert kwargs.get("session_end_eval_prompt") is None
+
+
+def test_process_turn_threads_session_ended_true_into_turn_result():
+    """When manager.session_ended=True, TurnResult.session_ended is True."""
+    cfg = _config_with_session_end_eval(enabled=True, prompt="p")
+    agent = _make_agent_with_config(cfg)
+    agent._manager_agent.session_ended = True
+    result = agent.process_turn(_turn_input())
+    assert result.session_ended is True
+
+
+def test_process_turn_session_ended_default_false():
+    """When manager.session_ended=False, TurnResult.session_ended is False (default)."""
+    agent = _make_agent()
+    # Default manager mock has no session_ended attr explicitly set → None/Mock; guard below.
+    agent._manager_agent.session_ended = False
+    result = agent.process_turn(_turn_input())
+    assert result.session_ended is False

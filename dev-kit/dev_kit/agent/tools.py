@@ -6,11 +6,13 @@ DPG conversation agent.
 """
 from __future__ import annotations
 
+from pathlib import Path
 import logging
 
 logger = logging.getLogger(__name__)
 
 from dev_kit.agent.accumulator import BLOCKS, PHASES, ConfigAccumulator, ConfigStatus
+from dev_kit.agent.prompts.base import AGENT_TYPES, SHEET_REQUIREMENTS
 from dev_kit.schemas.loader import get_valid_sections
 
 # ---------------------------------------------------------------------------
@@ -61,6 +63,37 @@ TOOL_DEFINITIONS: list[dict] = [
         },
     },
     {
+        "name": "set_agent_type",
+        "description": (
+            "Sets the agent type classification for this project. Valid values: "
+            "transactional, informational, agentic, conversational. Driven by the "
+            "3-question decision tree in the tier phase."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "type": {"type": "string", "enum": AGENT_TYPES},
+            },
+            "required": ["type"],
+        },
+    },
+    {
+        "name": "skip_optional_phase",
+        "description": (
+            "Record that the user has chosen to skip an optional phase. "
+            "Only allowed when SHEET_REQUIREMENTS marks the phase as 'optional' "
+            "for the current agent type. Writes phase_decisions[phase] = skipped_by_user "
+            "to project meta."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "phase": {"type": "string", "enum": PHASES},
+            },
+            "required": ["phase"],
+        },
+    },
+    {
         "name": "set_phase",
         "description": "Advance the conversation to the next phase. Call when you have collected enough information for the current phase.",
         "input_schema": {
@@ -68,7 +101,7 @@ TOOL_DEFINITIONS: list[dict] = [
             "properties": {
                 "phase": {
                     "type": "string",
-                    "enum": ["overview", "language", "knowledge", "memory", "trust", "tools", "workflow", "observability", "reach", "review"],
+                    "enum": PHASES,
                 },
             },
             "required": ["phase"],
@@ -460,9 +493,60 @@ class ToolHandler:
                is called, so the ConversationEngine can trigger a checkpoint.
     """
 
-    def __init__(self, accumulator: ConfigAccumulator, state: dict) -> None:
+    def __init__(
+        self,
+        accumulator: ConfigAccumulator,
+        state: dict,
+        project_path: "Path | None" = None,
+    ) -> None:
         self._acc = accumulator
         self._state = state
+        self._project_path = project_path
+
+    def _read_project_meta(self) -> dict:
+        """Read the persisted project meta dict from disk.
+
+        Falls back to ``state['project_meta']`` (an in-memory copy maintained
+        by ConversationEngine) when no project_path is configured, which is
+        the case in unit tests that do not provide disk state.
+
+        Returns:
+            Parsed project meta dict, or an empty dict if nothing is available.
+        """
+        import json
+
+        if self._project_path is not None:
+            meta_file = self._project_path / "_meta" / "project.json"
+            if meta_file.exists():
+                try:
+                    return json.loads(meta_file.read_text())
+                except json.JSONDecodeError:
+                    return {}
+        return dict(self._state.get("project_meta") or {})
+
+    def _update_project_meta(self, updates: dict) -> None:
+        """Merge ``updates`` into the project meta on disk and in state.
+
+        When no ``project_path`` is configured, updates are applied only to
+        ``state['project_meta']`` so tests and in-memory callers still observe
+        the change.
+
+        Args:
+            updates: Partial meta dict to merge into the stored metadata.
+        """
+        import json
+
+        meta = self._read_project_meta()
+        meta.update(updates)
+        # Mirror into in-memory state for consumers that read from there.
+        state_meta = self._state.setdefault("project_meta", {})
+        state_meta.update(updates)
+        if self._project_path is not None:
+            meta_dir = self._project_path / "_meta"
+            meta_dir.mkdir(parents=True, exist_ok=True)
+            (meta_dir / "project.json").write_text(
+                json.dumps(meta, ensure_ascii=False, indent=2)
+            )
 
     def dispatch(self, tool_name: str, tool_input: dict) -> str:
         """Route a tool call to the appropriate handler.
@@ -479,6 +563,8 @@ class ToolHandler:
         """
         handlers = {
             "set_project_meta": self._handle_set_project_meta,
+            "set_agent_type": self._handle_set_agent_type,
+            "skip_optional_phase": self._handle_skip_optional_phase,
             "update_config": self._handle_update_config,
             "set_phase": self._handle_set_phase,
             "create_subagent": self._handle_create_subagent,
@@ -506,12 +592,73 @@ class ToolHandler:
         self._state["project_meta"].update(inputs)
         return f"Project meta updated: {inputs.get('name', '')} ({inputs.get('slug', '')})"
 
+    def _handle_set_agent_type(self, inputs: dict) -> str:
+        """Record the project's agent type in ``_meta/project.json``.
+
+        Args:
+            inputs: Dict with ``type`` key — one of the AGENT_TYPES values.
+
+        Returns:
+            Confirmation string, or an ERROR string for an invalid type.
+        """
+        agent_type = inputs.get("type", "")
+        if agent_type not in AGENT_TYPES:
+            return f"ERROR — invalid agent type: {agent_type!r}. Must be one of: {AGENT_TYPES}"
+        self._update_project_meta({"agent_type": agent_type})
+        return f"ok: agent_type set to {agent_type}"
+
+    def _handle_skip_optional_phase(self, inputs: dict) -> str:
+        """Record a user-initiated skip of an optional phase.
+
+        Args:
+            inputs: Dict with ``phase`` key naming the phase to skip.
+
+        Returns:
+            Confirmation string, or an ERROR if the phase is not ``optional``
+            for the current agent type.
+        """
+        from datetime import datetime, timezone
+
+        phase = inputs.get("phase", "")
+        meta = self._read_project_meta()
+        agent_type = meta.get("agent_type", "")
+        status = SHEET_REQUIREMENTS.get(phase, {}).get(agent_type, "required")
+        if status != "optional":
+            return (
+                f"ERROR — phase {phase!r} is {status!r} for {agent_type!r} agents; "
+                "cannot skip."
+            )
+        phase_decisions = dict(meta.get("phase_decisions", {}))
+        phase_decisions[phase] = {
+            "status": "skipped_by_user",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        self._update_project_meta({"phase_decisions": phase_decisions})
+        return f"ok: {phase} skipped by user"
+
     def _handle_update_config(self, inputs: dict) -> str:
         from dev_kit.schema import validate_partial
 
         block = inputs["block"]
         section = inputs["section"]
         values = inputs["values"]
+
+        # GH-137 hard-cut: channel configuration has moved to the top-level
+        # `channels` section inside each block. Reject the legacy paths with
+        # explicit migration guidance so the LLM retries with the new path.
+        if block == "agent_core":
+            if section == "agent.channels" or section.startswith("agent.channels."):
+                return (
+                    "ERROR — agent.channels is removed (GH-137). "
+                    "Use section=`channels` at the top level instead "
+                    "(e.g. section=`channels`, values={voice: {...}})."
+                )
+            if section == "reach_layer.channels" or section.startswith("reach_layer.channels."):
+                return (
+                    "ERROR — reach_layer.channels inside agent_core is removed (GH-137). "
+                    "Use section=`channels.<name>.turn_assembler` at the top level for "
+                    "turn_assembler policy overrides."
+                )
 
         # Build the nested partial and validate key names before writing.
         partial: dict = {}
@@ -535,13 +682,38 @@ class ToolHandler:
         return f"ok: updated {block}.{section}"
 
     def _handle_set_phase(self, inputs: dict) -> str:
-        requested = inputs["phase"]
-        current = self._state.get("phase", "overview")
-        current_idx = PHASES.index(current) if current in PHASES else 0
-        requested_idx = PHASES.index(requested) if requested in PHASES else -1
+        """Advance the conversation to ``inputs['phase']``.
 
-        # Only allow moving to the immediately next phase (or staying on the same one).
-        # Skipping phases is not permitted — each phase must be visited in order.
+        Consults SHEET_REQUIREMENTS for the requested phase: if the matrix
+        marks the phase as ``skip`` for the current project's agent type,
+        the phase is auto-advanced and a ``not_applicable_for_type`` entry
+        is written to ``phase_decisions``. When leaving an ``optional``
+        phase the current phase is recorded as ``answered`` unless it was
+        previously skipped by the user.
+
+        Args:
+            inputs: Dict with a ``phase`` key naming a member of PHASES.
+
+        Returns:
+            Human-readable advance/skip message, or an ERROR string when
+            the requested phase is unknown or sequencing is invalid.
+        """
+        from datetime import datetime, timezone
+
+        requested = inputs["phase"]
+        current = self._state.get("phase", PHASES[0])
+
+        if requested not in PHASES:
+            return f"ERROR — unknown phase: {requested!r}"
+
+        current_idx = PHASES.index(current) if current in PHASES else 0
+        requested_idx = PHASES.index(requested)
+
+        if requested_idx < current_idx:
+            return (
+                f"ERROR — cannot go back from '{current}' to '{requested}'. "
+                "Use rollback_to_checkpoint if you need to revisit an earlier phase."
+            )
         if requested_idx > current_idx + 1:
             next_phase = PHASES[current_idx + 1]
             return (
@@ -549,12 +721,45 @@ class ToolHandler:
                 f"You must complete '{next_phase}' next. "
                 f"Call set_phase('{next_phase}') when you are ready."
             )
-        if requested_idx < current_idx:
-            return (
-                f"ERROR — cannot go back from '{current}' to '{requested}'. "
-                f"Use rollback_to_checkpoint if you need to revisit an earlier phase."
-            )
+
+        # Consult SHEET_REQUIREMENTS for the phase we are entering.
+        meta = self._read_project_meta()
+        agent_type = meta.get("agent_type", "")
+        phase_decisions = dict(meta.get("phase_decisions", {}))
+        status = (
+            SHEET_REQUIREMENTS.get(requested, {}).get(agent_type, "optional")
+            if agent_type else "required"
+        )
+
+        if status == "skip":
+            # Auto-advance past this phase; record the decision for audit.
+            phase_decisions[requested] = {
+                "status": "not_applicable_for_type",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+            self._update_project_meta({"phase_decisions": phase_decisions})
+            self._state["phase_changed"] = requested
+            next_idx = requested_idx + 1
+            if next_idx < len(PHASES):
+                return (
+                    f"Phase '{requested}' skipped ({agent_type} agents). "
+                    f"Advancing directly past it. Call set_phase('{PHASES[next_idx]}') next."
+                )
+            return f"Phase '{requested}' skipped ({agent_type} agents)."
+
+        # Required / optional phases are entered normally. When leaving an
+        # 'optional' phase, record the answered decision unless the user
+        # explicitly skipped it via skip_optional_phase.
         self._state["phase_changed"] = requested
+        if current in PHASES and agent_type:
+            if SHEET_REQUIREMENTS.get(current, {}).get(agent_type) == "optional":
+                existing = phase_decisions.get(current, {})
+                if existing.get("status") != "skipped_by_user":
+                    phase_decisions[current] = {
+                        "status": "answered",
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    }
+                    self._update_project_meta({"phase_decisions": phase_decisions})
         return f"Phase advancing to: {requested}"
 
     def _handle_create_subagent(self, inputs: dict) -> str:

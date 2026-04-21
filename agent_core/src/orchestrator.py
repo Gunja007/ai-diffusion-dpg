@@ -121,6 +121,67 @@ class AgentCore(AgentCoreBase):
         self._learning = learning
         self._workflow = workflow
 
+        # Session-end signal (GH-137) — optional, opt-in per domain.
+        session_end_cfg = (self._config or {}).get("conversation", {}).get("session_end_eval", {}) or {}
+        self._session_end_eval_enabled: bool = bool(session_end_cfg.get("enabled", False))
+        self._session_end_eval_prompt: str = str(session_end_cfg.get("prompt", "") or "")
+
+        if self._session_end_eval_enabled:
+            # Register end_session as an internal tool routed to the orchestrator
+            # (no external executor — intercepted by manager_agent's tool loop).
+            end_session_def = {
+                "name": "end_session",
+                "description": (
+                    "Call when the conversation has naturally concluded (user said "
+                    "goodbye, task completed, user asked to stop). Emits the session-"
+                    "end signal to runtime; still include your natural final response "
+                    "text alongside this tool call."
+                ),
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "reason": {
+                            "type": "string",
+                            "enum": [
+                                "user_goodbye",
+                                "task_complete",
+                                "user_requested_stop",
+                                "other",
+                            ],
+                        },
+                    },
+                    "required": ["reason"],
+                },
+            }
+            try:
+                self._tool_registry.register_internal(
+                    name="end_session",
+                    route="orchestrator",
+                    description=end_session_def["description"],
+                    input_schema=end_session_def["input_schema"],
+                )
+            except AttributeError:
+                # Tolerate mock registries in tests that don't implement the method.
+                pass
+            # Ensure every subagent's scoped tool list includes end_session.
+            try:
+                tool_defs = getattr(self._workflow, "tool_defs", None)
+                if isinstance(tool_defs, dict):
+                    for _sa_id, _tools in list(tool_defs.items()):
+                        if not isinstance(_tools, list):
+                            continue
+                        if not any(t.get("name") == "end_session" for t in _tools):
+                            _tools.append(end_session_def)
+            except Exception as _err:  # defensive — never break init
+                logger.warning(
+                    "orchestrator.end_session_tool_defs_extension_failed",
+                    extra={
+                        "operation": "orchestrator.init",
+                        "status": "failure",
+                        "error": f"{type(_err).__name__}: {_err}",
+                    },
+                )
+
         # Async clients for stream_turn() — optional, only needed for streaming
         self._async_memory = async_memory
         self._async_trust = async_trust
@@ -361,6 +422,36 @@ class AgentCore(AgentCoreBase):
                 self._write_memory_sync(session_id, user_id, "session", "user_storage_mode", new_storage_mode)
                 bundle.session["user_storage_mode"] = new_storage_mode
             # if user_storage_mode is set → fall through, skip consent gate entirely
+
+        # ── Opening-phrase gate (Step 1c, GH-137) ────────────────────────
+        # Emit the current subagent's opening_phrase exactly once per session,
+        # on the first post-consent turn. Subsequent turns skip this check.
+        if not bundle.session.get("opening_phrase_emitted", False):
+            current_sa = self._workflow.subagents.get(current_subagent_id)
+            opening_phrase = (getattr(current_sa, "opening_phrase", "") or "").strip()
+
+            # Always set the flag so we don't re-check every turn.
+            self._write_memory_sync(session_id, user_id, "session", "opening_phrase_emitted", True)
+
+            if opening_phrase:
+                # Ensure current_subagent_id is persisted so next turn has it.
+                self._write_memory_sync(session_id, user_id, "session", "current_subagent_id", current_subagent_id)
+                logger.info(
+                    "orchestrator.opening_phrase_emitted",
+                    extra={
+                        "operation": "orchestrator.opening_phrase_gate",
+                        "status": "emitted",
+                        "session_id": session_id,
+                        "subagent_id": current_subagent_id,
+                    },
+                )
+                return TurnResult(
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    response_text=opening_phrase,
+                    latency_ms=int((time.time() - start) * 1000),
+                )
+            # else: empty opening_phrase — flag is set; fall through to normal turn.
 
         # ── Step 2: Resolve current subagent + special handler ────────
         current_subagent: SubAgent = self._workflow.subagents[current_subagent_id]
@@ -742,6 +833,9 @@ class AgentCore(AgentCoreBase):
             is_resumption=is_resumption,
             guardrail_constraints=guardrail_constraints,
             user_state_guidance=user_state_guidance_text,
+            session_end_eval_prompt=(
+                self._session_end_eval_prompt if self._session_end_eval_enabled else None
+            ),
         )
 
         # Clear resumption flag in session so it only affects the first turn
@@ -956,6 +1050,7 @@ class AgentCore(AgentCoreBase):
             do_flush=_do_flush,
             flush_reason=_flush_reason,
             trace_id=_trace_id,
+            session_ended=bool(getattr(self._manager_agent, "session_ended", False)),
         )
 
         logger.info(
@@ -1504,6 +1599,7 @@ class AgentCore(AgentCoreBase):
         do_flush: bool = False,
         flush_reason: str = "",
         trace_id: str = "",
+        session_ended: bool = False,
     ) -> TurnResult:
         """
         Construct the TurnResult and schedule async post-turn work.
@@ -1539,6 +1635,7 @@ class AgentCore(AgentCoreBase):
             was_tool_used=was_tool_used,
             model_used=model_used,
             latency_ms=latency_ms,
+            session_ended=session_ended,
         )
 
         turn_event = TurnEvent(
@@ -1768,18 +1865,25 @@ class AgentCore(AgentCoreBase):
     # ------------------------------------------------------------------
 
     def _resolve_channel_config(self, channel: str) -> dict:
-        """Resolve per-channel config from agent.channels, raising for unsupported channels.
+        """Resolve per-channel config from top-level channels.<name>.
 
         Args:
             channel: Channel name from the inbound TurnInput.
 
         Returns:
-            Channel config dict with at least system_prompt_suffix key.
+            Channel config dict (at minimum has `system_prompt_suffix` key).
 
         Raises:
-            ValueError: If the channel is not present in agent.channels config.
+            ValueError: If the channel is not present in the top-level channels config,
+                OR if the legacy `agent.channels` path is present (hard-cut migration).
         """
-        channels = self._config.get("agent", {}).get("channels", {})
+        if self._config.get("agent", {}).get("channels"):
+            raise ValueError(
+                "agent.channels is removed — migrate to top-level channels.<name> "
+                "(see docs/superpowers/specs/2026-04-21-gh137-framework-uplift-design.md)"
+            )
+
+        channels = self._config.get("channels", {})
         config = channels.get(channel)
         if config is None:
             raise ValueError(f"Unsupported channel: {channel}")
@@ -2388,6 +2492,9 @@ class AgentCore(AgentCoreBase):
                 is_resumption=is_resumption,
                 guardrail_constraints=guardrail_constraints,
                 user_state_guidance=stream_user_state_guidance_text,
+                session_end_eval_prompt=(
+                    self._session_end_eval_prompt if self._session_end_eval_enabled else None
+                ),
             )
 
             if is_resumption:
@@ -2636,6 +2743,7 @@ class AgentCore(AgentCoreBase):
                 model_used=model_used,
                 latency_ms=latency_ms,
                 turn_id=turn_id,
+                session_ended=bool(getattr(self._manager_agent, "session_ended", False)),
             )
 
             # ── Steps 12-13: Async post-turn ───────────────────────────
