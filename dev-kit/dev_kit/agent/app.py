@@ -775,11 +775,28 @@ async def get_deploy_preview(slug: str, body: dict) -> dict:
     """
     target = body.get("target", "docker")
     if target == "docker":
+        # Decrypt secrets here too so preview can show what will be written to disk.
+        encrypted_secrets = body.get("encrypted_secrets", {})
+        secrets = decrypt_secrets_dict(encrypted_secrets) if encrypted_secrets else body.get("secrets", {})
+
         raw = COMPOSE_FILE.read_text() if COMPOSE_FILE.exists() else "# docker-compose.dev.yml not found"
         content = raw.replace("${DOMAIN:-kkb}", slug).replace("${DOMAIN}", slug)
         resources = body.get("resources", {})
         if resources:
             content = _apply_resources_to_compose(content, resources)
+
+        # Inject tool secrets into the preview the same way _run_docker_deploy does,
+        # so the user sees exactly what will be deployed (values masked).
+        tool_secrets = secrets.get("tool_secrets", {})
+        if tool_secrets:
+            import yaml as _yaml
+            compose_doc = _yaml.safe_load(content)
+            ag_env = compose_doc.get("services", {}).get("action_gateway", {}).setdefault("environment", [])
+            for env_var in tool_secrets:
+                if tool_secrets[env_var]:
+                    ag_env.append(f"{env_var}=<set at deploy time>")
+            content = _yaml.dump(compose_doc, default_flow_style=False, sort_keys=False)
+
         return {"target": target, "preview": {"docker-compose.yml": content}}
 
     # Kubernetes — render all 14 charts via helm template
@@ -850,6 +867,30 @@ async def get_deploy_preview(slug: str, body: dict) -> dict:
             for env_var, secret_value in secrets.get("tool_secrets", {}).items():
                 if secret_value:
                     set_values[f"extraSecrets.{env_var}"] = secret_value
+
+        # Inject Azure creds and upload chain auth into knowledge-engine
+        if block_name == "knowledge_engine":
+            if secrets.get("azure_storage_account"):
+                set_values["azure.storageAccount"] = secrets["azure_storage_account"]
+            if secrets.get("azure_storage_key"):
+                set_values["azure.storageKey"] = secrets["azure_storage_key"]
+            if secrets.get("azure_container_name"):
+                set_values["azure.containerName"] = secrets["azure_container_name"]
+            if secrets.get("reach_to_ke_api_key"):
+                set_values["uploadAuth.reachToKeApiKey"] = secrets["reach_to_ke_api_key"]
+            if secrets.get("ke_to_devkit_api_key"):
+                set_values["uploadAuth.keToDevkitApiKey"] = secrets["ke_to_devkit_api_key"]
+            if secrets.get("ke_devkit_callback_url"):
+                set_values["uploadAuth.devkitCallbackUrl"] = secrets["ke_devkit_callback_url"]
+
+        # Inject upload chain auth into reach-layer
+        if block_name == "reach_layer":
+            if secrets.get("devkit_to_reach_api_key"):
+                set_values["uploadAuth.devkitToReachApiKey"] = secrets["devkit_to_reach_api_key"]
+            if secrets.get("reach_to_ke_api_key"):
+                set_values["uploadAuth.reachToKeApiKey"] = secrets["reach_to_ke_api_key"]
+            if secrets.get("ke_internal_url"):
+                set_values["uploadAuth.keInternalUrl"] = secrets["ke_internal_url"]
 
         block_res = resources.get(block_name, {})
         limits = block_res.get("limits", {})
@@ -927,12 +968,19 @@ async def _run_docker_deploy(slug: str, state, secrets: dict, resources: dict) -
         if resources:
             content = _apply_resources_to_compose(content, resources)
 
-        # Strip hardcoded container_name so Docker Compose auto-prefixes
-        # with the project name, avoiding conflicts with other deployments.
+        # Patch the parsed YAML in one pass:
+        #   - strip container_name (avoids conflicts across deployments)
+        #   - inject connector tool secrets directly into action_gateway environment
         import yaml as _yaml
         compose_doc = _yaml.safe_load(content)
-        for svc in compose_doc.get("services", {}).values():
+        tool_secrets = secrets.get("tool_secrets", {})
+        for svc_name, svc in compose_doc.get("services", {}).items():
             svc.pop("container_name", None)
+            if svc_name == "action_gateway" and tool_secrets:
+                env_list = svc.setdefault("environment", [])
+                for env_var, value in tool_secrets.items():
+                    if value:
+                        env_list.append(f"{env_var}={value}")
         content = _yaml.dump(compose_doc, default_flow_style=False, sort_keys=False)
 
         # Write to a temp file next to the original so relative paths resolve
@@ -1046,6 +1094,30 @@ async def _run_k8s_deploy(slug: str, state, secrets: dict, resources: dict, kube
                         for env_var, secret_value in secrets.get("tool_secrets", {}).items():
                             if secret_value:
                                 set_values[f"extraSecrets.{env_var}"] = secret_value
+
+                    # Inject Azure creds and upload chain auth into knowledge-engine
+                    if svc_name == "knowledge_engine":
+                        if secrets.get("azure_storage_account"):
+                            set_values["azure.storageAccount"] = secrets["azure_storage_account"]
+                        if secrets.get("azure_storage_key"):
+                            set_values["azure.storageKey"] = secrets["azure_storage_key"]
+                        if secrets.get("azure_container_name"):
+                            set_values["azure.containerName"] = secrets["azure_container_name"]
+                        if secrets.get("reach_to_ke_api_key"):
+                            set_values["uploadAuth.reachToKeApiKey"] = secrets["reach_to_ke_api_key"]
+                        if secrets.get("ke_to_devkit_api_key"):
+                            set_values["uploadAuth.keToDevkitApiKey"] = secrets["ke_to_devkit_api_key"]
+                        if secrets.get("ke_devkit_callback_url"):
+                            set_values["uploadAuth.devkitCallbackUrl"] = secrets["ke_devkit_callback_url"]
+
+                    # Inject upload chain auth into reach-layer
+                    if svc_name == "reach_layer":
+                        if secrets.get("devkit_to_reach_api_key"):
+                            set_values["uploadAuth.devkitToReachApiKey"] = secrets["devkit_to_reach_api_key"]
+                        if secrets.get("reach_to_ke_api_key"):
+                            set_values["uploadAuth.reachToKeApiKey"] = secrets["reach_to_ke_api_key"]
+                        if secrets.get("ke_internal_url"):
+                            set_values["uploadAuth.keInternalUrl"] = secrets["ke_internal_url"]
 
                     block_res = resources.get(svc_name, {})
                     limits = block_res.get("limits", {})

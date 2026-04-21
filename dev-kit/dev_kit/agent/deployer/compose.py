@@ -199,13 +199,37 @@ async def run_compose_up(
         if secrets.get("memgraph_password"):
             env["MEMGRAPH_PASSWORD"] = secrets["memgraph_password"]
         if secrets.get("redis_password"):
-            env["REDIS_PASSWORD"] = secrets["redis_password"]
+            # Build password-authenticated URL; the compose file interpolates REDIS_URL.
+            env["REDIS_URL"] = f"redis://:{secrets['redis_password']}@redis:6379/0"
         if secrets.get("grafana_admin_password"):
             env["GF_SECURITY_ADMIN_PASSWORD"] = secrets["grafana_admin_password"]
         if secrets.get("google_client_id"):
             env["GOOGLE_CLIENT_ID"] = secrets["google_client_id"]
         if secrets.get("reach_session_secret"):
             env["REACH_SESSION_SECRET"] = secrets["reach_session_secret"]
+        # Upload chain auth — resolves ${VAR:-} placeholders in the compose file
+        _upload_chain = {
+            "devkit_to_reach_api_key": "DEVKIT_TO_REACH_API_KEY",
+            "ke_to_devkit_api_key": "KE_TO_DEVKIT_API_KEY",
+            "reach_to_ke_api_key": "REACH_TO_KE_API_KEY",
+        }
+        for secret_key, env_var in _upload_chain.items():
+            if secrets.get(secret_key):
+                env[env_var] = secrets[secret_key]
+        # Internal service URLs — allow override when services run at non-default addresses
+        if secrets.get("ke_internal_url"):
+            env["KE_INTERNAL_URL"] = secrets["ke_internal_url"]
+        if secrets.get("ke_devkit_callback_url"):
+            env["KE_DEVKIT_CALLBACK_URL"] = secrets["ke_devkit_callback_url"]
+        # Azure Blob Storage — resolves ${VAR:-} placeholders in the compose file
+        _azure = {
+            "azure_storage_account": "AZURE_STORAGE_ACCOUNT",
+            "azure_storage_key": "AZURE_STORAGE_KEY",
+            "azure_container_name": "AZURE_CONTAINER_NAME",
+        }
+        for secret_key, env_var in _azure.items():
+            if secrets.get(secret_key):
+                env[env_var] = secrets[secret_key]
 
     try:
         proc = await asyncio.create_subprocess_exec(
