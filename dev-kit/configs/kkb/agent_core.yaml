@@ -5,11 +5,25 @@ agent:
   primary_model: claude-haiku-4-5-20251001
   fallback_model: claude-haiku-4-5-20251001
   ask_for_consent: true
-  consent_prompt: "Namaste! Kya main aapki trade aur location yaad rakh sakta hoon? Isse agle baar aapko dobara batana nahi padega."
+  consent_prompt: "नमस्ते! क्या मैं आपकी ट्रेड और लोकेशन याद रख सकती हूँ? इससे अगली बार आपको दोबारा बताना नहीं पड़ेगा।"
 
 channels:
   voice:
-    system_prompt_suffix: "1-2 chhote vakya bolein. Bullet points ya markdown mat use karein."
+    system_prompt_suffix: |
+      You are conversing over the phone, so keep responses short and simple. Do not emit any markdown or emojis.
+
+      <!-- tts_rules:begin -->
+      (auto-generated from channels.voice.tts_rules; edit tts_rules to change)
+      TTS formatting rules (voice channel):
+      - Numbers: Write all numbers in words in Devanagari. Never use digits in spoken output. Examples: 2 → दो, 350 → तीन सौ पचास, 24 → चौबीस, 48 → अड़तालीस.
+      - Money: Always speak monetary amounts in full words. Examples: ₹13,000–₹17,000 → तेरह हज़ार से सत्रह हज़ार, ₹500/day → पाँच सौ रुपये दिन का.
+      - Dates: Write dates in full spoken form, never use short formats. Example: 29/01/2026 → उनतीस जनवरी दो हज़ार छब्बीस.
+      - Time: Use सुबह/दोपहर/शाम/रात instead of AM/PM. Example: 3 PM → दोपहर तीन बजे, 10 AM → सुबह दस बजे.
+      - Phone numbers: Say each digit one by one in words. Example: 9876543210 → नौ, आठ, सात, छह, पाँच, चार, तीन, दो, एक, शून्य.
+      - Abbreviations: Expand abbreviations as spoken letters in Devanagari. Examples: PMKVY → पी एम के वी वाय, NCVT → एन सी वी टी, GST → जी एस टी, ITI → आई टी आई.
+      - Output script: All Hindi and Hinglish output MUST be in Devanagari script only. Never use Roman script for Hindi words. Examples: job → जॉब, market → मार्केट, skill → स्किल, option → ऑप्शन.
+      - English loanwords: Write English words used in Hindi speech in Devanagari transliteration. Examples: apply → अप्लाई, verified → वेरिफाइड, WhatsApp → व्हाट्सऐप, signal → सिग्नल, data → डेटा, location → लोकेशन, district → डिस्ट्रिक्ट.
+      <!-- tts_rules:end -->
     terminal_word: "Goodbye"
     tts_rules:
       numbers: >
@@ -282,7 +296,13 @@ preprocessing:
     code_switching: true
 
   nlu_processor:
-    model: claude-haiku-4-5-20251001
+    # GH-151 follow-up: moved from Haiku-4.5 to Sonnet-4.6 so prompt caching
+    # actually triggers. Haiku requires ~2048 cacheable tokens to start
+    # caching; the KKB NLU system prompt is ~1100 tokens, so on Haiku every
+    # call was a cold read (~1.8 s). Sonnet's 1024-token minimum means the
+    # same prompt is cached from turn 2 onward, dropping NLU latency to
+    # ~500–800 ms once warm.
+    model: claude-sonnet-4-6
     confidence_threshold: 0.5
     user_state_confidence_threshold: 0.4  # (GH-139) below this, state classification stays sticky
     domain_instruction: |
@@ -413,24 +433,6 @@ hitl:
 agent_workflow:
   workflow_id: kkb_iti_graduate
   version: "1.0.0"
-
-  # Maps next_subagent_id → mental_state value written to session after routing resolves.
-  # Keeps the Five Mental States aligned with conversation progression automatically.
-  subagent_mental_state_map:
-    profile_building: fog
-    profile_incomplete: fog
-    market_truth: orientation
-    pay_branch: orientation
-    distance_branch: orientation
-    normalise_branch: orientation
-    skill_check: orientation
-    evaluation: evaluation
-    commitment: commitment
-    counsellor_request: commitment
-    follow_through: follow_through
-    capture_dropoff: fog          # Drop-off resets to fog for next re-engagement
-    ended: fog
-    clarification: fog
 
   # Maps tool name → journey_event config for persisting tool outputs to Neo4j child nodes.
   # result_list_key: if the result dict contains a list under this key, one node is created per item.
@@ -698,7 +700,9 @@ agent_workflow:
         - skip_question
         - profile_complete
 
-      tools: []
+      tools:
+        - get_profile
+        - update_profile
 
       system_prompt: |
         ## INTRODUCTION PRIORITY RULE — Check FIRST before anything else
@@ -718,7 +722,7 @@ agent_workflow:
         If this is a new user with no profile in memory:
           1. Say you do not have their profile data and ask permission to fetch it:
              "मेरे पास अभी आपकी प्रोफाइल की जानकारी नहीं है। क्या मैं आपकी प्रोफाइल fetch कर सकती हूँ?"
-          2. If user agrees: call the profile fetch tool. If profile found: give a brief summary of what
+          2. If user agrees: call get_profile. If profile found: give a brief summary of what
              you found, then ask one open-ended question — do NOT immediately call another tool.
           3. If user declines or profile not found: continue naturally with one opening question.
 
@@ -1261,9 +1265,10 @@ agent_workflow:
         - connect_counsellor
         - action_declined   # User backs out at last moment
 
-      tools: []
-        # onest_apply and counsellor_schedule are commented out in action_gateway.yaml (not yet live).
-        # Add them back here once the connectors are uncommented and the env secrets are set.
+      tools:
+        - apply_job
+        # counsellor_schedule is commented out in action_gateway.yaml (not yet live).
+        # Add it back here once the connector is uncommented and the env secret is set.
 
       system_prompt: |
         The user has decided to act. This is the final commitment stage.
