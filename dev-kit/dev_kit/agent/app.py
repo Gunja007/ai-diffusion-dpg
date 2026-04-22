@@ -74,6 +74,15 @@ _KE_TO_DEVKIT_API_KEY = os.environ.get("KE_TO_DEVKIT_API_KEY", "")
 _DEVKIT_TO_REACH_API_KEY = os.environ.get("DEVKIT_TO_REACH_API_KEY", "")
 _REACH_LAYER_URL = os.environ.get("REACH_LAYER_URL", "http://localhost:8005")
 
+# Upload-chain API keys — generated once per dev-kit process if not pre-set via env.
+# Written to secrets at deploy time so all services share the same keys.
+import secrets as _secrets_module
+_UPLOAD_CHAIN_KEYS: dict[str, str] = {
+    "devkit_to_reach_api_key": _DEVKIT_TO_REACH_API_KEY or "",
+    "reach_to_ke_api_key": os.environ.get("REACH_TO_KE_API_KEY", ""),
+    "ke_to_devkit_api_key": _KE_TO_DEVKIT_API_KEY or "",
+}
+
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
@@ -171,7 +180,7 @@ def create_project(body: CreateProjectRequest) -> dict:
         "slug": slug,
         "name": body.name,
         "description": body.description,
-        "current_phase": "overview",
+        "current_phase": "tier",
         "phases_completed": [],
         "agent_type": "",
         "phase_decisions": {},
@@ -709,9 +718,14 @@ def _apply_resources_to_compose(content: str, resources: dict) -> str:
         return content
 
     for block_name, res in resources.items():
-        if block_name not in compose["services"]:
+        # Presets use underscores (action_gateway); compose uses dashes (action-gateway).
+        compose_name = block_name.replace("_", "-")
+        # reach_layer maps to reach-layer-web in compose
+        if compose_name == "reach-layer":
+            compose_name = "reach-layer-web"
+        if compose_name not in compose["services"]:
             continue
-        svc = compose["services"][block_name]
+        svc = compose["services"][compose_name]
         limits = res.get("limits", {})
         if limits:
             # Convert K8s CPU (e.g. "500m") to Docker cpus (e.g. "0.5")
@@ -773,6 +787,11 @@ async def get_deploy_preview(slug: str, body: dict) -> dict:
         Dict with ``target`` and ``preview`` keys. Preview contains rendered
         deployment manifests keyed by filename.
     """
+    _CHANNEL_SERVICE: dict[str, str] = {
+        "web": "reach-layer-web",
+        "voice": "reach-layer-voice",
+        "cli": "reach-layer-cli",
+    }
     target = body.get("target", "docker")
     if target == "docker":
         # Decrypt secrets here too so preview can show what will be written to disk.
@@ -785,17 +804,36 @@ async def get_deploy_preview(slug: str, body: dict) -> dict:
         if resources:
             content = _apply_resources_to_compose(content, resources)
 
-        # Inject tool secrets into the preview the same way _run_docker_deploy does,
-        # so the user sees exactly what will be deployed (values masked).
+        # Apply channel selection: remove reach services for unselected channels so
+        # the preview matches exactly what _run_docker_deploy will deploy.
+        selected_channels = _get_engine(slug).accumulator.get_reach_channel_selection()
+        services_to_remove = {
+            svc_name
+            for channel, svc_name in _CHANNEL_SERVICE.items()
+            if channel not in selected_channels
+        }
+        # ngrok depends_on reach_layer_voice (tunnels port 8006 for Vobiz webhooks).
+        # Remove it if voice is not selected.
+        if "voice" not in selected_channels:
+            services_to_remove.add("ngrok")
+        services_to_remove.add("dev-kit")
+
+        import yaml as _yaml
+        compose_doc = _yaml.safe_load(content)
         tool_secrets = secrets.get("tool_secrets", {})
-        if tool_secrets:
-            import yaml as _yaml
-            compose_doc = _yaml.safe_load(content)
-            ag_env = compose_doc.get("services", {}).get("action_gateway", {}).setdefault("environment", [])
-            for env_var in tool_secrets:
-                if tool_secrets[env_var]:
-                    ag_env.append(f"{env_var}=<set at deploy time>")
-            content = _yaml.dump(compose_doc, default_flow_style=False, sort_keys=False)
+        services = compose_doc.get("services", {})
+        for svc_name in list(services.keys()):
+            if svc_name in services_to_remove:
+                del services[svc_name]
+                continue
+            svc = services[svc_name]
+            svc.pop("container_name", None)
+            if svc_name == "action-gateway" and tool_secrets:
+                ag_env = svc.setdefault("environment", [])
+                for env_var in tool_secrets:
+                    if tool_secrets[env_var]:
+                        ag_env.append(f"{env_var}=<set at deploy time>")
+        content = _yaml.dump(compose_doc, default_flow_style=False, sort_keys=False)
 
         return {"target": target, "preview": {"docker-compose.yml": content}}
 
@@ -936,6 +974,53 @@ async def execute_deploy(slug: str, body: dict) -> dict:
     secrets = decrypt_secrets_dict(encrypted_secrets) if encrypted_secrets else body.get("secrets", {})
     resources = body.get("resources", {})
 
+    # Auto-generate upload-chain API keys if not supplied by the caller.
+    # These are internal service-to-service credentials — never entered by the user.
+    # We generate them once per deploy and inject them into every service that needs them.
+    # We also update the in-process globals so the devkit ingest proxy uses the same keys.
+    global _DEVKIT_TO_REACH_API_KEY, _KE_TO_DEVKIT_API_KEY
+    for key_name in ("devkit_to_reach_api_key", "reach_to_ke_api_key", "ke_to_devkit_api_key"):
+        if not secrets.get(key_name):
+            # Reuse the process-level key if already generated (survives redeploy in same session)
+            existing = _UPLOAD_CHAIN_KEYS.get(key_name, "")
+            if not existing:
+                existing = _secrets_module.token_urlsafe(32)
+                _UPLOAD_CHAIN_KEYS[key_name] = existing
+            secrets[key_name] = existing
+
+    # Sync the ingest-proxy globals so POST /api/ingest/submit authenticates correctly.
+    _DEVKIT_TO_REACH_API_KEY = secrets["devkit_to_reach_api_key"]
+    _KE_TO_DEVKIT_API_KEY = secrets["ke_to_devkit_api_key"]
+
+    # For Kubernetes deployments, reach-layer is exposed as NodePort 30805 on the cluster node.
+    # Update the global so the ingest proxy routes to the right host:port after deploy.
+    global _REACH_LAYER_URL
+    if target == "kubernetes":
+        node_ip = body.get("node_ip", "")
+        if not node_ip:
+            # Default to the Colima VM address; operator can override via node_ip in request.
+            node_ip = "192.168.5.1"
+        _REACH_LAYER_URL = f"http://{node_ip}:30805"
+    elif target == "docker":
+        _REACH_LAYER_URL = "http://localhost:8005"
+
+    # Auto-fill ke_internal_url based on target if not already provided.
+    if not secrets.get("ke_internal_url"):
+        if target == "kubernetes":
+            namespace = body.get("namespace", "dpg")
+            secrets["ke_internal_url"] = f"http://knowledge-engine.{namespace}.svc.cluster.local:8001"
+        else:
+            # Docker Compose: KE is reachable on its service name within the compose network.
+            secrets["ke_internal_url"] = "http://knowledge-engine:8001"
+
+    # Auto-fill ke_devkit_callback_url from devkit external_url if not provided.
+    # KE calls this URL when an ingestion job completes (ingested or failed).
+    # If empty, KE skips the callback and the frontend polls for status instead.
+    if not secrets.get("ke_devkit_callback_url"):
+        devkit_ext = _DEVKIT_CONFIG.external_url
+        if devkit_ext:
+            secrets["ke_devkit_callback_url"] = f"{devkit_ext.rstrip('/')}/api/ingest/callback"
+
     # Mark all services as queued initially
     all_services = [
         "redis", "memgraph", "otel_collector", "jaeger", "prometheus", "loki", "grafana",
@@ -946,7 +1031,8 @@ async def execute_deploy(slug: str, body: dict) -> dict:
         state.set_service(svc, "queued")
 
     if target == "docker":
-        asyncio.create_task(_run_docker_deploy(slug, state, secrets, resources))
+        selected_channels = _get_engine(slug).accumulator.get_reach_channel_selection()
+        asyncio.create_task(_run_docker_deploy(slug, state, secrets, resources, selected_channels))
     else:
         kubeconfig_content = body.get("kubeconfig", "")
         namespace = body.get("namespace", "dpg")
@@ -955,11 +1041,28 @@ async def execute_deploy(slug: str, body: dict) -> dict:
     return {"status": "started", "target": target}
 
 
-async def _run_docker_deploy(slug: str, state, secrets: dict, resources: dict) -> None:
+async def _run_docker_deploy(
+    slug: str,
+    state,
+    secrets: dict,
+    resources: dict,
+    selected_channels: list[str] | None = None,
+) -> None:
     """Background task: apply resources, resolve domain, and run docker compose up."""
     import tempfile
     from dev_kit.agent.deployer.compose import run_compose_up
     from dev_kit.agent.deployer.helm import DEPLOY_PHASES
+
+    # Map channel name → compose service name. CLI is already profile-gated in the
+    # compose file so it never starts with `docker compose up`; web/voice need explicit
+    # removal when not selected.
+    _CHANNEL_SERVICE: dict[str, str] = {
+        "web": "reach-layer-web",
+        "voice": "reach-layer-voice",
+        "cli": "reach-layer-cli",
+    }
+    if selected_channels is None:
+        selected_channels = ["web", "voice", "cli"]
 
     try:
         # Read compose file, apply domain and resources
@@ -970,13 +1073,34 @@ async def _run_docker_deploy(slug: str, state, secrets: dict, resources: dict) -
 
         # Patch the parsed YAML in one pass:
         #   - strip container_name (avoids conflicts across deployments)
+        #   - remove reach_layer_* services for unselected channels
         #   - inject connector tool secrets directly into action_gateway environment
         import yaml as _yaml
         compose_doc = _yaml.safe_load(content)
         tool_secrets = secrets.get("tool_secrets", {})
-        for svc_name, svc in compose_doc.get("services", {}).items():
+
+        # Determine which reach_layer services to remove
+        services_to_remove = {
+            svc_name
+            for channel, svc_name in _CHANNEL_SERVICE.items()
+            if channel not in selected_channels
+        }
+        # ngrok depends_on reach_layer_voice (tunnels port 8006 for Vobiz webhooks).
+        # Remove it if voice is not selected.
+        if "voice" not in selected_channels:
+            services_to_remove.add("ngrok")
+        # When deploying from the local dev-kit, exclude the Docker dev-kit service
+        # to avoid port 8080 conflicts. The local process handles the UI + ingest proxy.
+        services_to_remove.add("dev-kit")
+
+        services = compose_doc.get("services", {})
+        for svc_name in list(services.keys()):
+            if svc_name in services_to_remove:
+                del services[svc_name]
+                continue
+            svc = services[svc_name]
             svc.pop("container_name", None)
-            if svc_name == "action_gateway" and tool_secrets:
+            if svc_name == "action-gateway" and tool_secrets:
                 env_list = svc.setdefault("environment", [])
                 for env_var, value in tool_secrets.items():
                     if value:
@@ -1110,7 +1234,8 @@ async def _run_k8s_deploy(slug: str, state, secrets: dict, resources: dict, kube
                         if secrets.get("ke_devkit_callback_url"):
                             set_values["uploadAuth.devkitCallbackUrl"] = secrets["ke_devkit_callback_url"]
 
-                    # Inject upload chain auth into reach-layer
+                    # Inject upload chain auth into reach-layer and expose as NodePort
+                    # so the local dev-kit can reach it directly from outside the cluster.
                     if svc_name == "reach_layer":
                         if secrets.get("devkit_to_reach_api_key"):
                             set_values["uploadAuth.devkitToReachApiKey"] = secrets["devkit_to_reach_api_key"]
@@ -1118,6 +1243,10 @@ async def _run_k8s_deploy(slug: str, state, secrets: dict, resources: dict, kube
                             set_values["uploadAuth.reachToKeApiKey"] = secrets["reach_to_ke_api_key"]
                         if secrets.get("ke_internal_url"):
                             set_values["uploadAuth.keInternalUrl"] = secrets["ke_internal_url"]
+                        # Expose reach-layer as NodePort so local dev-kit can call it for uploads.
+                        # Fixed port 30805 avoids conflicts and is predictable for the ingest proxy.
+                        set_values["service.type"] = "NodePort"
+                        set_values["service.nodePort"] = "30805"
 
                     block_res = resources.get(svc_name, {})
                     limits = block_res.get("limits", {})
@@ -1196,28 +1325,47 @@ async def get_deploy_status(slug: str) -> dict:
     if not state:
         return {"services": [], "overall": "idle"}
 
-    # For completed/failed deployments, also try to get live status
-    if state.overall in ("complete", "failed"):
-        if state.target == "docker" and state.compose_file_path:
-            from dev_kit.agent.deployer.compose import get_compose_status
+    # For Docker deployments, always poll live container status so the UI
+    # gets real-time updates (compose up -d returns quickly but containers
+    # take time to become healthy).
+    # Compose service names use dashes; state keys use underscores.
+    _COMPOSE_TO_STATE = {
+        "action-gateway": "action_gateway",
+        "agent-core": "agent_core",
+        "knowledge-engine": "knowledge_engine",
+        "memory-layer": "memory_layer",
+        "trust-layer": "trust_layer",
+        "observability-layer": "observability_layer",
+        "reach-layer-web": "reach_layer",
+        "reach-layer-voice": "reach_layer",
+        "otelcol": "otel_collector",
+    }
+    if state.target == "docker" and state.compose_file_path:
+        from dev_kit.agent.deployer.compose import get_compose_status
 
-            containers = await get_compose_status(state.compose_file_path, project_name=f"dpg-{slug}")
-            if containers:
-                for c in containers:
-                    svc_name = c.get("Service", c.get("Name", ""))
-                    c_state = c.get("State", "")
-                    c_status = c.get("Status", "")
-                    if c_state == "running":
-                        status = "healthy" if "healthy" in c_status.lower() else "running"
-                    elif c_state == "exited":
-                        status = "failed"
-                    else:
-                        status = c_state
+        containers = await get_compose_status(state.compose_file_path, project_name=f"dpg-{slug}")
+        if containers:
+            for c in containers:
+                compose_name = c.get("Service", c.get("Name", ""))
+                svc_name = _COMPOSE_TO_STATE.get(compose_name, compose_name)
+                c_state = c.get("State", "")
+                c_status = c.get("Status", "")
+                if c_state == "running":
+                    status = "healthy" if "healthy" in c_status.lower() else "running"
+                elif c_state == "exited":
+                    status = "failed"
+                else:
+                    status = c_state
+                if svc_name in state.services:
                     state.set_service(svc_name, status)
-                statuses = {s["status"] for s in state.services.values()}
+            statuses = {s["status"] for s in state.services.values()}
+            if state.overall != "deploying":
                 state.overall = "failed" if "failed" in statuses else "complete"
+            elif all(s in ("healthy", "running") for s in statuses):
+                state.overall = "complete"
 
-        elif state.target == "kubernetes" and state.kubeconfig_path:
+    elif state.overall in ("complete", "failed"):
+        if state.target == "kubernetes" and state.kubeconfig_path:
             from dev_kit.agent.deployer.helm import get_pod_status
 
             pods = await get_pod_status(state.namespace, state.kubeconfig_path)

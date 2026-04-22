@@ -18,6 +18,49 @@ _DRAFT_HEADER = "# STATUS: draft — block template not yet finalized\n"
 _STALE_HEADER_TPL = "# STATUS: stale — validation errors detected:\n{errors}\n"
 
 
+def _sync_agent_core_intents(data: dict) -> dict:
+    """Ensure NLU processor intents cover every intent referenced in the agent workflow.
+
+    Collects all intents declared in subagent ``valid_intents`` and the workflow
+    ``global_intents`` list, then adds any that are absent from
+    ``preprocessing.nlu_processor.intents``.  The sentinel value ``"other"`` is
+    excluded — it is handled by the router as a catch-all and must not appear in
+    the NLU classifier's label set.
+
+    Args:
+        data: Cleaned agent_core block dict (``_``-prefixed keys already stripped).
+
+    Returns:
+        Updated dict with a complete NLU intents list.
+    """
+    workflow: dict = data.get("agent_workflow", {})
+    if not workflow:
+        return data
+
+    # Gather every intent mentioned in the workflow.
+    workflow_intents: set[str] = set()
+    for subagent in workflow.get("subagents", []):
+        for intent in subagent.get("valid_intents", []):
+            workflow_intents.add(intent)
+    for intent in workflow.get("global_intents", []):
+        workflow_intents.add(intent)
+
+    # "other" is a router catch-all — not a real NLU label.
+    workflow_intents.discard("other")
+
+    # Locate (or create) the NLU intents list.
+    preprocessing: dict = data.setdefault("preprocessing", {})
+    nlu: dict = preprocessing.setdefault("nlu_processor", {})
+    existing: list[str] = nlu.get("intents", [])
+    existing_set: set[str] = set(existing)
+
+    missing = workflow_intents - existing_set
+    if missing:
+        nlu["intents"] = existing + sorted(missing)
+
+    return data
+
+
 def render_all(project_path: Path, accumulator: ConfigAccumulator) -> dict[str, ConfigStatus]:
     """Write all 7 block config YAML files and return their statuses.
 
@@ -65,9 +108,10 @@ def render_block(project_path: Path, block: str, accumulator: ConfigAccumulator)
         accumulator.set_status(block, ConfigStatus.PENDING)
         return
 
-    # Runtime (Agent Core) only reads channels.voice.system_prompt_suffix; merge
-    # the canonical channels.voice.tts_rules into it on the way to disk.
+    # For agent_core, ensure NLU intents cover all workflow routing intents
+    # and merge voice TTS rules into the system prompt suffix.
     if block == "agent_core":
+        data = _sync_agent_core_intents(data)
         data = merge_voice_tts_into_suffix(data)
 
     yaml_content = yaml.dump(data, default_flow_style=False, allow_unicode=True, sort_keys=False)
