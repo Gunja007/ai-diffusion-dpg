@@ -52,6 +52,7 @@ from src.models import (
     SignalEvent,
     StreamEvent,
     ToolCall,
+    ToolResult,
     TrustCheckResult,
     TurnEvent,
     TurnInput,
@@ -1549,6 +1550,125 @@ class AgentCore(AgentCoreBase):
         )
 
     # ------------------------------------------------------------------
+    # Private: cross-turn tool_use/tool_result replay (issue #193)
+    # ------------------------------------------------------------------
+
+    def _recent_tool_exchanges_caps(self) -> tuple[int, int]:
+        """Return ``(max_items, max_chars)`` for cross-turn tool replay.
+
+        Reads ``agent.recent_tool_exchanges.max_items`` and
+        ``agent.recent_tool_exchanges.max_chars`` from config, falling back
+        to (3, 4000) which mirrors the action_gateway default
+        ``max_size_chars``.
+
+        Returns:
+            Tuple of (max_items, max_chars). Either may be 0 to disable.
+        """
+        cfg = self._config.get("agent", {}).get("recent_tool_exchanges", {}) or {}
+        max_items = int(cfg.get("max_items", 3))
+        max_chars = int(cfg.get("max_chars", 4000))
+        return max_items, max_chars
+
+    @staticmethod
+    def _build_tool_exchange_messages(
+        exchanges: list[dict],
+    ) -> list[dict]:
+        """Convert persisted tool exchange records into Anthropic messages.
+
+        Each exchange is rendered as one ``assistant`` message containing
+        all of its ``tool_use`` blocks followed by one ``user`` message
+        containing the matching ``tool_result`` blocks, exactly as the
+        Anthropic tool-use protocol requires.
+
+        Args:
+            exchanges: Ordered list of exchange dicts as persisted by
+                ``_capture_tool_exchange``. Malformed entries are skipped.
+
+        Returns:
+            Flat list of ``messages`` dicts ready to prepend to a turn's
+            ``messages`` array.
+        """
+        out: list[dict] = []
+        if not exchanges:
+            return out
+        for ex in exchanges:
+            if not isinstance(ex, dict):
+                continue
+            uses = ex.get("tool_uses") or []
+            results = ex.get("tool_results") or []
+            if not uses or not results:
+                continue
+            out.append({"role": "assistant", "content": list(uses)})
+            out.append({"role": "user", "content": list(results)})
+        return out
+
+    @staticmethod
+    def _truncate_tool_result_content(content: str, max_chars: int) -> str:
+        """Truncate a tool_result payload to ``max_chars`` characters.
+
+        Args:
+            content: Raw text payload (already string-form).
+            max_chars: Hard cap; values <= 0 disable truncation.
+
+        Returns:
+            The original string if within the cap, otherwise a clipped
+            string.
+        """
+        if max_chars <= 0 or not content:
+            return content
+        if len(content) <= max_chars:
+            return content
+        return content[:max_chars]
+
+    def _capture_tool_exchange(
+        self,
+        tool_calls: list,
+        tool_results: list,
+        max_chars: int,
+    ) -> dict | None:
+        """Build a single persistable exchange from one tool round.
+
+        Args:
+            tool_calls: ``ToolCall`` objects executed in this round.
+            tool_results: Anthropic-schema tool_result content dicts that
+                were appended to ``messages`` after the round.
+            max_chars: Per-result content cap.
+
+        Returns:
+            A dict with ``tool_uses`` and ``tool_results`` keys, or
+            ``None`` if either side is empty.
+        """
+        if not tool_calls or not tool_results:
+            return None
+        uses: list[dict] = []
+        for tc in tool_calls:
+            uses.append(
+                {
+                    "type": "tool_use",
+                    "id": tc.tool_use_id,
+                    "name": tc.tool_name,
+                    "input": tc.input_params or {},
+                }
+            )
+        results: list[dict] = []
+        for tr in tool_results:
+            if not isinstance(tr, dict):
+                continue
+            content = tr.get("content", "")
+            if not isinstance(content, str):
+                content = str(content)
+            results.append(
+                {
+                    "type": "tool_result",
+                    "tool_use_id": tr.get("tool_use_id", ""),
+                    "content": self._truncate_tool_result_content(content, max_chars),
+                }
+            )
+        if not uses or not results:
+            return None
+        return {"tool_uses": uses, "tool_results": results}
+
+    # ------------------------------------------------------------------
     # Private: schedule async flush for early exit paths
     # ------------------------------------------------------------------
 
@@ -2104,6 +2224,19 @@ class AgentCore(AgentCoreBase):
         nlu_result = NLUResult(intent="unknown", entities={}, sentiment="neutral", confidence=0.0)
         all_tool_calls: list[ToolCall] = []
         full_response_text = ""
+        # GH-191: Track end_session locally for the streaming path. The sync
+        # path mutates ``manager_agent._session_ended_flag`` inside ``run_turn``;
+        # the streaming tool loop bypasses that method, so we must compute the
+        # signal here. Reset the manager flag too in case a prior sync turn left
+        # it set on this AgentCore instance.
+        session_ended = False
+        try:
+            self._manager_agent._reset_turn_flags()
+        except AttributeError:
+            # Test doubles or alternative manager implementations may omit this
+            # helper; default to clearing the attribute when present.
+            if hasattr(self._manager_agent, "_session_ended_flag"):
+                self._manager_agent._session_ended_flag = False
 
         logger.info(
             "orchestrator.stream_turn_start",
@@ -2635,6 +2768,37 @@ class AgentCore(AgentCoreBase):
                 current_question=current_question,
             )
 
+            # ── #193: prepend prior tool_use/tool_result exchanges ──────
+            # Persisted by this same path on the previous turn under the
+            # session-scoped ``recent_tool_exchanges`` key. Replaying them
+            # as real Anthropic tool-use messages keeps the LLM aware of
+            # results it has already seen, so it does not re-invoke the
+            # same tool with identical params on every follow-up turn.
+            _max_items, _max_chars = self._recent_tool_exchanges_caps()
+            _prior_exchanges_raw = bundle.session.get("recent_tool_exchanges") or []
+            if not isinstance(_prior_exchanges_raw, list):
+                _prior_exchanges_raw = []
+            _prior_exchanges: list[dict] = list(_prior_exchanges_raw)
+            if _max_items > 0 and _prior_exchanges:
+                _replay_msgs = self._build_tool_exchange_messages(
+                    _prior_exchanges[-_max_items:]
+                )
+                if _replay_msgs:
+                    messages = _replay_msgs + messages
+                    logger.info(
+                        "orchestrator.stream_turn_tool_replay",
+                        extra={
+                            "operation": "orchestrator.stream_turn",
+                            "status": "success",
+                            "session_id": session_id,
+                            "replayed_exchanges": len(_replay_msgs) // 2,
+                        },
+                    )
+
+            # Tool exchanges captured during *this* turn's tool rounds; persisted
+            # at the end of the turn so the next turn can replay them.
+            _captured_exchanges_this_turn: list[dict] = []
+
             if not messages:
                 yield DoneEvent(turn_id=turn_id, latency_ms=int((time.time() - start) * 1000))
                 return
@@ -2644,6 +2808,20 @@ class AgentCore(AgentCoreBase):
             sentence_index = 0
             token_buffer = ""
             primary_model = self._config.get("agent", {}).get("primary_model", "unknown")
+
+            # GH-196 — Trust /check/output batcher (config-driven).
+            _batch_cfg = (
+                self._config.get("trust_client", {}).get("check_output_batch", {})
+                or {}
+            )
+            _trust_batcher = _TrustOutputBatcher(
+                check_output=self._async_trust.check_output,
+                session_id=session_id,
+                max_sentences=int(_batch_cfg.get("max_sentences", 3)),
+                max_interval_ms=int(_batch_cfg.get("max_interval_ms", 500)),
+                fallback_message=self._safe_fallback_message(),
+                enabled=bool(_batch_cfg.get("enabled", True)),
+            )
             logger.info(
                 "  [STEP 8] LLM Stream Call #1  →  Anthropic API (model=%s)"
                 "  tools_available=%d  message_count=%d",
@@ -2651,37 +2829,43 @@ class AgentCore(AgentCoreBase):
             )
             t8 = time.time()
 
+            # GH-194: per-channel response-length cap (None → wrapper default).
+            channel_max_tokens = channel_config.get("max_tokens")
+
             try:
                 async for token in self._llm.stream_call(
                     messages=messages,
                     tools=active_tools if active_tools else None,
                     system=system,
+                    max_tokens=channel_max_tokens,
                 ):
                     token_buffer += token
                     sentences, token_buffer = _split_sentences(token_buffer)
+                    # Stop accepting new sentences once a batch was blocked —
+                    # subsequent sentences in this turn must NOT reach TTS.
+                    if _trust_batcher.was_escalated:
+                        was_escalated = True
+                        continue
+                    pending_emit: list[str] = []
                     for sentence in sentences:
-                        # Per-sentence trust check
-                        yield SignalEvent(stage="trust_output", status="start")
-                        try:
-                            trust_output = await self._async_trust.check_output(session_id, sentence)
-                            if not trust_output.passed:
-                                sentence = self._safe_fallback_message()
-                                was_escalated = True
-                        except Exception:
-                            # Trust infra failure — treat as "allow" (spec requirement)
-                            logger.error(
-                                "orchestrator.stream_trust_output_infra_failure",
-                                extra={
-                                    "operation": "orchestrator.stream_turn",
-                                    "status": "failure",
-                                    "session_id": session_id,
-                                },
-                            )
-                        yield SignalEvent(stage="trust_output", status="complete")
-
-                        full_response_text += sentence + " "
-                        yield SentenceEvent(text=sentence, sentence_index=sentence_index)
+                        released = await _trust_batcher.add(sentence)
+                        if released:
+                            pending_emit.extend(released)
+                            yield SignalEvent(stage="trust_output", status="complete")
+                            yield SignalEvent(stage="trust_output", status="start")
+                    # Time-based flush even if no new sentence triggered size.
+                    timed = await _trust_batcher.maybe_flush_on_tick()
+                    if timed:
+                        pending_emit.extend(timed)
+                    if _trust_batcher.was_escalated:
+                        was_escalated = True
+                    for emit in pending_emit:
+                        full_response_text += emit + " "
+                        yield SentenceEvent(text=emit, sentence_index=sentence_index)
                         sentence_index += 1
+                        if _trust_batcher.was_escalated:
+                            # Drop everything queued after the blocked batch.
+                            break
 
                 model_used = self._llm.get_active_model()
                 logger.info(
@@ -2719,9 +2903,33 @@ class AgentCore(AgentCoreBase):
                     "detected_language": detected_language,
                 }
                 for tc in e.tool_calls:
+                    # GH-191: ``end_session`` is an internal signal. Mirror the
+                    # sync path (manager_agent.run_turn): never dispatch it to
+                    # Action Gateway; just flip the flag so the DoneEvent below
+                    # carries ``session_ended=True`` and the voice adapter can
+                    # close the call.
+                    if tc.tool_name == "end_session":
+                        session_ended = True
+                        self._manager_agent._session_ended_flag = True
+                        logger.info(
+                            "orchestrator.stream_end_session",
+                            extra={
+                                "operation": "orchestrator.stream_turn",
+                                "status": "success",
+                                "tool_name": "end_session",
+                                "session_id": session_id,
+                            },
+                        )
+                        tool_result = ToolResult(
+                            tool_use_id=tc.tool_use_id,
+                            tool_name="end_session",
+                            result={"acknowledged": True},
+                            success=True,
+                            result_text="Session end acknowledged.",
+                        )
                     # Route internal tools (e.g. knowledge_retrieval) to KE,
                     # not through Action Gateway.
-                    if self._tool_registry.get_route(tc.tool_name) == "knowledge_engine":
+                    elif self._tool_registry.get_route(tc.tool_name) == "knowledge_engine":
                         tool_result = await asyncio.to_thread(
                             self._manager_agent._execute_knowledge_retrieval,
                             tc, _ke_context,
@@ -2766,31 +2974,43 @@ class AgentCore(AgentCoreBase):
                     ]})
                     messages.append({"role": "user", "content": _current_tool_results})
 
+                    # #193: snapshot this round so it can be replayed next turn.
+                    _ex = self._capture_tool_exchange(
+                        _current_tool_calls, _current_tool_results, _max_chars,
+                    )
+                    if _ex is not None:
+                        _captured_exchanges_this_turn.append(_ex)
+
                     try:
                         async for token in self._llm.stream_call(
                             messages=messages,
                             tools=active_tools if active_tools else None,
                             system=system,
+                            max_tokens=channel_max_tokens,
                         ):
                             token_buffer += token
                             sentences, token_buffer = _split_sentences(token_buffer)
+                            if _trust_batcher.was_escalated:
+                                was_escalated = True
+                                continue
+                            pending_emit = []
                             for sentence in sentences:
-                                yield SignalEvent(stage="trust_output", status="start")
-                                try:
-                                    trust_output = await self._async_trust.check_output(session_id, sentence)
-                                    if not trust_output.passed:
-                                        sentence = self._safe_fallback_message()
-                                        was_escalated = True
-                                except Exception:
-                                    logger.error(
-                                        "orchestrator.stream_trust_output_infra_failure",
-                                        extra={"operation": "orchestrator.stream_turn", "status": "failure", "session_id": session_id},
-                                    )
-                                yield SignalEvent(stage="trust_output", status="complete")
-
-                                full_response_text += sentence + " "
-                                yield SentenceEvent(text=sentence, sentence_index=sentence_index)
+                                released = await _trust_batcher.add(sentence)
+                                if released:
+                                    pending_emit.extend(released)
+                                    yield SignalEvent(stage="trust_output", status="complete")
+                                    yield SignalEvent(stage="trust_output", status="start")
+                            timed = await _trust_batcher.maybe_flush_on_tick()
+                            if timed:
+                                pending_emit.extend(timed)
+                            if _trust_batcher.was_escalated:
+                                was_escalated = True
+                            for emit in pending_emit:
+                                full_response_text += emit + " "
+                                yield SentenceEvent(text=emit, sentence_index=sentence_index)
                                 sentence_index += 1
+                                if _trust_batcher.was_escalated:
+                                    break
                         break  # LLM responded with text — tool loop complete
 
                     except ToolUseRequested as nested_e:
@@ -2810,7 +3030,28 @@ class AgentCore(AgentCoreBase):
                         yield SignalEvent(stage="tool_start", status="start")
                         _nested_results = []
                         for tc in nested_e.tool_calls:
-                            if self._tool_registry.get_route(tc.tool_name) == "knowledge_engine":
+                            # GH-191: intercept end_session in nested rounds too.
+                            if tc.tool_name == "end_session":
+                                session_ended = True
+                                self._manager_agent._session_ended_flag = True
+                                logger.info(
+                                    "orchestrator.stream_end_session",
+                                    extra={
+                                        "operation": "orchestrator.stream_turn",
+                                        "status": "success",
+                                        "tool_name": "end_session",
+                                        "session_id": session_id,
+                                        "tool_round": _tool_round,
+                                    },
+                                )
+                                tool_result = ToolResult(
+                                    tool_use_id=tc.tool_use_id,
+                                    tool_name="end_session",
+                                    result={"acknowledged": True},
+                                    success=True,
+                                    result_text="Session end acknowledged.",
+                                )
+                            elif self._tool_registry.get_route(tc.tool_name) == "knowledge_engine":
                                 tool_result = await asyncio.to_thread(
                                     self._manager_agent._execute_knowledge_retrieval,
                                     tc, _ke_context,
@@ -2861,23 +3102,23 @@ class AgentCore(AgentCoreBase):
                             )
                             break
 
-            # Flush remaining buffer as final sentence
+            # Flush remaining token buffer as a final sentence into the batcher,
+            # then drain the batcher in one final Trust call (turn-end flush).
             remaining = token_buffer.strip()
-            if remaining:
-                yield SignalEvent(stage="trust_output", status="start")
-                try:
-                    trust_output = await self._async_trust.check_output(session_id, remaining)
-                    if not trust_output.passed:
-                        remaining = self._safe_fallback_message()
-                        was_escalated = True
-                except Exception:
-                    logger.error(
-                        "orchestrator.stream_trust_output_infra_failure",
-                        extra={"operation": "orchestrator.stream_turn", "status": "failure", "session_id": session_id},
-                    )
-                yield SignalEvent(stage="trust_output", status="complete")
-                full_response_text += remaining
-                yield SentenceEvent(text=remaining, sentence_index=sentence_index)
+            if remaining and not _trust_batcher.was_escalated:
+                await _trust_batcher.add(remaining)
+            yield SignalEvent(stage="trust_output", status="start")
+            final_release = await _trust_batcher.flush()
+            yield SignalEvent(stage="trust_output", status="complete")
+            if _trust_batcher.was_escalated:
+                was_escalated = True
+            for emit in final_release:
+                full_response_text += emit + " "
+                yield SentenceEvent(text=emit, sentence_index=sentence_index)
+                sentence_index += 1
+                if _trust_batcher.was_escalated:
+                    break
+            full_response_text = full_response_text.rstrip()
 
             # ── Step 11: Write current_question ────────────────────────
             # GH-151 #5: fire-and-forget. The next turn reads context_bundle,
@@ -2895,6 +3136,29 @@ class AgentCore(AgentCoreBase):
                     session_id, user_id, "session", "current_question", full_response_text.strip()
                 )
             )
+
+            # #193: persist captured tool exchanges (capped) so the next
+            # turn can replay them as real tool_use/tool_result messages.
+            if _captured_exchanges_this_turn and _max_items > 0:
+                _merged = list(_prior_exchanges) + _captured_exchanges_this_turn
+                _capped = _merged[-_max_items:]
+                bundle.session["recent_tool_exchanges"] = _capped
+                asyncio.create_task(
+                    self._async_memory.write(
+                        session_id, user_id, "session",
+                        "recent_tool_exchanges", _capped,
+                    )
+                )
+                logger.info(
+                    "orchestrator.stream_turn_tool_persist",
+                    extra={
+                        "operation": "orchestrator.stream_turn",
+                        "status": "success",
+                        "session_id": session_id,
+                        "captured": len(_captured_exchanges_this_turn),
+                        "stored": len(_capped),
+                    },
+                )
             yield SignalEvent(stage="memory_write", status="complete")
 
             latency_ms = int((time.time() - start) * 1000)
@@ -2929,7 +3193,10 @@ class AgentCore(AgentCoreBase):
                 model_used=model_used,
                 latency_ms=latency_ms,
                 turn_id=turn_id,
-                session_ended=bool(getattr(self._manager_agent, "session_ended", False)),
+                # GH-191: prefer the locally-tracked flag (streaming tool loop
+                # sets it directly when end_session is invoked); fall back to
+                # the manager_agent flag for parity with the sync path.
+                session_ended=session_ended or bool(getattr(self._manager_agent, "session_ended", False)),
             )
 
             # ── Steps 12-13: Async post-turn ───────────────────────────
@@ -3040,6 +3307,177 @@ class AgentCore(AgentCoreBase):
 # Regex for sentence splitting — splits on . ? ! । (Devanagari danda U+0964)
 # ？ (fullwidth question mark U+FF1F) followed by whitespace or end-of-string.
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.?!।？])\s+")
+
+
+class _TrustOutputBatcher:
+    """Buffer streamed sentences and flush a single Trust Layer ``check_output``.
+
+    GH-196 (P4-D). On a long turn, hitting ``/check/output`` once per sentence
+    contributes 0.5–2 s of pure overhead. This helper batches sentences so the
+    Trust Layer sees ``ceil(N_sentences / max_sentences)`` calls instead.
+
+    Flush triggers (whichever fires first):
+      * buffer length reaches ``max_sentences``
+      * elapsed wall-clock since the first buffered sentence reaches
+        ``max_interval_ms``
+      * caller invokes ``flush()`` (turn end / pre-DoneEvent cleanup)
+
+    Verdict semantics:
+      * ``allow``  — release every buffered sentence verbatim.
+      * ``block`` / ``escalate`` — release a single fallback sentence in
+        place of the entire pending batch and set ``was_escalated``. The
+        caller is responsible for not pushing further batches to TTS once
+        ``was_escalated`` flips true (the orchestrator stops feeding new
+        sentences after a blocked verdict).
+
+    Sentences released by earlier batches that were already streamed to the
+    user are NOT retracted — that is acceptable per the spec.
+
+    Trust infra failures (network/timeout) fall back to ``allow`` to preserve
+    the existing per-sentence behaviour and avoid silently dropping output.
+    """
+
+    def __init__(
+        self,
+        *,
+        check_output: Any,
+        session_id: str,
+        max_sentences: int,
+        max_interval_ms: int,
+        fallback_message: str,
+        enabled: bool = True,
+        time_fn: Any = None,
+    ) -> None:
+        """Initialise the batcher.
+
+        Args:
+            check_output: Awaitable ``async def check_output(session_id, text)``
+                returning a ``TrustCheckResult``-like object with ``passed``
+                and ``action`` attributes.
+            session_id: Session identifier passed to every Trust call.
+            max_sentences: Flush trigger by buffer size (>= 1).
+            max_interval_ms: Flush trigger by elapsed ms (>= 1).
+            fallback_message: Replacement text for the entire batch on
+                ``block`` / ``escalate``.
+            enabled: When False, ``add()`` flushes immediately (one
+                Trust call per sentence — legacy behaviour).
+            time_fn: Override for ``time.monotonic`` (test seam).
+        """
+        if max_sentences < 1:
+            raise ValueError("max_sentences must be >= 1")
+        if max_interval_ms < 1:
+            raise ValueError("max_interval_ms must be >= 1")
+        self._check_output = check_output
+        self._session_id = session_id
+        self._max_sentences = 1 if not enabled else max_sentences
+        self._max_interval_ms = max_interval_ms
+        self._fallback = fallback_message
+        self._enabled = enabled
+        self._time_fn = time_fn or time.monotonic
+        self._buffer: list[str] = []
+        self._batch_start: float | None = None
+        self.was_escalated: bool = False
+        self.batch_count: int = 0
+
+    def _should_flush(self) -> bool:
+        """Return True iff size or time threshold has been crossed."""
+        if not self._buffer:
+            return False
+        if len(self._buffer) >= self._max_sentences:
+            return True
+        if self._batch_start is None:
+            return False
+        elapsed_ms = (self._time_fn() - self._batch_start) * 1000
+        return elapsed_ms >= self._max_interval_ms
+
+    async def add(self, sentence: str) -> list[str]:
+        """Buffer a sentence and flush if a threshold has been reached.
+
+        Args:
+            sentence: Sentence to enqueue. Empty / whitespace-only inputs
+                are ignored.
+
+        Returns:
+            Sentences ready for TTS / SentenceEvent emission. May be empty
+            if the buffer is still filling.
+        """
+        if not sentence or not sentence.strip():
+            return []
+        if self._batch_start is None:
+            self._batch_start = self._time_fn()
+        self._buffer.append(sentence)
+        if self._should_flush():
+            return await self._flush_now()
+        return []
+
+    async def maybe_flush_on_tick(self) -> list[str]:
+        """Flush only if the time threshold has elapsed; never on size alone.
+
+        Returns:
+            Sentences released by the time-based flush, or empty list.
+        """
+        if not self._buffer or self._batch_start is None:
+            return []
+        elapsed_ms = (self._time_fn() - self._batch_start) * 1000
+        if elapsed_ms >= self._max_interval_ms:
+            return await self._flush_now()
+        return []
+
+    async def flush(self) -> list[str]:
+        """Force a flush of any buffered sentences (turn end).
+
+        Returns:
+            Sentences released, or empty list if nothing was buffered.
+        """
+        if not self._buffer:
+            return []
+        return await self._flush_now()
+
+    async def _flush_now(self) -> list[str]:
+        """Submit the current buffer to Trust Layer and return release list."""
+        batch = self._buffer
+        self._buffer = []
+        self._batch_start = None
+        if not batch:
+            return []
+        self.batch_count += 1
+        joined = " ".join(batch)
+        start = time.time()
+        try:
+            verdict = await self._check_output(self._session_id, joined)
+            latency_ms = int((time.time() - start) * 1000)
+            logger.info(
+                "trust_output_batcher.flush",
+                extra={
+                    "operation": "trust_output_batcher.flush",
+                    "status": "success",
+                    "session_id": self._session_id,
+                    "batch_size": len(batch),
+                    "batch_index": self.batch_count,
+                    "latency_ms": latency_ms,
+                    "passed": getattr(verdict, "passed", True),
+                    "action": getattr(verdict, "action", "allow"),
+                },
+            )
+            if not getattr(verdict, "passed", True):
+                self.was_escalated = True
+                return [self._fallback]
+            return batch
+        except Exception as exc:  # noqa: BLE001
+            # Spec: trust infra failure → treat as allow, log, do not crash.
+            logger.error(
+                "trust_output_batcher.flush_infra_failure",
+                extra={
+                    "operation": "trust_output_batcher.flush",
+                    "status": "failure",
+                    "session_id": self._session_id,
+                    "batch_size": len(batch),
+                    "batch_index": self.batch_count,
+                    "latency_ms": int((time.time() - start) * 1000),
+                    "error": f"{type(exc).__name__}: {exc}",
+                },
+            )
+            return batch
 
 
 def _split_sentences(buffer: str) -> tuple[list[str], str]:

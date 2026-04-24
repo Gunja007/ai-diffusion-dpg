@@ -9,9 +9,15 @@ agent:
 
 channels:
   voice:
+    # GH-194: hard cap on voice response length (token cap below + prompt rule).
+    max_tokens: 200
     system_prompt_suffix: |
       You are conversing over the phone, so keep responses short and simple.
       Do not emit any markdown or emojis.
+
+      ## Response length (hard rule)
+      Reply in at most 2 short sentences. The only exception is presenting a
+      market listing, where you may use at most 3 items, one short line each.
 
       ## Style
       Short to medium sentences, calm pace, one idea at a time, natural
@@ -33,6 +39,12 @@ channels:
       Never reply with waiting messages like "कृपया प्रतीक्षा करें" or
       "ज़रा इंतज़ार करें". Always respond with the actual answer.
 
+      ## Prior tool results
+      Prior tool results in this conversation are visible to you as real
+      tool_result messages earlier in the message history. Do not re-invoke
+      a tool unless the relevant parameters have changed; reuse the
+      already-returned data when answering follow-up questions.
+
       <!-- tts_rules:begin -->
       (auto-generated from channels.voice.tts_rules; edit tts_rules to change)
       TTS formatting rules (voice channel):
@@ -47,7 +59,9 @@ channels:
       - English loanwords: Write English words used in Hindi speech in Devanagari transliteration. Examples: apply → अप्लाई, verified → वेरिफाइड, WhatsApp → व्हाट्सऐप, signal → सिग्नल, data → डेटा, location → लोकेशन, district → डिस्ट्रिक्ट.
       - Named entities: When speaking person, employer, or institute names, write them in Devanagari that sounds natural. Examples: सविता, प्रकाश, अमित, श्यामलाल, राजीव.
       <!-- tts_rules:end -->
-    terminal_word: "Goodbye"
+    # Final word spoken before the call is closed. Must match the domain's
+    # primary language; KKB is Hindi-first (see language_normalisation below).
+    terminal_word: "धन्यवाद"
     tts_rules:
       numbers: >
         Write all numbers in words in Devanagari. Never use digits in spoken output.
@@ -372,7 +386,7 @@ preprocessing:
     # call was a cold read (~1.8 s). Sonnet's 1024-token minimum means the
     # same prompt is cached from turn 2 onward, dropping NLU latency to
     # ~500–800 ms once warm.
-    model: claude-sonnet-4-6
+    model: claude-sonnet-4-5-20250929
     confidence_threshold: 0.5
     user_state_confidence_threshold: 0.4  # (GH-139) below this, state classification stays sticky
     domain_instruction: |

@@ -76,6 +76,40 @@ class ClientConfig(BaseModel):
     timeout_ms: int = Field(default=5000, gt=0)
 
 
+class CheckOutputBatchConfig(BaseModel):
+    """Trust Layer ``/check/output`` batching policy for streaming turns.
+
+    During SSE streaming, sentences are buffered and submitted to Trust Layer
+    as a single concatenated check whenever the buffer reaches ``max_sentences``
+    or ``max_interval_ms`` has elapsed since the first buffered sentence —
+    whichever happens first. On ``block`` / ``escalate`` verdicts the entire
+    pending batch is replaced with the configured fallback message; sentences
+    already emitted in earlier batches are not retracted.
+
+    Attributes:
+        enabled: When False, every sentence is checked individually
+            (legacy behaviour).
+        max_sentences: Flush trigger by buffer size (>=1).
+        max_interval_ms: Flush trigger by elapsed wall-clock ms (>=1).
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    enabled: bool = True
+    max_sentences: int = Field(default=3, ge=1)
+    max_interval_ms: int = Field(default=500, ge=1)
+
+
+class TrustClientConfig(ClientConfig):
+    """HTTP client config for the Trust Layer plus output-check batching policy."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    check_output_batch: CheckOutputBatchConfig = Field(
+        default_factory=CheckOutputBatchConfig
+    )
+
+
 class OtelConfig(BaseModel):
     """OTel SDK exporter and sampling configuration."""
 
@@ -100,6 +134,23 @@ class ObservabilityConfig(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+class RecentToolExchangesConfig(BaseModel):
+    """Caps for cross-turn tool_use/tool_result replay (issue #193).
+
+    Controls how many prior tool exchanges are persisted into Memory Layer
+    under the session-scoped ``recent_tool_exchanges`` key and replayed as
+    real ``tool_use``/``tool_result`` message pairs at the start of the
+    next turn's streaming LLM call. Keeping the LLM aware of prior tool
+    results avoids redundant re-invocation of the same tool with identical
+    parameters across turns.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    max_items: int = Field(default=3, ge=0)
+    max_chars: int = Field(default=4000, ge=0)
+
+
 class AgentConfig(BaseModel):
     """Top-level LLM wrapper settings."""
 
@@ -113,6 +164,9 @@ class AgentConfig(BaseModel):
     max_tool_rounds: int = Field(default=3, ge=1)
     ask_for_consent: bool = False
     consent_prompt: str = ""
+    recent_tool_exchanges: RecentToolExchangesConfig = Field(
+        default_factory=RecentToolExchangesConfig
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -429,13 +483,20 @@ class TurnAssemblerConfig(BaseModel):
 
 
 class ChannelConfig(BaseModel):
-    """Per-channel LLM-facing configuration (GH-137)."""
+    """Per-channel LLM-facing configuration (GH-137).
+
+    ``max_tokens`` (GH-194) caps the LLM response length on this channel.
+    When ``None`` the wrapper falls back to its built-in default (4096).
+    Voice channels typically set a tight cap (~200) so the user never
+    waits through long monologues.
+    """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     system_prompt_suffix: str = ""
     tts_rules: Optional[TtsRulesConfig] = None
     terminal_word: Optional[str] = None
+    max_tokens: Optional[int] = Field(default=None, gt=0)
     turn_assembler: TurnAssemblerConfig = Field(default_factory=TurnAssemblerConfig)
 
 
@@ -498,8 +559,8 @@ class MergedConfig(BaseModel):
     memory_client: ClientConfig = Field(
         default_factory=lambda: ClientConfig(endpoint="http://memory_layer:8002")
     )
-    trust_client: ClientConfig = Field(
-        default_factory=lambda: ClientConfig(endpoint="http://trust_layer:8003")
+    trust_client: TrustClientConfig = Field(
+        default_factory=lambda: TrustClientConfig(endpoint="http://trust_layer:8003")
     )
     learning_client: ClientConfig = Field(
         default_factory=lambda: ClientConfig(endpoint="http://observability_layer:8004")
