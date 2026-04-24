@@ -158,6 +158,7 @@ def _make_agent_core(**overrides):
     trust = MagicMock()
     ke = MagicMock()
     tool_registry = MagicMock()
+    tool_registry.get_route.return_value = None
     manager_agent = MagicMock()
     manager_agent.build_system_prompt.return_value = "System prompt"
     manager_agent.build_messages.return_value = [{"role": "user", "content": "Hello"}]

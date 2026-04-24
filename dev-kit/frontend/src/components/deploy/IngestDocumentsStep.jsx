@@ -17,22 +17,26 @@ import { api } from '../../api'
 
 const INITIAL_STATE = {
   config: null,
+  docTypes: [],
+  defaultDocType: '',
   rows: [],
   submitting: false,
   submitError: null,
+  servicesReady: false,
 }
 
 function _rowId() {
   return Math.random().toString(36).slice(2)
 }
 
-function _makeRow() {
+function _makeRow(defaultDocType = '') {
   return {
     id: _rowId(),
     mode: 'local_write_ingest',
     file: null,
     cloudPath: '',
     filename: '',
+    docType: defaultDocType,
     jobId: null,
     status: 'pending',
     queuePosition: null,
@@ -45,6 +49,14 @@ function reducer(state, action) {
   switch (action.type) {
     case 'SET_CONFIG':
       return { ...state, config: action.config }
+    case 'SET_DOC_TYPES':
+      return {
+        ...state,
+        docTypes: action.docTypes || [],
+        defaultDocType: action.defaultDocType || '',
+      }
+    case 'SET_SERVICES_READY':
+      return { ...state, servicesReady: action.value }
     case 'ADD_ROW':
       return { ...state, rows: [...state.rows, action.row] }
     case 'REMOVE_ROW':
@@ -135,11 +147,44 @@ export default function IngestDocumentsStep({ slug, project, onNext, onBack }) {
         },
       })
     })
+    if (slug) {
+      api.getProjectDocTypes(slug).then(payload => {
+        dispatch({
+          type: 'SET_DOC_TYPES',
+          docTypes: payload.doc_types || [],
+          defaultDocType: payload.default_doc_type || '',
+        })
+      }).catch(() => {
+        // Non-fatal — operator can still type a doc_type manually.
+      })
+
+      // Poll deploy status until reach_layer is healthy
+      const checkServices = async () => {
+        try {
+          const status = await api.getDeployStatus(slug)
+          const reachSvc = (status.services || []).find(
+            s => s.name === 'reach_layer' || s.name === 'reach_layer_web'
+          )
+          const keSvc = (status.services || []).find(s => s.name === 'knowledge_engine')
+          if (
+            (reachSvc && reachSvc.status === 'healthy') &&
+            (keSvc && keSvc.status === 'healthy')
+          ) {
+            dispatch({ type: 'SET_SERVICES_READY', value: true })
+            clearInterval(svcPollId)
+          }
+        } catch (_err) { /* retry on next interval */ }
+      }
+      checkServices() // immediate check
+      const svcPollId = setInterval(checkServices, 5000)
+      // Store for cleanup
+      pollingRef.current._svcPoll = svcPollId
+    }
     return () => {
-      Object.values(pollingRef.current).forEach(clearInterval)
+      Object.values(pollingRef.current).forEach(id => clearInterval(id))
       Object.values(timeoutRef.current).forEach(clearTimeout)
     }
-  }, [])
+  }, [slug])
 
   // ---------------------------------------------------------------------------
   // Row management
@@ -147,7 +192,11 @@ export default function IngestDocumentsStep({ slug, project, onNext, onBack }) {
 
   const handleAddRow = () => {
     if (state.rows.length >= maxFiles) return
-    dispatch({ type: 'ADD_ROW', row: _makeRow() })
+    dispatch({ type: 'ADD_ROW', row: _makeRow(state.defaultDocType) })
+  }
+
+  const handleDocTypeChange = (id, docType) => {
+    dispatch({ type: 'UPDATE_ROW', id, patch: { docType } })
   }
 
   const handleRemoveRow = (id) => {
@@ -223,6 +272,7 @@ export default function IngestDocumentsStep({ slug, project, onNext, onBack }) {
         filename: row.filename,
         mode: row.mode,
         ...(row.cloudPath ? { cloud_path: row.cloudPath } : {}),
+        ...(row.docType ? { doc_type: row.docType } : {}),
       }))
     ))
     for (const row of pending) {
@@ -305,6 +355,13 @@ export default function IngestDocumentsStep({ slug, project, onNext, onBack }) {
         Max {maxFiles} files · Max {maxSizeMb} MB per file
       </p>
 
+      {!state.servicesReady && (
+        <div className="mb-4 px-4 py-3 bg-yellow-900/30 border border-yellow-700 rounded-xl text-sm text-yellow-300 flex items-center gap-2">
+          <span className="animate-spin text-xs">⏳</span>
+          Waiting for services to become healthy (Knowledge Engine + Reach Layer)…
+        </div>
+      )}
+
       {/* File rows */}
       {state.rows.length > 0 && (
         <div className="flex flex-col gap-2 mb-4">
@@ -357,6 +414,36 @@ export default function IngestDocumentsStep({ slug, project, onNext, onBack }) {
                 )}
               </div>
 
+              {/* Doc type selector */}
+              <div className="shrink-0">
+                {row.status === 'pending' ? (
+                  state.docTypes.length > 0 ? (
+                    <select
+                      value={row.docType}
+                      onChange={e => handleDocTypeChange(row.id, e.target.value)}
+                      title="doc_type (matched against intent_filters)"
+                      className="bg-gray-800 border border-gray-600 rounded-lg px-2 py-1.5 text-xs text-gray-200 focus:outline-none focus:border-blue-500"
+                    >
+                      <option value="">doc_type…</option>
+                      {state.docTypes.map(dt => (
+                        <option key={dt} value={dt}>{dt}</option>
+                      ))}
+                    </select>
+                  ) : (
+                    <input
+                      type="text"
+                      placeholder="doc_type"
+                      value={row.docType}
+                      onChange={e => handleDocTypeChange(row.id, e.target.value)}
+                      title="Optional doc_type tag (matches intent_filters)"
+                      className="bg-gray-800 border border-gray-600 rounded-lg px-2 py-1.5 text-xs text-gray-200 w-32 focus:outline-none focus:border-blue-500"
+                    />
+                  )
+                ) : row.docType ? (
+                  <span className="text-xs text-gray-500">{row.docType}</span>
+                ) : null}
+              </div>
+
               {/* Retry button for failed rows */}
               {row.status === 'failed' && (
                 <button
@@ -395,10 +482,10 @@ export default function IngestDocumentsStep({ slug, project, onNext, onBack }) {
         </button>
         <button
           onClick={handleSubmit}
-          disabled={state.submitting || !hasPending}
+          disabled={state.submitting || !hasPending || !state.servicesReady}
           className="text-sm bg-blue-600 hover:bg-blue-500 disabled:opacity-40 disabled:cursor-not-allowed text-white px-5 py-2 rounded-xl font-medium transition-colors"
         >
-          {state.submitting ? 'Uploading…' : hasPending ? `Upload & Ingest (${pendingRows.length})` : 'Upload & Ingest'}
+          {!state.servicesReady ? 'Waiting for services…' : state.submitting ? 'Uploading…' : hasPending ? `Upload & Ingest (${pendingRows.length})` : 'Upload & Ingest'}
         </button>
       </div>
 
@@ -424,6 +511,16 @@ export default function IngestDocumentsStep({ slug, project, onNext, onBack }) {
           >
             Skip
           </button>
+          {allTerminal && (
+            <a
+              href={`http://${window.location.hostname}:8005`}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-sm bg-blue-600 hover:bg-blue-500 text-white px-5 py-2 rounded-xl font-medium transition-colors inline-flex items-center gap-1"
+            >
+              Open Agent Chat ↗
+            </a>
+          )}
           <button
             onClick={() => onNext({})}
             disabled={state.rows.length > 0 && !allTerminal}

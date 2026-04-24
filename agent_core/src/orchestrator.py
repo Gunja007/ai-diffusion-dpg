@@ -2764,8 +2764,28 @@ class AgentCore(AgentCoreBase):
                 yield SignalEvent(stage="tool_start", status="start")
                 tool_results_for_llm = []
                 _stream_tool_results = []  # Collect ToolResult objects for post-tool hook
+                # Build ke_context for knowledge_retrieval tool (same as sync path)
+                _ke_context = {
+                    "session_id": session_id,
+                    "user_message": turn_input.user_message,
+                    "profile": bundle.profile,
+                    "session": bundle.session,
+                    "intent": nlu_result.intent,
+                    "entities": nlu_result.entities,
+                    "sentiment": nlu_result.sentiment,
+                    "confidence": nlu_result.confidence,
+                    "normalised_input": normalised_input,
+                    "detected_language": detected_language,
+                }
                 for tc in e.tool_calls:
-                    if self._async_gateway:
+                    # Route internal tools (e.g. knowledge_retrieval) to KE,
+                    # not through Action Gateway.
+                    if self._tool_registry.get_route(tc.tool_name) == "knowledge_engine":
+                        tool_result = await asyncio.to_thread(
+                            self._manager_agent._execute_knowledge_retrieval,
+                            tc, _ke_context,
+                        )
+                    elif self._async_gateway:
                         tool_result = await self._async_gateway.execute(tc, session_id, user_id)
                     else:
                         # Fallback: no async gateway — cannot execute tools in streaming mode
@@ -2849,14 +2869,21 @@ class AgentCore(AgentCoreBase):
                         yield SignalEvent(stage="tool_start", status="start")
                         _nested_results = []
                         for tc in nested_e.tool_calls:
-                            if self._async_gateway:
+                            if self._tool_registry.get_route(tc.tool_name) == "knowledge_engine":
+                                tool_result = await asyncio.to_thread(
+                                    self._manager_agent._execute_knowledge_retrieval,
+                                    tc, _ke_context,
+                                )
+                            elif self._async_gateway:
                                 tool_result = await self._async_gateway.execute(tc, session_id, user_id)
-                                _nested_results.append({
-                                    "type": "tool_result",
-                                    "tool_use_id": tc.tool_use_id,
-                                    "content": tool_result.result_text or str(tool_result.result),
-                                })
-                                _stream_tool_results.append(tool_result)
+                            else:
+                                break
+                            _nested_results.append({
+                                "type": "tool_result",
+                                "tool_use_id": tc.tool_use_id,
+                                "content": tool_result.result_text or str(tool_result.result),
+                            })
+                            _stream_tool_results.append(tool_result)
                         yield SignalEvent(stage="tool_end", status="complete")
                         logger.info(
                             "  [STEP 9] Tool-Use Loop (round %d)  ✓  tools=%s",

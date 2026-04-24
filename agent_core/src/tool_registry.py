@@ -27,7 +27,7 @@ class ToolRegistry:
     def __init__(self, config: dict, gateway: ActionGatewayBase) -> None:
         if config is None:
             raise ValueError("config must not be None")
-        
+
         # 2. Extract tools from Gateway (fetched from /tools at startup)
         self._tool_definitions = gateway.list_available_tools()
 
@@ -36,11 +36,17 @@ class ToolRegistry:
 
         # Strip non-Anthropic fields (e.g. "category") from gateway tool definitions.
         # The Anthropic API only accepts name, description, and input_schema.
+        # Also strip "$schema" from input_schema — MCP tools (e.g. GitBook) include
+        # JSON Schema draft references that the Anthropic API rejects with 400.
         _ANTHROPIC_TOOL_KEYS = {"name", "description", "input_schema"}
-        self._tool_definitions = [
-            {k: v for k, v in t.items() if k in _ANTHROPIC_TOOL_KEYS}
-            for t in self._tool_definitions
-        ]
+        cleaned: list[dict] = []
+        for t in self._tool_definitions:
+            tool = {k: v for k, v in t.items() if k in _ANTHROPIC_TOOL_KEYS}
+            schema = tool.get("input_schema")
+            if isinstance(schema, dict):
+                schema.pop("$schema", None)
+            cleaned.append(tool)
+        self._tool_definitions = cleaned
 
         # 3. Add internal tools from config (not handled by AG client)
         internal_tools, tool_routes = self._load_internal_tools(config)
@@ -54,7 +60,7 @@ class ToolRegistry:
             extra={
                 "total_tools": len(self._tool_definitions),
                 "consent_tools": list(self._consent_tools),
-                "internal_tools": [t["name"] for t in internal_tools]
+                "internal_tools": [t["name"] for t in internal_tools],
             },
         )
 
