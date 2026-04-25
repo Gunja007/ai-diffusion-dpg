@@ -10,9 +10,11 @@ Coverage:
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
-from src.models import NLUResult, TurnEvent, TrustCheckResult, UserStateClassification
+from src.models import DoneEvent, NLUResult, SentenceEvent, SignalEvent, TurnEvent, TrustCheckResult, UserStateClassification
 
 
 def test_turn_event_has_trace_id_field():
@@ -104,3 +106,27 @@ def test_done_event_session_ended_accepts_true():
     from src.models import DoneEvent
     evt = DoneEvent(session_ended=True)
     assert evt.session_ended is True
+
+
+# Tests for StreamEvent classes after adding turn_id field (#224)
+def test_signal_event_has_turn_id_default_empty():
+    ev = SignalEvent(stage="memory_read", status="start")
+    assert ev.turn_id == ""
+
+
+def test_sentence_event_carries_turn_id():
+    ev = SentenceEvent(text="hello", sentence_index=0, turn_id="abc-123")
+    assert ev.turn_id == "abc-123"
+    assert "abc-123" in ev.to_sse()
+
+
+def test_done_event_serialises_turn_id_in_sse():
+    ev = DoneEvent(turn_status="completed", turn_id="t-1")
+    payload = ev.to_sse()
+    assert json.loads(payload.removeprefix("data: ").rstrip())["turn_id"] == "t-1"
+
+
+def test_signal_event_to_sse_includes_turn_id_field():
+    ev = SignalEvent(stage="trust_input", status="complete", turn_id="t-2")
+    parsed = json.loads(ev.to_sse().removeprefix("data: ").rstrip())
+    assert parsed["turn_id"] == "t-2"
