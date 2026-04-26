@@ -280,24 +280,24 @@ services:
   # Launch with:
   #   docker compose -f docker-compose.dev.yml run --rm reach_layer_cli
   # ---------------------------------------------------------------------------
-  reach_layer_cli:
-    image: sanketikahub/dpg-reach-layer-cli:latest
-    pull_policy: always
-    container_name: reach_layer_cli
-    volumes:
-      # Unified Reach Layer config: DPG defaults + per-domain overrides.
-      # Loader scopes to the cli channel via load_reach_config("cli").
-      - ../../dev-kit/dpg/reach_layer.yaml:/app/config/dpg.yaml:ro
-      - ../../dev-kit/configs/${DOMAIN:-kkb}/reach_layer.yaml:/app/config/domain.yaml:ro
-    networks:
-      - dpg_net
-    stdin_open: true
-    tty: true
-    depends_on:
-      agent_core:
-        condition: service_healthy
-    profiles:
-      - cli  # do not auto-start with `docker compose up`; use `run --rm`
+  # reach_layer_cli:
+  #   image: sanketikahub/dpg-reach-layer-cli:latest
+  #   pull_policy: always
+  #   container_name: reach_layer_cli
+  #   volumes:
+  #     # Unified Reach Layer config: DPG defaults + per-domain overrides.
+  #     # Loader scopes to the cli channel via load_reach_config("cli").
+  #     - ../../dev-kit/dpg/reach_layer.yaml:/app/config/dpg.yaml:ro
+  #     - ../../dev-kit/configs/${DOMAIN:-kkb}/reach_layer.yaml:/app/config/domain.yaml:ro
+  #   networks:
+  #     - dpg_net
+  #   stdin_open: true
+  #   tty: true
+  #   depends_on:
+  #     agent_core:
+  #       condition: service_healthy
+  #   profiles:
+  #     - cli  # do not auto-start with `docker compose up`; use `run --rm`
 
   # ---------------------------------------------------------------------------
   # Reach Layer — Voice channel (port 8006)
@@ -318,7 +318,6 @@ services:
       - VOBIZ_AUTH_TOKEN=${VOBIZ_AUTH_TOKEN:-}
       - VOBIZ_FROM_NUMBER=${VOBIZ_FROM_NUMBER:-}
       - RAYA_API_KEY=${RAYA_API_KEY:-}
-      - LOG_LEVEL=INFO
     volumes:
       # Unified Reach Layer config: DPG defaults + per-domain overrides.
       # Loader scopes to the voice channel via load_reach_config("voice").
@@ -497,7 +496,7 @@ services:
   ngrok:
     image: ngrok/ngrok:latest
     container_name: ngrok
-    command: http reach_layer_voice:8006 --log stdout
+    command: http reach_layer_web:8005 --log stdout
     environment:
       - NGROK_AUTHTOKEN=${NGROK_AUTHTOKEN:-}
     ports:
@@ -510,7 +509,7 @@ services:
           cpus: '0.25'
           memory: 128M
     depends_on:
-      reach_layer_voice:
+      reach_layer_web:
         condition: service_healthy
     restart: unless-stopped
 
