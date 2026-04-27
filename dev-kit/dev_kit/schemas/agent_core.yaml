@@ -137,6 +137,7 @@ connectors:
 
 preprocessing:
   language_normalisation:
+    model: ""                   # optional — Claude model ID override; falls back to agent.primary_model when empty
     default_language: ""        # required — primary language e.g. english, hindi
     supported_languages: []     # required — e.g. [english, hindi, hinglish, kannada]
     min_detection_tokens: 3     # inputs with fewer tokens skip LLM detection; returns default_language

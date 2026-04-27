@@ -770,6 +770,24 @@ def update_config_file(slug: str, block: str, body: UpdateConfigRequest) -> dict
     return {"block": block, "status": engine.accumulator.get_status(block).value, "validation_errors": errors}
 
 
+@app.post("/api/projects/{slug}/configs/reload")
+def reload_configs(slug: str) -> dict[str, Any]:
+    """Evict the cached engine so the next request reloads all configs from disk.
+
+    Useful after the operator hand-edits a YAML file outside the UI (e.g. in
+    their editor or via git pull). The engine is recreated on the next request,
+    picking up the new on-disk state.
+
+    Args:
+        slug: Project slug.
+
+    Returns:
+        Dict confirming the engine was evicted.
+    """
+    _engines.pop(slug, None)
+    return {"reloaded": True, "slug": slug}
+
+
 @app.post("/api/projects/{slug}/configs/validate")
 def validate_all_configs(slug: str) -> dict[str, Any]:
     """Run partial validation on all 7 configs and return results."""
@@ -780,6 +798,270 @@ def validate_all_configs(slug: str) -> dict[str, Any]:
         errors = validate_partial(block, data)
         results[block] = {"valid": len(errors) == 0, "errors": errors}
     return results
+
+
+@app.post("/api/projects/{slug}/deploy/validate")
+def pre_deploy_validate(slug: str) -> dict[str, Any]:
+    """Run full merged-config validation and cross-block invariant checks.
+
+    Merges DPG defaults + domain config for each of the 7 blocks, runs the
+    full Pydantic model (not partial), then checks cross-block invariants
+    such as tool-name integrity and intent-filter coverage.
+
+    Args:
+        slug: Project slug.
+
+    Returns:
+        Dict with ``valid`` bool, ``block_errors`` per-block Pydantic errors,
+        and ``invariant_errors`` list of cross-block rule violations.
+    """
+    from dev_kit.loader import _load_and_merge
+    from dev_kit.schema import (
+        AgentCoreConfig, KnowledgeEngineConfig, TrustLayerConfig,
+        MemoryLayerConfig, ObservabilityLayerConfig, ActionGatewayConfig,
+        ReachLayerConfig,
+    )
+    from pydantic import ValidationError as _VE
+
+    _MODELS = {
+        "agent_core": AgentCoreConfig,
+        "knowledge_engine": KnowledgeEngineConfig,
+        "trust_layer": TrustLayerConfig,
+        "memory_layer": MemoryLayerConfig,
+        "observability_layer": ObservabilityLayerConfig,
+        "action_gateway": ActionGatewayConfig,
+        "reach_layer": ReachLayerConfig,
+    }
+
+    block_errors: dict[str, list[str]] = {}
+    merged: dict[str, dict] = {}
+
+    # 1. Full Pydantic validation per block using merged (dpg + domain) config.
+    for block, model_cls in _MODELS.items():
+        try:
+            data = _load_and_merge(slug, block)
+            merged[block] = data
+            model_cls.model_validate(data)
+            block_errors[block] = []
+        except _VE as exc:
+            block_errors[block] = [
+                f"{'.'.join(str(loc) for loc in err['loc'])}: {err['msg']}"
+                for err in exc.errors()
+            ]
+        except FileNotFoundError:
+            merged[block] = {}
+            block_errors[block] = []
+        except Exception as exc:
+            block_errors[block] = [str(exc)]
+
+    # 2. Cross-block invariant checks.
+    invariant_errors: list[str] = []
+    ac = merged.get("agent_core", {})
+    ke = merged.get("knowledge_engine", {})
+    rl = merged.get("reach_layer", {})
+
+    # Build connector name set from agent_core
+    connectors = ac.get("connectors", {})
+    declared_connectors: set[str] = set()
+    for category in ("read", "write", "identity", "internal"):
+        for c in connectors.get(category) or []:
+            if isinstance(c, dict) and c.get("name"):
+                declared_connectors.add(c["name"])
+    internal_connectors: set[str] = {
+        c["name"]
+        for c in (connectors.get("internal") or [])
+        if isinstance(c, dict) and c.get("name")
+    }
+
+    workflow = ac.get("agent_workflow", {})
+    global_tools: list[str] = workflow.get("global_tools") or []
+    global_intents: set[str] = set(workflow.get("global_intents") or [])
+
+    # Check 1: tool names in global_tools exist in connectors
+    for tool in global_tools:
+        if tool not in declared_connectors and "__" not in tool:
+            invariant_errors.append(
+                f"agent_core.agent_workflow.global_tools: '{tool}' is not declared "
+                f"in any connectors.* list. Declared connectors: {sorted(declared_connectors)}"
+            )
+
+    # Check 2 & 3: per-subagent tool names + global_intents overlap
+    declared_subagent_ids: set[str] = {
+        sa["id"]
+        for sa in (workflow.get("subagents") or [])
+        if isinstance(sa, dict) and sa.get("id")
+    }
+    all_subagent_intents: set[str] = set()
+    for sa in workflow.get("subagents") or []:
+        if not isinstance(sa, dict):
+            continue
+        sa_id = sa.get("id", "?")
+        for tool in sa.get("tools") or []:
+            if tool not in declared_connectors and "__" not in tool:
+                invariant_errors.append(
+                    f"agent_core.agent_workflow.subagents[{sa_id}].tools: '{tool}' is not "
+                    f"declared in any connectors.* list. Declared connectors: {sorted(declared_connectors)}"
+                )
+        for intent in sa.get("valid_intents") or []:
+            all_subagent_intents.add(intent)
+
+    overlap = global_intents & all_subagent_intents
+    if overlap:
+        invariant_errors.append(
+            f"agent_core: intents {sorted(overlap)} appear in both global_intents and a "
+            f"subagent's valid_intents. Agent Core crashes at startup if there is any overlap."
+        )
+
+    # Check 4: knowledge_retrieval must be in connectors.internal, not connectors.read
+    all_tool_names = set(global_tools)
+    for sa in workflow.get("subagents") or []:
+        if isinstance(sa, dict):
+            all_tool_names.update(sa.get("tools") or [])
+    if "knowledge_retrieval" in all_tool_names and "knowledge_retrieval" not in internal_connectors:
+        read_names = {c["name"] for c in (connectors.get("read") or []) if isinstance(c, dict)}
+        if "knowledge_retrieval" in read_names:
+            invariant_errors.append(
+                "agent_core: 'knowledge_retrieval' is in connectors.read but must be in "
+                "connectors.internal (it routes to Knowledge Engine, not Action Gateway). "
+                "Move the connector to the connectors.internal list and add a 'route: knowledge_engine' field."
+            )
+        else:
+            invariant_errors.append(
+                "agent_core: 'knowledge_retrieval' is referenced in tools but not declared "
+                "in connectors.internal. Add it under connectors.internal with route: knowledge_engine."
+            )
+
+    # Check 5: intent_filters keys must be in NLU intents
+    nlu_intents: set[str] = set(
+        ac.get("preprocessing", {}).get("nlu_processor", {}).get("intents") or []
+    )
+    intent_filters: dict = (
+        ke.get("knowledge", {})
+        .get("blocks", {})
+        .get("static_knowledge_base", {})
+        .get("intent_filters") or {}
+    )
+    for intent_key in intent_filters:
+        if intent_key not in nlu_intents:
+            invariant_errors.append(
+                f"knowledge_engine.intent_filters key '{intent_key}' is not declared in "
+                f"agent_core.preprocessing.nlu_processor.intents. Queries for this intent "
+                f"will bypass the filter. Add '{intent_key}' to the NLU intents list."
+            )
+
+    # Check 6: voice selected → reach_layer.channels.voice configured
+    selected_channels = _get_engine(slug).accumulator.get_reach_channel_selection_or_default()
+    if "voice" in selected_channels:
+        voice_cfg = (rl.get("reach_layer", {}) or {}).get("channels", {}).get("voice")
+        if not voice_cfg or not isinstance(voice_cfg, dict):
+            invariant_errors.append(
+                "reach_layer.channels.voice is not configured but voice is in selected_channels. "
+                "Set reach_layer.channels.voice with raya.voice_id, raya.stt_language, and raya.tts_language."
+            )
+        else:
+            raya = voice_cfg.get("raya") or {}
+            for field in ("voice_id", "stt_language", "tts_language"):
+                if not raya.get(field):
+                    invariant_errors.append(
+                        f"reach_layer.channels.voice.raya.{field} is empty but voice is in selected_channels."
+                    )
+
+    # Check 7: selected_channels[x] → agent_core.channels.<x> must exist in raw YAML.
+    # DPG agent_core defaults have no channels.* entries; if the domain config also
+    # omits channels.web the runtime raises ValueError: Unsupported channel.
+    ac_channels = ac.get("channels", {}) or {}
+    for ch in selected_channels:
+        if ch not in ac_channels:
+            invariant_errors.append(
+                f"agent_core.channels.{ch} is missing but '{ch}' is in selected_channels. "
+                f"Agent Core raises ValueError: Unsupported channel at startup. "
+                f"Add a channels.{ch} block with system_prompt_suffix and turn_assembler settings."
+            )
+
+    # Check 8: selected_channels[x] → reach_layer.channels.<x> must be non-null.
+    # DPG reach_layer defaults have all three channels, but domain config can nullify one.
+    rl_channels = (rl.get("reach_layer", {}) or {}).get("channels", {}) or {}
+    for ch in selected_channels:
+        if rl_channels.get(ch) is None:
+            invariant_errors.append(
+                f"reach_layer.channels.{ch} is null/missing but '{ch}' is in selected_channels. "
+                f"The reach layer service will fail to start. Add a reach_layer.channels.{ch} block."
+            )
+
+    # Check 9: opening_phrase must be non-empty for every non-terminal subagent.
+    # Terminal subagents end the conversation and never need an opening phrase.
+    for sa in (workflow.get("subagents") or []):
+        if not isinstance(sa, dict):
+            continue
+        sa_id = sa.get("id", "?")
+        if not sa.get("is_terminal") and not (sa.get("opening_phrase") or "").strip():
+            invariant_errors.append(
+                f"agent_core.agent_workflow.subagents[{sa_id}].opening_phrase is empty. "
+                f"Every non-terminal subagent must have an opening_phrase — it is emitted "
+                f"on the first turn the session enters this subagent."
+            )
+
+    # Check 10: default_fallback_subagent_id must match a declared subagent id.
+    fallback_id = (workflow.get("default_fallback_subagent_id") or "").strip()
+    if fallback_id and fallback_id not in declared_subagent_ids:
+        invariant_errors.append(
+            f"agent_core.agent_workflow.default_fallback_subagent_id: '{fallback_id}' is not "
+            f"declared in subagents (declared: {sorted(declared_subagent_ids)}). "
+            f"Agent Core will raise KeyError when the fallback is triggered."
+        )
+
+    # Check 11: every routing[*].next_subagent_id must match a declared subagent id.
+    for rule in (workflow.get("global_routing") or []):
+        if not isinstance(rule, dict):
+            continue
+        next_id = (rule.get("next_subagent_id") or "").strip()
+        if next_id and next_id not in declared_subagent_ids:
+            invariant_errors.append(
+                f"agent_core.agent_workflow.global_routing: next_subagent_id '{next_id}' "
+                f"is not declared in subagents (declared: {sorted(declared_subagent_ids)})."
+            )
+    for sa in (workflow.get("subagents") or []):
+        if not isinstance(sa, dict):
+            continue
+        sa_id = sa.get("id", "?")
+        for rule in (sa.get("routing") or []):
+            if not isinstance(rule, dict):
+                continue
+            next_id = (rule.get("next_subagent_id") or "").strip()
+            if next_id and next_id not in declared_subagent_ids:
+                invariant_errors.append(
+                    f"agent_core.agent_workflow.subagents[{sa_id}].routing: "
+                    f"next_subagent_id '{next_id}' is not declared in subagents "
+                    f"(declared: {sorted(declared_subagent_ids)})."
+                )
+
+    # Check 12: workflow top-level required fields must be non-empty.
+    for field in ("workflow_id", "agent_system_prompt"):
+        if not (workflow.get(field) or "").strip():
+            invariant_errors.append(
+                f"agent_core.agent_workflow.{field} is empty. "
+                f"This is a required field — Agent Core fails Pydantic validation at startup."
+            )
+
+    # Check 13: dignity_check.questions must be non-empty if dignity_check is enabled.
+    # dignity_check is a top-level key in the merged trust_layer YAML.
+    tl = merged.get("trust_layer", {})
+    dignity = tl.get("dignity_check") or {}
+    if dignity.get("enabled") and not dignity.get("questions"):
+        invariant_errors.append(
+            "trust_layer.dignity_check.enabled is true but questions is empty. "
+            "The dignity check will always pass with no questions — add the 5 canonical "
+            "questions: ['Does this blame the user?', 'Does it over-promise?', "
+            "'Does it push urgency?', 'Does it reduce their agency?', "
+            "'Does it sound like a script instead of a human call?']"
+        )
+
+    all_valid = all(len(errs) == 0 for errs in block_errors.values()) and not invariant_errors
+    return {
+        "valid": all_valid,
+        "block_errors": block_errors,
+        "invariant_errors": invariant_errors,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1083,15 +1365,18 @@ async def get_deploy_preview(slug: str, body: dict) -> dict:
 
         # Apply channel selection: remove reach services for unselected channels so
         # the preview matches exactly what _run_docker_deploy will deploy.
+        # web is always deployed regardless of selection so the UI and ingest proxy
+        # remain accessible; voice and cli are optional.
         selected_channels = _get_engine(slug).accumulator.get_reach_channel_selection_or_default()
+        effective_channels = set(selected_channels) | {"web"}
         services_to_remove = {
             svc_name
             for channel, svc_name in _CHANNEL_SERVICE.items()
-            if channel not in selected_channels
+            if channel not in effective_channels
         }
         # ngrok depends_on reach_layer_voice (tunnels port 8006 for Vobiz webhooks).
         # Remove it if voice is not selected.
-        if "voice" not in selected_channels:
+        if "voice" not in effective_channels:
             services_to_remove.add("ngrok")
         services_to_remove.add("dev_kit")
 
@@ -1252,6 +1537,25 @@ async def execute_deploy(slug: str, body: dict) -> dict:
     Returns:
         Dict with ``status: started`` and the resolved target name.
     """
+    from fastapi import HTTPException as _HTTPException
+
+    # Gate: reject deploys with config errors so broken configs never reach containers.
+    validation = pre_deploy_validate(slug)
+    if not validation["valid"]:
+        block_msgs = [
+            f"[{block}] {err}"
+            for block, errs in (validation.get("block_errors") or {}).items()
+            for err in errs
+        ]
+        all_errors = block_msgs + (validation.get("invariant_errors") or [])
+        raise _HTTPException(
+            status_code=422,
+            detail={
+                "error": "Config validation failed — fix errors before deploying.",
+                "errors": all_errors,
+            },
+        )
+
     import tempfile
     from dev_kit.agent.deployer.state import start_deploy
 
@@ -1393,15 +1697,18 @@ async def _run_docker_deploy(
         compose_doc = _yaml.safe_load(content)
         tool_secrets = secrets.get("tool_secrets", {})
 
-        # Determine which reach_layer services to remove
+        # Determine which reach_layer services to remove.
+        # web is always deployed regardless of selected_channels so the UI and
+        # ingest proxy remain accessible; voice and cli are optional.
+        effective_channels = set(selected_channels) | {"web"}
         services_to_remove = {
             svc_name
             for channel, svc_name in _CHANNEL_SERVICE.items()
-            if channel not in selected_channels
+            if channel not in effective_channels
         }
         # ngrok depends_on reach_layer_voice (tunnels port 8006 for Vobiz webhooks).
         # Remove it if voice is not selected.
-        if "voice" not in selected_channels:
+        if "voice" not in effective_channels:
             services_to_remove.add("ngrok")
         # When deploying from the local dev-kit, exclude the Docker dev-kit service
         # to avoid port 8080 conflicts. The local process handles the UI + ingest proxy.
@@ -1627,6 +1934,50 @@ async def _run_k8s_deploy(slug: str, state, secrets: dict, resources: dict, kube
         )
 
 
+# Services with no Docker healthcheck — treat "running" as "healthy"
+# since that's the best signal they ever emit.
+_NO_HEALTHCHECK_SERVICES = {"loki", "grafana", "prometheus", "jaeger", "otel_collector"}
+
+# Compose service name → canonical state key
+_COMPOSE_TO_STATE = {
+    "reach_layer_web": "reach_layer",
+    "reach_layer_voice": "reach_layer",
+    "otelcol": "otel_collector",
+}
+
+
+def _docker_status(c_state: str, c_status: str, svc_name: str) -> str:
+    """Map raw docker compose State/Status fields to a canonical service status.
+
+    Args:
+        c_state: Value of the ``State`` field from ``docker compose ps``.
+        c_status: Value of the ``Status`` field (includes health text).
+        svc_name: Canonical state service name (after compose→state mapping).
+
+    Returns:
+        One of: ``healthy``, ``running``, ``starting``, ``failed``, or the
+        raw c_state value for unrecognised states.
+    """
+    if c_state == "running":
+        if "healthy" in c_status.lower() or svc_name in _NO_HEALTHCHECK_SERVICES:
+            return "healthy"
+        return "running"
+    if c_state == "exited":
+        return "failed"
+    if c_state == "restarting":
+        # Crash-loop detection: Docker reports restart count in the Status
+        # field as "Restarting (N) X seconds ago". After 3+ restarts the
+        # container is unlikely to self-heal — surface it as failed so the
+        # UI shows the Restart button rather than spinning forever.
+        m = re.search(r"Restarting \((\d+)\)", c_status)
+        if m and int(m.group(1)) >= 3:
+            return "failed"
+        return "starting"
+    if c_state == "created":
+        return "starting"
+    return c_state or "starting"
+
+
 @app.get("/api/projects/{slug}/deploy/status")
 async def get_deploy_status(slug: str) -> dict:
     """Poll deployment status of all services.
@@ -1657,25 +2008,15 @@ async def get_deploy_status(slug: str) -> dict:
         if not containers:
             return {"services": [], "overall": "idle"}
 
-        _PROBE_COMPOSE_TO_STATE = {
-            "reach_layer_web": "reach_layer",
-            "reach_layer_voice": "reach_layer",
-            "otelcol": "otel_collector",
-        }
         services_out: list[dict] = []
         all_ok = True
         for c in containers:
             compose_name = c.get("Service") or c.get("Name", "")
-            svc_name = _PROBE_COMPOSE_TO_STATE.get(compose_name, compose_name)
+            svc_name = _COMPOSE_TO_STATE.get(compose_name, compose_name)
             c_state = c.get("State", "")
             c_status = c.get("Status", "")
-            if c_state == "running":
-                status = "healthy" if "healthy" in c_status.lower() else "running"
-            elif c_state == "exited":
-                status = "failed"
-                all_ok = False
-            else:
-                status = c_state or "unknown"
+            status = _docker_status(c_state, c_status, svc_name)
+            if status == "failed":
                 all_ok = False
             services_out.append({"name": svc_name, "status": status, "error": ""})
         return {
@@ -1684,33 +2025,33 @@ async def get_deploy_status(slug: str) -> dict:
             "target": "docker",
         }
 
-    # For Docker deployments, always poll live container status so the UI
-    # gets real-time updates (compose up -d returns quickly but containers
-    # take time to become healthy).
-    # Compose service names use dashes; state keys use underscores.
-    _COMPOSE_TO_STATE = {
-        "reach_layer_web": "reach_layer",
-        "reach_layer_voice": "reach_layer",
-        "otelcol": "otel_collector",
-    }
     if state.target == "docker" and state.compose_file_path:
-        from dev_kit.agent.deployer.compose import get_compose_status
+        from dev_kit.agent.deployer.compose import get_compose_status, get_service_logs
 
         containers = await get_compose_status(state.compose_file_path, project_name=f"dpg-{slug}")
+        if not containers:
+            # Containers are gone (e.g. docker compose down was run externally).
+            # Clear stale in-memory state so next deploy starts fresh.
+            from dev_kit.agent.deployer.state import clear_state
+            clear_state(slug)
+            return {"services": [], "overall": "idle"}
         if containers:
             for c in containers:
                 compose_name = c.get("Service", c.get("Name", ""))
                 svc_name = _COMPOSE_TO_STATE.get(compose_name, compose_name)
                 c_state = c.get("State", "")
                 c_status = c.get("Status", "")
-                if c_state == "running":
-                    status = "healthy" if "healthy" in c_status.lower() else "running"
-                elif c_state == "exited":
-                    status = "failed"
-                else:
-                    status = c_state
+                status = _docker_status(c_state, c_status, svc_name)
+                error_text = ""
+                if status == "failed":
+                    # Fetch last log lines so the UI can show a readable reason.
+                    # get_service_logs reads only container stdout/stderr — no secrets.
+                    error_text = await get_service_logs(
+                        state.compose_file_path, compose_name,
+                        project_name=f"dpg-{slug}", tail=15,
+                    )
                 if svc_name in state.services:
-                    state.set_service(svc_name, status)
+                    state.set_service(svc_name, status, error=error_text)
             statuses = {s["status"] for s in state.services.values()}
             if state.overall != "deploying":
                 state.overall = "failed" if "failed" in statuses else "complete"
@@ -1724,7 +2065,6 @@ async def get_deploy_status(slug: str) -> dict:
             pods = await get_pod_status(state.namespace, state.kubeconfig_path)
             if pods:
                 for pod in pods:
-                    # Map pod name back to service (release name is prefix)
                     pod_name = pod["name"]
                     matched_svc = None
                     for svc_name in state.services:
@@ -1746,6 +2086,81 @@ async def get_deploy_status(slug: str) -> dict:
                 state.overall = "failed" if "failed" in statuses else "complete"
 
     return state.to_response()
+
+
+@app.post("/api/projects/{slug}/deploy/services/{service}/restart")
+async def restart_deploy_service(slug: str, service: str) -> dict:
+    """Restart a single deployed service without redeploying the full stack.
+
+    Translates the state service name to the compose service name, runs
+    ``docker compose restart`` on that one service, and resets its in-memory
+    status to ``starting`` so the polling loop shows fresh progress.
+
+    Only supported for Docker deployments. No secrets are accepted or returned.
+
+    Args:
+        slug: Project slug.
+        service: Canonical state service name (e.g. ``knowledge_engine``,
+            ``reach_layer``).
+
+    Returns:
+        ``{"ok": true}`` on success.
+
+    Raises:
+        HTTPException 422: Invalid characters in service name.
+        HTTPException 404: No active deployment for this project.
+        HTTPException 400: Not a Docker deployment, or service name unknown.
+        HTTPException 500: Docker restart command failed.
+    """
+    import re as _re
+    if not _re.match(r'^[a-zA-Z0-9_]+$', service):
+        raise HTTPException(422, "Invalid service name")
+
+    from dev_kit.agent.deployer.state import get_state
+    from dev_kit.agent.deployer.compose import restart_service
+
+    state = get_state(slug)
+    if not state:
+        raise HTTPException(404, "No active deployment for this project")
+    if state.target != "docker":
+        raise HTTPException(400, "Per-service restart is only supported for Docker deployments")
+    if not state.compose_file_path:
+        raise HTTPException(400, "Compose file path not available in deployment state")
+    if service not in state.services:
+        raise HTTPException(400, f"Unknown service: {service}")
+
+    # Map canonical state name → compose service name
+    _STATE_TO_COMPOSE = {
+        "reach_layer": "reach_layer_web",
+        "otel_collector": "otelcol",
+    }
+    compose_service = _STATE_TO_COMPOSE.get(service, service)
+
+    start = time.time()
+    result = await restart_service(
+        state.compose_file_path, compose_service, project_name=f"dpg-{slug}"
+    )
+    if not result["success"]:
+        # Truncate stderr so docker's verbose output doesn't leak compose internals
+        err_preview = result["stderr"].strip()[:300]
+        raise HTTPException(500, f"Failed to restart {service}: {err_preview}")
+
+    # Reset service in state — polling will update it to running/healthy shortly
+    state.set_service(service, "starting")
+    if state.overall in ("failed", "complete"):
+        state.overall = "deploying"
+
+    logger.info(
+        "devkit.restart_service",
+        extra={
+            "operation": "devkit.restart_service",
+            "status": "success",
+            "slug": slug,
+            "service": service,
+            "latency_ms": int((time.time() - start) * 1000),
+        },
+    )
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------------------
@@ -1936,6 +2351,63 @@ async def ingest_job_status(job_id: str):
         logger.error(
             "devkit.ingest_job_status_timeout",
             extra={"operation": "devkit.ingest_job_status", "status": "failure", "error": str(e)},
+        )
+        raise HTTPException(504, "Reach Layer timed out") from e
+    except _httpx.HTTPError as e:
+        raise HTTPException(502, "Upstream error communicating with Reach Layer") from e
+
+
+@app.get("/api/ingest/jobs")
+async def list_ingest_jobs(limit: int = 100):
+    """Return ingestion history by proxying to Reach Layer → KE.
+
+    Called by the frontend on mount of the Ingest Documents step so previously
+    ingested files are shown even after navigating away and back.
+
+    Args:
+        limit: Maximum number of records to return (default 100, max 500).
+
+    Returns:
+        Job list response from KE.
+
+    Raises:
+        HTTPException: 503 if Reach Layer is unreachable.
+        HTTPException: 504 if Reach Layer times out.
+        HTTPException: 502 on other upstream errors.
+    """
+    import httpx as _httpx
+    start = time.time()
+    try:
+        async with _httpx.AsyncClient(timeout=10.0) as http_client:
+            ke_response = await http_client.get(
+                f"{_REACH_LAYER_URL}/ingest/jobs",
+                params={"limit": min(limit, 500)},
+                headers={"X-API-Key": _DEVKIT_TO_REACH_API_KEY},
+            )
+        logger.info(
+            "devkit.list_ingest_jobs",
+            extra={
+                "operation": "devkit.list_ingest_jobs",
+                "status": "success",
+                "reach_status": ke_response.status_code,
+                "latency_ms": int((time.time() - start) * 1000),
+            },
+        )
+        return Response(
+            content=ke_response.content,
+            status_code=ke_response.status_code,
+            media_type=ke_response.headers.get("content-type", "application/json"),
+        )
+    except _httpx.ConnectError as e:
+        logger.error(
+            "devkit.list_ingest_jobs_unreachable",
+            extra={"operation": "devkit.list_ingest_jobs", "status": "failure", "error": str(e)},
+        )
+        raise HTTPException(503, "Reach Layer is unreachable") from e
+    except _httpx.TimeoutException as e:
+        logger.error(
+            "devkit.list_ingest_jobs_timeout",
+            extra={"operation": "devkit.list_ingest_jobs", "status": "failure", "error": str(e)},
         )
         raise HTTPException(504, "Reach Layer timed out") from e
     except _httpx.HTTPError as e:

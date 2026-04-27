@@ -23,6 +23,7 @@ const INITIAL_STATE = {
   submitting: false,
   submitError: null,
   servicesReady: false,
+  historyLoading: true,
 }
 
 function _rowId() {
@@ -57,6 +58,8 @@ function reducer(state, action) {
       }
     case 'SET_SERVICES_READY':
       return { ...state, servicesReady: action.value }
+    case 'SET_HISTORY_LOADING':
+      return { ...state, historyLoading: action.value }
     case 'ADD_ROW':
       return { ...state, rows: [...state.rows, action.row] }
     case 'REMOVE_ROW':
@@ -91,6 +94,26 @@ function reducer(state, action) {
             : r
         ),
       }
+    case 'LOAD_HISTORY': {
+      // Merge history records — skip any job_id already in local state
+      const existingJobIds = new Set(state.rows.map(r => r.jobId).filter(Boolean))
+      const newRows = action.jobs
+        .filter(j => !existingJobIds.has(j.job_id))
+        .map(j => ({
+          id: _rowId(),
+          mode: j.mode || 'local_write_ingest',
+          file: null,
+          cloudPath: '',
+          filename: j.filename,
+          docType: j.doc_type || '',
+          jobId: j.job_id,
+          status: j.status,
+          queuePosition: j.queue_position ?? null,
+          chunksAdded: j.chunks_added ?? null,
+          error: j.error ?? null,
+        }))
+      return { ...state, rows: [...state.rows, ...newRows] }
+    }
     default:
       return state
   }
@@ -127,6 +150,8 @@ export default function IngestDocumentsStep({ slug, project, onNext, onBack }) {
   const [state, dispatch] = useReducer(reducer, INITIAL_STATE)
   const pollingRef = useRef({})
   const timeoutRef = useRef({})
+  // Stable ref to _startPolling so the mount effect can call it without stale closures
+  const _startPollingRef = useRef(null)
   // Backend always returns azure_storage as `{ needed: bool }`, so we have to
   // check the flag — `Boolean(project?.azure_storage)` would be true even when
   // Azure isn't configured.
@@ -161,6 +186,24 @@ export default function IngestDocumentsStep({ slug, project, onNext, onBack }) {
         // Non-fatal — operator can still type a doc_type manually.
       })
 
+      // Fetch ingestion history so previously ingested files appear on revisit
+      api.getIngestJobs().then(payload => {
+        const jobs = payload.jobs || []
+        if (jobs.length > 0) {
+          dispatch({ type: 'LOAD_HISTORY', jobs })
+          // Resume polling for any non-terminal jobs (queued / ingesting)
+          jobs.forEach(j => {
+            if (j.status !== 'ingested' && j.status !== 'failed' && _startPollingRef.current) {
+              _startPollingRef.current(j.job_id)
+            }
+          })
+        }
+      }).catch(() => {
+        // Non-fatal — history fetch fails if services aren't up yet.
+      }).finally(() => {
+        dispatch({ type: 'SET_HISTORY_LOADING', value: false })
+      })
+
       // Poll deploy status until reach_layer is healthy
       const checkServices = async () => {
         try {
@@ -169,9 +212,11 @@ export default function IngestDocumentsStep({ slug, project, onNext, onBack }) {
             s => s.name === 'reach_layer' || s.name === 'reach_layer_web'
           )
           const keSvc = (status.services || []).find(s => s.name === 'knowledge_engine')
+          const agentCoreSvc = (status.services || []).find(s => s.name === 'agent_core')
           if (
             (reachSvc && reachSvc.status === 'healthy') &&
-            (keSvc && keSvc.status === 'healthy')
+            (keSvc && keSvc.status === 'healthy') &&
+            (agentCoreSvc && agentCoreSvc.status === 'healthy')
           ) {
             dispatch({ type: 'SET_SERVICES_READY', value: true })
             clearInterval(svcPollId)
@@ -333,6 +378,8 @@ export default function IngestDocumentsStep({ slug, project, onNext, onBack }) {
       })
     }, pollTimeoutMs)
   }, [pollIntervalMs, pollTimeoutMs])
+  // Keep ref current so the mount effect can call _startPolling without stale closures
+  _startPollingRef.current = _startPolling
 
   // ---------------------------------------------------------------------------
   // Render
@@ -342,6 +389,11 @@ export default function IngestDocumentsStep({ slug, project, onNext, onBack }) {
   const hasPending = pendingRows.length > 0
   const allTerminal = state.rows.length > 0 &&
     state.rows.every(r => r.status === 'ingested' || r.status === 'failed')
+
+  // Names of files already successfully ingested — used to warn before re-upload
+  const ingestedFilenames = new Set(
+    state.rows.filter(r => r.status === 'ingested').map(r => r.filename)
+  )
 
   if (!state.config) {
     return (
@@ -364,7 +416,15 @@ export default function IngestDocumentsStep({ slug, project, onNext, onBack }) {
       {!state.servicesReady && (
         <div className="mb-4 px-4 py-3 bg-yellow-900/30 border border-yellow-700 rounded-xl text-sm text-yellow-300 flex items-center gap-2">
           <span className="animate-spin text-xs">⏳</span>
-          Waiting for services to become healthy (Knowledge Engine + Reach Layer)…
+          Waiting for services to become healthy (Agent Core + Knowledge Engine + Reach Layer)…
+        </div>
+      )}
+
+      {/* Ingestion history loader */}
+      {state.historyLoading && (
+        <div className="flex items-center gap-2 text-xs text-gray-500 mb-3">
+          <span className="animate-spin">⟳</span>
+          Loading ingestion history…
         </div>
       )}
 
@@ -392,12 +452,19 @@ export default function IngestDocumentsStep({ slug, project, onNext, onBack }) {
                     className="w-full bg-gray-800 border border-gray-600 rounded-lg px-3 py-1.5 text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:border-blue-500"
                   />
                 ) : (
-                  <input
-                    type="file"
-                    accept={supportedExtensions.join(',')}
-                    onChange={e => handleFileChange(row.id, e.target.files?.[0])}
-                    className="text-sm text-gray-300 file:mr-3 file:py-1 file:px-3 file:rounded-lg file:border-0 file:text-xs file:bg-gray-700 file:text-gray-200 hover:file:bg-gray-600 cursor-pointer"
-                  />
+                  <>
+                    <input
+                      type="file"
+                      accept={supportedExtensions.join(',')}
+                      onChange={e => handleFileChange(row.id, e.target.files?.[0])}
+                      className="text-sm text-gray-300 file:mr-3 file:py-1 file:px-3 file:rounded-lg file:border-0 file:text-xs file:bg-gray-700 file:text-gray-200 hover:file:bg-gray-600 cursor-pointer"
+                    />
+                    {row.filename && ingestedFilenames.has(row.filename) && (
+                      <p className="mt-1 text-xs text-yellow-400">
+                        Already ingested — uploading will replace existing chunks in the vector store.
+                      </p>
+                    )}
+                  </>
                 )}
               </div>
 
