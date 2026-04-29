@@ -38,11 +38,67 @@ function SecretInput({ existingValue, onUpdate, placeholder, id, className }) {
   )
 }
 
+function PhoneNumberInput({ value, onChange }) {
+  const digits = (value || '').replace(/\D/g, '')
+  // Initialise: assume first 2 chars are country code if value already stored
+  const [cc, setCc] = React.useState(() => digits.length >= 2 ? digits.slice(0, 2) : '')
+  const [local, setLocal] = React.useState(() => digits.length >= 2 ? digits.slice(2) : digits)
+
+  function handleCc(raw) {
+    const cleaned = raw.replace(/\D/g, '').slice(0, 4)
+    setCc(cleaned)
+    onChange(cleaned + local)
+  }
+
+  function handleLocal(raw) {
+    const cleaned = raw.replace(/\D/g, '')
+    setLocal(cleaned)
+    onChange(cc + cleaned)
+  }
+
+  const inputClass = 'bg-gray-800 border border-gray-600 rounded-lg px-3 py-2 text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:border-blue-500 transition-colors'
+
+  return (
+    <div className="flex gap-2">
+      <div className="flex items-center">
+        <span className="text-gray-500 text-sm mr-1">+</span>
+        <input
+          type="text"
+          value={cc}
+          onChange={e => handleCc(e.target.value)}
+          placeholder="91"
+          maxLength={4}
+          className={`${inputClass} w-16`}
+        />
+      </div>
+      <input
+        type="text"
+        value={local}
+        onChange={e => handleLocal(e.target.value)}
+        placeholder="9240024444"
+        className={`${inputClass} flex-1`}
+      />
+    </div>
+  )
+}
+
 export default function MandatoryInputsStep({ data, updateData, onUpdate, project, onNext, onBack }) {
   const secrets = data.secrets || {}
 
   function update(field, value) {
     const updated = { ...secrets, [field]: value }
+    if (onUpdate) {
+      onUpdate({ secrets: updated })
+    } else if (updateData) {
+      updateData('secrets', updated)
+    }
+  }
+
+  function updateChannelSecret(envVar, value) {
+    const updated = {
+      ...secrets,
+      channel_secrets: { ...(secrets.channel_secrets || {}), [envVar]: value },
+    }
     if (onUpdate) {
       onUpdate({ secrets: updated })
     } else if (updateData) {
@@ -64,6 +120,9 @@ export default function MandatoryInputsStep({ data, updateData, onUpdate, projec
 
   const requiredSecrets = project?.required_secrets || []
   const azureNeeded = project?.azure_storage?.needed === true
+  const channelSecrets = project?.channel_secrets || []
+  const webSecrets = channelSecrets.filter(d => d.section === 'web')
+  const voiceSecrets = channelSecrets.filter(d => d.section === 'voice')
 
   return (
     <div>
@@ -113,6 +172,74 @@ export default function MandatoryInputsStep({ data, updateData, onUpdate, projec
                 {description && (
                   <p className="text-xs text-gray-500 mt-1">Used by tool: {description}</p>
                 )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Web Channel credentials — shown only when web channel is selected */}
+      {webSecrets.length > 0 && (
+        <div className="mb-8">
+          <h3 className="text-sm font-medium text-gray-300 mb-3 flex items-center gap-2">
+            <span className="w-1.5 h-1.5 rounded-full bg-blue-400" />
+            Web Channel
+          </h3>
+          <div className="border border-gray-700 rounded-xl p-4 bg-gray-900 flex flex-col gap-4">
+            {webSecrets.map(({ env_var, label, required, description }) => (
+              <div key={env_var}>
+                <label htmlFor={`channel_${env_var}`} className="block text-xs text-gray-300 mb-1">
+                  {label} {required && <span className="text-red-400">*</span>}
+                </label>
+                <input
+                  id={`channel_${env_var}`}
+                  type="text"
+                  value={(secrets.channel_secrets || {})[env_var] || ''}
+                  onChange={e => updateChannelSecret(env_var, e.target.value)}
+                  className="w-full bg-gray-800 border border-gray-600 rounded-lg px-3 py-2 text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:border-blue-500 transition-colors"
+                />
+                {description && <p className="text-xs text-gray-500 mt-1">{description}</p>}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Voice Channel credentials — shown only when voice channel is selected */}
+      {voiceSecrets.length > 0 && (
+        <div className="mb-8">
+          <h3 className="text-sm font-medium text-gray-300 mb-3 flex items-center gap-2">
+            <span className="w-1.5 h-1.5 rounded-full bg-purple-400" />
+            Voice Channel
+          </h3>
+          <div className="border border-gray-700 rounded-xl p-4 bg-gray-900 flex flex-col gap-4">
+            {voiceSecrets.map(({ env_var, label, required, secret, description }) => (
+              <div key={env_var}>
+                <label htmlFor={`channel_${env_var}`} className="block text-xs text-gray-300 mb-1">
+                  {label} {required && <span className="text-red-400">*</span>}
+                </label>
+                {env_var === 'VOBIZ_FROM_NUMBER' ? (
+                  <PhoneNumberInput
+                    value={(secrets.channel_secrets || {})[env_var] || ''}
+                    onChange={v => updateChannelSecret(env_var, v)}
+                  />
+                ) : secret ? (
+                  <SecretInput
+                    id={`channel_${env_var}`}
+                    existingValue={(secrets.channel_secrets || {})[env_var]}
+                    onUpdate={v => updateChannelSecret(env_var, v)}
+                    placeholder={label}
+                  />
+                ) : (
+                  <input
+                    id={`channel_${env_var}`}
+                    type="text"
+                    value={(secrets.channel_secrets || {})[env_var] || ''}
+                    onChange={e => updateChannelSecret(env_var, e.target.value)}
+                    className="w-full bg-gray-800 border border-gray-600 rounded-lg px-3 py-2 text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:border-blue-500 transition-colors"
+                  />
+                )}
+                {description && <p className="text-xs text-gray-500 mt-1">{description}</p>}
               </div>
             ))}
           </div>
