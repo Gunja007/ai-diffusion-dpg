@@ -2104,6 +2104,12 @@ async def get_deploy_status(slug: str) -> dict:
             from dev_kit.agent.deployer.state import clear_state
             clear_state(slug)
             return {"services": [], "overall": "idle"}
+        if state.overall == "destroying":
+            # Containers still exist but teardown is in progress — don't
+            # recompute overall from live Docker state (services still appear
+            # healthy during the shutdown window, which would flip the UI back
+            # to "Deployment Complete").
+            return state.to_response()
         if containers:
             for c in containers:
                 compose_name = c.get("Service", c.get("Name", ""))
