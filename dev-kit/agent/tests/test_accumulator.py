@@ -178,3 +178,29 @@ class TestPhasesOrdering:
     def test_phases_count(self):
         """GH-137: PHASES has 12 entries (tier + original 11)."""
         assert len(PHASES) == 12
+
+
+class TestHasKnowledgeBase:
+    def test_empty_accumulator_returns_false(self):
+        """Fresh accumulator with no knowledge_engine data returns False."""
+        acc = ConfigAccumulator()
+        assert acc.has_knowledge_base() is False
+
+    def test_knowledge_engine_with_disabled_skb_returns_false(self):
+        """knowledge_engine with static_knowledge_base.enabled=False returns False."""
+        acc = ConfigAccumulator()
+        acc.update("knowledge_engine", "knowledge.blocks.static_knowledge_base", {"enabled": False})
+        assert acc.has_knowledge_base() is False
+
+    def test_knowledge_engine_with_enabled_skb_returns_true(self):
+        """knowledge_engine with static_knowledge_base.enabled=True returns True."""
+        acc = ConfigAccumulator()
+        acc.update("knowledge_engine", "knowledge.blocks.static_knowledge_base", {"enabled": True})
+        assert acc.has_knowledge_base() is True
+
+    def test_missing_knowledge_engine_key_returns_false_no_exception(self):
+        """Accumulator without any knowledge_engine data returns False without raising."""
+        acc = ConfigAccumulator()
+        # knowledge_engine block exists but is empty — no KeyError should be raised
+        assert acc.get_block("knowledge_engine") == {}
+        assert acc.has_knowledge_base() is False

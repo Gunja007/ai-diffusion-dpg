@@ -107,8 +107,13 @@ def _rewrite_compose_bind_paths_to_host(services: dict) -> None:
                 rewritten.append(vol)
         svc["volumes"] = rewritten
 
-# Load dev-kit config once at startup
+# Load dev-kit config once at startup; configure logging immediately after so
+# all subsequent logger calls honour the level from config (or DEVKIT_LOG_LEVEL env var).
 _DEVKIT_CONFIG = _load_devkit_config()
+logging.basicConfig(
+    level=getattr(logging, _DEVKIT_CONFIG.log_level, logging.INFO),
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
 _KE_TO_DEVKIT_API_KEY = os.environ.get("KE_TO_DEVKIT_API_KEY", "")
 _DEVKIT_TO_REACH_API_KEY = os.environ.get("DEVKIT_TO_REACH_API_KEY", "")
 _REACH_LAYER_URL = os.environ.get("REACH_LAYER_URL", "http://localhost:8005")
@@ -204,6 +209,7 @@ def _rehydrate_upload_chain_from_running_containers() -> bool:
                 "status": "failure",
                 "error": str(exc),
             },
+            exc_info=True,
         )
         return False
 
@@ -429,6 +435,7 @@ def _load_project_meta(slug: str) -> dict:
         logger.error(
             "project_meta_corrupt",
             extra={"operation": "_load_project_meta", "status": "failure", "error": str(exc), "latency_ms": 0},
+            exc_info=True,
         )
         raise HTTPException(status_code=500, detail="Project metadata is corrupt") from exc
 
@@ -469,6 +476,10 @@ def create_project(body: CreateProjectRequest) -> dict:
     acc = ConfigAccumulator()
     render_all(project_path, acc)
     _engines[slug] = ConversationEngine(project_path, _anthropic_client)
+    logger.info(
+        "devkit.project.created",
+        extra={"operation": "api.create_project", "status": "success", "slug": slug},
+    )
     return meta
 
 
@@ -495,6 +506,7 @@ def list_projects() -> list[dict]:
                         "latency_ms": 0,
                         "path": str(meta_file),
                     },
+                    exc_info=True,
                 )
     return projects
 
@@ -515,6 +527,9 @@ def get_project(slug: str) -> dict:
     meta["required_secrets"] = engine.accumulator.get_required_secrets()
     meta["channel_secrets"] = engine.accumulator.get_required_channel_secrets()
 
+    # Knowledge base presence — used by the deploy wizard to skip the ingest step
+    meta["has_knowledge_base"] = engine.accumulator.has_knowledge_base()
+
     return meta
 
 
@@ -526,6 +541,10 @@ def delete_project(slug: str) -> dict:
         raise HTTPException(status_code=404, detail=f"Project '{slug}' not found")
     shutil.rmtree(project_path)
     _engines.pop(slug, None)
+    logger.info(
+        "devkit.project.deleted",
+        extra={"operation": "api.delete_project", "status": "success", "slug": slug},
+    )
     return {"deleted": slug}
 
 
@@ -561,6 +580,7 @@ async def chat(slug: str, body: ChatRequest) -> dict:
                 "latency_ms": int((time.time() - start) * 1000),
                 "slug": slug,
             },
+            exc_info=True,
         )
         raise HTTPException(status_code=500, detail={"error": str(exc)}) from exc
     except Exception as exc:
@@ -619,6 +639,15 @@ def restore_checkpoint_route(slug: str, phase: str) -> dict:
     engine._history = engine._load_history_from_checkpoints()
     render_all(project_path, restored_acc)
     engine._save_accumulator()
+    logger.info(
+        "devkit.conversation.checkpoint_restored",
+        extra={
+            "operation": "conversation.checkpoint_restore",
+            "status": "success",
+            "slug": slug,
+            "phase": phase,
+        },
+    )
     return {"restored": phase, "summary": summary}
 
 
@@ -653,6 +682,7 @@ def preview_checkpoint(slug: str, phase: str) -> list[dict]:
         logger.error(
             "checkpoint_preview_corrupt",
             extra={"operation": "preview_checkpoint", "status": "failure", "error": str(exc), "latency_ms": 0},
+            exc_info=True,
         )
         raise HTTPException(status_code=404, detail=f"Checkpoint '{phase}' accumulator unreadable") from exc
 
@@ -1079,6 +1109,23 @@ def pre_deploy_validate(slug: str) -> dict[str, Any]:
 
     all_valid = all(len(errs) == 0 for errs in block_errors.values()) and not invariant_errors
 
+    issue_count = sum(len(errs) for errs in block_errors.values()) + len(invariant_errors)
+    if all_valid:
+        logger.info(
+            "devkit.deploy.validation_passed",
+            extra={"operation": "api.deploy_validate", "status": "success", "slug": slug},
+        )
+    else:
+        logger.warning(
+            "devkit.deploy.validation_failed",
+            extra={
+                "operation": "api.deploy_validate",
+                "status": "failure",
+                "slug": slug,
+                "issues": issue_count,
+            },
+        )
+
     # Build display-friendly merged configs: for reach_layer, mark unselected
     # channels as enabled: false so the viewer reflects what will actually deploy.
     display_merged = {}
@@ -1188,6 +1235,10 @@ async def update_dpg_value(slug: str, block: str, body: dict) -> dict:
     """
     if block not in BLOCKS:
         raise HTTPException(status_code=400, detail=f"Unknown block: {block}")
+    try:
+        yaml.safe_load(body["content"])
+    except yaml.YAMLError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid YAML: {exc}")
     path = DPG_DIR / f"{block}.yaml"
     path.write_text(body["content"])
     return {"status": "ok"}
@@ -1339,21 +1390,6 @@ def _apply_resources_to_compose(content: str, resources: dict) -> str:
             }
 
     return _yaml.dump(compose, default_flow_style=False, sort_keys=False)
-
-
-@app.put("/api/projects/{slug}/deploy/compose-file")
-async def update_compose_file(slug: str, body: dict) -> dict:
-    """Write updated docker-compose content back to the compose file.
-
-    Args:
-        slug: Project slug (unused; endpoint is project-scoped for consistency).
-        body: Dict with ``content`` key containing the full YAML string.
-
-    Returns:
-        Dict with ``status: ok`` on success.
-    """
-    COMPOSE_FILE.write_text(body["content"])
-    return {"status": "ok"}
 
 
 @app.get("/api/deploy/public-key")
@@ -1688,6 +1724,10 @@ async def execute_deploy(slug: str, body: dict) -> dict:
     for svc in all_services:
         state.set_service(svc, "queued")
 
+    logger.info(
+        "devkit.deploy.execute_triggered",
+        extra={"operation": "api.deploy_execute", "status": "start", "slug": slug, "target": target},
+    )
     if target == "docker":
         selected_channels = _get_engine(slug).accumulator.get_reach_channel_selection_or_default()
         asyncio.create_task(_run_docker_deploy(slug, state, secrets, resources, selected_channels))
@@ -1710,6 +1750,11 @@ async def _run_docker_deploy(
     import tempfile
     from dev_kit.agent.deployer.compose import run_compose_up
     from dev_kit.agent.deployer.helm import DEPLOY_PHASES
+
+    logger.info(
+        "devkit.docker_deploy.start",
+        extra={"operation": "_run_docker_deploy", "status": "start", "slug": slug},
+    )
 
     # Map channel name → compose service name. CLI is already profile-gated in the
     # compose file so it never starts with `docker compose up`; web/voice need explicit
@@ -1807,8 +1852,9 @@ async def _run_docker_deploy(
                 state.set_service(svc_name, "failed", result["stderr"][:200])
             state.overall = "failed"
             logger.error(
-                "docker_deploy_failed",
-                extra={"operation": "_run_docker_deploy", "status": "failure", "error": result["stderr"][:500]},
+                "docker_deploy_failed: %s",
+                result["stderr"][:500],
+                extra={"operation": "_run_docker_deploy", "status": "failure"},
             )
     except Exception as exc:
         for svc_name in state.services:
@@ -1817,6 +1863,7 @@ async def _run_docker_deploy(
         logger.error(
             "docker_deploy_exception",
             extra={"operation": "_run_docker_deploy", "status": "failure", "error": str(exc)},
+            exc_info=True,
         )
 
 
@@ -1825,6 +1872,10 @@ async def _run_k8s_deploy(slug: str, state, secrets: dict, resources: dict, kube
     import tempfile
     from dev_kit.agent.deployer.helm import DEPLOY_PHASES, build_helm_command, run_helm_command
 
+    logger.info(
+        "devkit.k8s_deploy.start",
+        extra={"operation": "_run_k8s_deploy", "status": "start", "slug": slug},
+    )
     _helm_base = HELM_BASE
     state.namespace = namespace
 
@@ -1950,12 +2001,12 @@ async def _run_k8s_deploy(slug: str, state, secrets: dict, resources: dict, kube
                 else:
                     state.set_service(svc_name, "failed", result["stderr"][:200])
                     logger.error(
-                        "k8s_deploy_service_failed",
+                        "k8s_deploy_service_failed: %s",
+                        result["stderr"][:500],
                         extra={
                             "operation": "_run_k8s_deploy",
                             "status": "failure",
                             "service": svc_name,
-                            "error": result["stderr"][:500],
                         },
                     )
 
@@ -1974,6 +2025,7 @@ async def _run_k8s_deploy(slug: str, state, secrets: dict, resources: dict, kube
         logger.error(
             "k8s_deploy_exception",
             extra={"operation": "_run_k8s_deploy", "status": "failure", "error": str(exc)},
+            exc_info=True,
         )
 
 
@@ -2008,6 +2060,7 @@ async def _get_restart_count(container_name: str) -> int:
         stdout, _ = await proc.communicate()
         return int(stdout.decode().strip())
     except Exception:
+        logger.warning("get_restart_count_failed", extra={"operation": "_get_restart_count", "container": container_name}, exc_info=True)
         return 0
 
 
@@ -2316,6 +2369,15 @@ async def _run_docker_destroy(
     from dev_kit.agent.deployer.compose import run_compose_down
     from dev_kit.agent.deployer.state import get_state, clear_state
 
+    logger.info(
+        "devkit.destroy.start",
+        extra={
+            "operation": "_run_docker_destroy",
+            "status": "start",
+            "slug": slug,
+            "remove_volumes": remove_volumes,
+        },
+    )
     try:
         result = await run_compose_down(
             project_name=project_name,
@@ -2330,6 +2392,7 @@ async def _run_docker_destroy(
                     logger.warning(
                         "devkit.destroy_compose_cleanup_failed",
                         extra={"operation": "_run_docker_destroy", "error": str(exc)},
+                        exc_info=True,
                     )
             clear_state(slug)
             logger.info(
@@ -2346,12 +2409,9 @@ async def _run_docker_destroy(
             if state:
                 state.overall = "failed"
             logger.error(
-                "devkit.destroy_failed",
-                extra={
-                    "operation": "_run_docker_destroy",
-                    "status": "failure",
-                    "error": result["stderr"][:500],
-                },
+                "devkit.destroy_failed: %s",
+                result["stderr"][:500],
+                extra={"operation": "_run_docker_destroy", "status": "failure"},
             )
     except Exception as exc:
         state = get_state(slug)
@@ -2360,6 +2420,7 @@ async def _run_docker_destroy(
         logger.error(
             "devkit.destroy_exception",
             extra={"operation": "_run_docker_destroy", "status": "failure", "error": str(exc)},
+            exc_info=True,
         )
 
 
@@ -2482,18 +2543,21 @@ async def ingest_submit(request: Request):
         logger.error(
             "devkit.ingest_submit_unreachable",
             extra={"operation": "devkit.ingest_submit", "status": "failure", "error": str(e)},
+            exc_info=True,
         )
         raise HTTPException(503, "Reach Layer is unreachable") from e
     except _httpx.TimeoutException as e:
         logger.error(
             "devkit.ingest_submit_timeout",
             extra={"operation": "devkit.ingest_submit", "status": "failure", "error": str(e)},
+            exc_info=True,
         )
         raise HTTPException(504, "Reach Layer timed out") from e
     except _httpx.HTTPError as e:
         logger.error(
             "devkit.ingest_submit_error",
             extra={"operation": "devkit.ingest_submit", "status": "failure", "error": str(e)},
+            exc_info=True,
         )
         raise HTTPException(502, "Upstream error communicating with Reach Layer") from e
 
@@ -2545,15 +2609,22 @@ async def ingest_job_status(job_id: str):
         logger.error(
             "devkit.ingest_job_status_unreachable",
             extra={"operation": "devkit.ingest_job_status", "status": "failure", "error": str(e)},
+            exc_info=True,
         )
         raise HTTPException(503, "Reach Layer is unreachable") from e
     except _httpx.TimeoutException as e:
         logger.error(
             "devkit.ingest_job_status_timeout",
             extra={"operation": "devkit.ingest_job_status", "status": "failure", "error": str(e)},
+            exc_info=True,
         )
         raise HTTPException(504, "Reach Layer timed out") from e
     except _httpx.HTTPError as e:
+        logger.error(
+            "devkit.ingest_job_status_error",
+            extra={"operation": "devkit.ingest_job_status", "status": "failure", "error": str(e)},
+            exc_info=True,
+        )
         raise HTTPException(502, "Upstream error communicating with Reach Layer") from e
 
 
@@ -2602,15 +2673,22 @@ async def list_ingest_jobs(limit: int = 100):
         logger.error(
             "devkit.list_ingest_jobs_unreachable",
             extra={"operation": "devkit.list_ingest_jobs", "status": "failure", "error": str(e)},
+            exc_info=True,
         )
         raise HTTPException(503, "Reach Layer is unreachable") from e
     except _httpx.TimeoutException as e:
         logger.error(
             "devkit.list_ingest_jobs_timeout",
             extra={"operation": "devkit.list_ingest_jobs", "status": "failure", "error": str(e)},
+            exc_info=True,
         )
         raise HTTPException(504, "Reach Layer timed out") from e
     except _httpx.HTTPError as e:
+        logger.error(
+            "devkit.list_ingest_jobs_error",
+            extra={"operation": "devkit.list_ingest_jobs", "status": "failure", "error": str(e)},
+            exc_info=True,
+        )
         raise HTTPException(502, "Upstream error communicating with Reach Layer") from e
 
 
@@ -2712,6 +2790,7 @@ def _append_callback_to_ingest_log(
                 "status": "failure",
                 "error": str(e),
             },
+            exc_info=True,
         )
 
 

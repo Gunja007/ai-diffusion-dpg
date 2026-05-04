@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 
 import anthropic
-from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+from tenacity import before_sleep_log, retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from dev_kit.agent.accumulator import PHASES, ConfigAccumulator
 from dev_kit.agent.checkpoints import build_summary, list_checkpoints, restore_checkpoint, save_checkpoint
@@ -35,6 +35,7 @@ _llm_retry = retry(
     stop=stop_after_attempt(2),
     wait=wait_exponential(multiplier=1, min=1, max=4),
     reraise=True,
+    before_sleep=before_sleep_log(logger, logging.WARNING),
 )
 
 
@@ -83,6 +84,7 @@ class ConversationEngine:
                         "error": str(exc),
                         "path": str(acc_path),
                     },
+                    exc_info=True,
                 )
 
         meta_path = self._project_path / "_meta" / "project.json"
@@ -100,6 +102,7 @@ class ConversationEngine:
                         "error": str(exc),
                         "path": str(meta_path),
                     },
+                    exc_info=True,
                 )
 
         # Restore conversation history — prefer the persisted history file over
@@ -116,6 +119,7 @@ class ConversationEngine:
                         "status": "failure",
                         "error": str(exc),
                     },
+                    exc_info=True,
                 )
                 self._history = self._load_history_from_checkpoints()
         else:
@@ -157,6 +161,7 @@ class ConversationEngine:
                             "error": str(exc),
                             "path": str(history_file),
                         },
+                        exc_info=True,
                     )
         if history:
             logger.info(
@@ -184,6 +189,7 @@ class ConversationEngine:
             logger.warning(
                 "history_save_failed",
                 extra={"operation": "conversation._save_history", "status": "failure", "error": str(exc)},
+                exc_info=True,
             )
 
     def _save_accumulator(self) -> None:
@@ -267,6 +273,7 @@ class ConversationEngine:
                         "error_type": type(exc).__name__,
                         "latency_ms": int((time.time() - start) * 1000),
                     },
+                    exc_info=True,
                 )
                 raise ConversationError(f"LLM call failed: {exc}") from exc
 
@@ -308,13 +315,32 @@ class ConversationEngine:
             if self._state["phase_changed"]:
                 old_phase = self._state["phase"]
                 new_phase = self._state["phase_changed"]
+                slug = self._state.get("project_meta", {}).get("slug", "")
                 phase_list = PHASES
                 phase_number = phase_list.index(old_phase) + 1 if old_phase in phase_list else 0
                 phase_label = f"{phase_number:02d}_{old_phase}"
                 save_checkpoint(self._project_path, phase_label, self.accumulator, self._history[:-2])
+                logger.info(
+                    "devkit.conversation.checkpoint_saved",
+                    extra={
+                        "operation": "conversation.checkpoint_save",
+                        "status": "success",
+                        "slug": slug,
+                        "phase": phase_label,
+                    },
+                )
                 checkpoint_created = phase_label
                 self._state["phase"] = new_phase
                 self._state["phase_changed"] = None
+                logger.info(
+                    "devkit.conversation.phase_transition",
+                    extra={
+                        "operation": "conversation.phase_transition",
+                        "status": "success",
+                        "slug": slug,
+                        "to_phase": new_phase,
+                    },
+                )
                 system = self._build_system_prompt()
 
             # Handle rollback requested by tool
@@ -364,7 +390,26 @@ class ConversationEngine:
         self._save_accumulator()
         self._save_project_meta()
         self._save_history()
+        _render_slug = self._state.get("project_meta", {}).get("slug", "")
+        logger.info(
+            "devkit.conversation.render_all",
+            extra={
+                "operation": "conversation.render_all",
+                "status": "start",
+                "slug": _render_slug,
+            },
+        )
+        _render_start = time.time()
         render_all(self._project_path, self.accumulator)
+        logger.info(
+            "devkit.conversation.render_all",
+            extra={
+                "operation": "conversation.render_all",
+                "status": "success",
+                "slug": _render_slug,
+                "elapsed_ms": int((time.time() - _render_start) * 1000),
+            },
+        )
 
         return {
             "reply": reply,
