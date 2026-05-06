@@ -19,14 +19,9 @@ One top-level model per service:
 
 from __future__ import annotations
 
-import logging
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field, ValidationError, model_validator
-
-from dev_kit.schemas.loader import load_template
-
-logger = logging.getLogger(__name__)
+from pydantic import BaseModel, Field, model_validator
 
 
 # ---------------------------------------------------------------------------
@@ -745,12 +740,22 @@ class SessionStateConfig(BaseModel):
 
 
 class UserNodeConfig(BaseModel):
-    label: str = Field(default="User", description="Memgraph node label for the root user node, e.g. 'User'")
-    key: str = Field(default="user_id", description="Property used as the unique user identifier, e.g. 'user_id'")
+    # `label` and `key` are required at runtime (memory_layer/src/schema/config.py
+    # declares them with no defaults). The dev-kit schema previously supplied
+    # defaults here, which masked LLM-generated configs that left user_node
+    # empty — those configs passed deploy review and then crashed at startup
+    # with "Field required" on label/key. Removed the defaults so deploy
+    # review surfaces the gap before deploy.
+    label: str = Field(..., min_length=1, description="Memgraph node label for the root user node, e.g. 'User'")
+    key: str = Field(..., min_length=1, description="Property used as the unique user identifier, e.g. 'user_id'")
 
 
 class GraphConfig(BaseModel):
-    user_node: UserNodeConfig = Field(default_factory=UserNodeConfig)
+    # user_node is required at runtime (memory_layer GraphConfig declares it
+    # without a default). Removed the default_factory here for the same reason
+    # as UserNodeConfig above — keep dev-kit deploy review at least as strict
+    # as runtime so missing required fields fail at the wizard, not in prod.
+    user_node: UserNodeConfig
     subnodes: dict[str, Any] = Field(
         default_factory=dict,
         description="Named subnode definitions attached to the user node. "
@@ -1179,199 +1184,3 @@ class ReachLayerConfig(BaseModel):
     )
 
 
-# ---------------------------------------------------------------------------
-# Partial validation helper
-# ---------------------------------------------------------------------------
-
-_BLOCK_MODEL_MAP: dict[str, type] = {
-    "agent_core": AgentCoreConfig,
-    "knowledge_engine": KnowledgeEngineConfig,
-    "trust_layer": TrustLayerConfig,
-    "memory_layer": MemoryLayerConfig,
-    "observability_layer": ObservabilityLayerConfig,
-    "action_gateway": ActionGatewayConfig,
-    "reach_layer": ReachLayerConfig,
-}
-
-
-# ---------------------------------------------------------------------------
-# Raya TTS voices — first voice per language from https://hub.getraya.app/v1/voices
-# Used by validate_partial to reject hallucinated voice IDs.
-# ---------------------------------------------------------------------------
-RAYA_VOICES: dict[str, dict[str, str]] = {
-    "c849b31b-b0ba-488f-b97d-3fd12f2656f4": {"name": "Sneha", "language": "mr"},
-    "d6a002d0-230c-49b1-a137-b8a7d564b1ae": {"name": "Priyanka", "language": "hi"},
-    "25a7c7d9-57b3-488a-a880-33edf6642902": {"name": "Tanvi", "language": "te"},
-    "6a897d02-83ab-43ea-b17f-a8cc2d96a279": {"name": "Meera", "language": "kn"},
-    "a1b2c3d4-e5f6-4789-a012-b3c4d5e6f789": {"name": "Aishwarya", "language": "bn"},
-    "d4e5f6a7-b8c9-4a01-d345-e6f7a8b9c012": {"name": "Priti", "language": "as"},
-    "9a01bcde-2345-6789-abc1-123456abcdef": {"name": "Jignesh", "language": "gu"},
-    "0f24fb66-e495-4781-9e84-1224aa7dacde": {"name": "Nayra", "language": "en-in"},
-    "90534e23-8bcb-4b1c-a16b-b9a4be646321": {"name": "Solene", "language": "en-us"},
-    "57a1e849-8e0f-43ee-adab-b4b74a9d79e1": {"name": "Devika", "language": "ml"},
-    "5d6c7ee4-2563-4dab-9c8a-c3269e22cba9": {"name": "Ritu", "language": "ne"},
-    "fed6231c-7e35-4fbe-bbca-254f566e5dd5": {"name": "Abirami", "language": "ta"},
-}
-
-VALID_RAYA_VOICE_IDS: frozenset[str] = frozenset(RAYA_VOICES.keys())
-
-
-def _validate_raya_voice_id(data: dict) -> list[str]:
-    """Check that voice_id in reach_layer config is a known Raya voice UUID.
-
-    Args:
-        data: The reach_layer config dict.
-
-    Returns:
-        List of error strings. Empty if valid or voice not configured.
-    """
-    voice_cfg = (
-        data.get("reach_layer", {})
-        .get("channels", {})
-        .get("voice", {})
-        .get("raya", {})
-    )
-    voice_id = voice_cfg.get("voice_id")
-    if not voice_id:
-        return []
-    if voice_id not in VALID_RAYA_VOICE_IDS:
-        available = ", ".join(
-            f"{v['name']} ({v['language']})" for v in RAYA_VOICES.values()
-        )
-        return [
-            f"reach_layer.channels.voice.raya.voice_id: '{voice_id}' is not a valid "
-            f"Raya voice ID. Available voices: {available}"
-        ]
-    return []
-
-
-def validate_partial(block: str, data: dict) -> list[str]:
-    """Validate partial config data for a block without requiring completeness.
-
-    Runs two checks in order:
-    1. Template structural check — every key in ``data`` must exist in the
-       YAML template. Catches renamed keys (e.g. ``blocked_msg`` instead of
-       ``blocked_message``) at every nesting level.
-    2. Pydantic type check — validates value types; filters out missing-field
-       errors so partial data is accepted.
-    3. Domain-specific checks (e.g. Raya voice ID validation for reach_layer).
-
-    Args:
-        block: Block name, e.g. "agent_core" or "trust_layer".
-        data: Partial config dict to validate.
-
-    Returns:
-        List of error strings. Empty list means valid so far.
-    """
-    # --- Block existence check ---
-    try:
-        load_template(block)
-    except ValueError:
-        return [f"Unknown block: {block!r}"]
-
-    if not data:
-        return []
-
-    # --- 1. YAML template structural check: catch wrong key names at all levels ---
-    try:
-        template = load_template(block)
-        key_errors = _check_keys_against_template(data, template, path="")
-        if key_errors:
-            return key_errors
-    except (ValueError, FileNotFoundError) as exc:
-        logger.warning(
-            "validate_partial: template load failed for block %r — skipping key check",
-            block,
-            extra={"operation": "validate_partial", "status": "skipped", "error": str(exc)},
-        )
-
-    # --- 2. Pydantic type/value check (filters out missing-field errors) ---
-    pydantic_errors: list[str] = []
-    model_cls = _BLOCK_MODEL_MAP.get(block)
-    if model_cls is not None:
-        try:
-            model_cls.model_validate(data)
-        except ValidationError as exc:
-            pydantic_errors = [
-                f"{'.'.join(str(loc) for loc in err['loc'])}: {err['msg']}"
-                for err in exc.errors()
-                if err["type"] != "missing"
-            ]
-
-    # --- 3. Domain-specific value checks ---
-    domain_errors: list[str] = []
-    if block == "reach_layer":
-        domain_errors.extend(_validate_raya_voice_id(data))
-
-    return pydantic_errors + domain_errors
-
-
-# Open-map sentinel: template value is a dict/list whose keys are examples,
-# not fixed field names. We detect these by looking for placeholder key names.
-_OPEN_MAP_PLACEHOLDER_KEYS = frozenset({
-    "field_name", "param_name", "connector_name", "NodeName",
-    "intent_name", "doc_type_name", "value_one",
-    # Trust Layer open maps
-    "policy_pack_name", "guardrail_name",
-    # Action Gateway response.projection.fields — user-defined target → dot-path map
-    "example_target",
-})
-
-
-def _check_keys_against_template(
-    data: object,
-    template: object,
-    path: str,
-) -> list[str]:
-    """Recursively check that every key in ``data`` exists in ``template``.
-
-    Detects renamed or invented keys at any nesting level. Skips open maps
-    (template dicts whose only keys are placeholder names) since those accept
-    arbitrary user-defined keys.
-
-    Args:
-        data: The generated config value (any type).
-        template: The corresponding template value.
-        path: Dot-notation path for error messages.
-
-    Returns:
-        List of error strings. Empty list means all keys are valid.
-    """
-    errors: list[str] = []
-
-    if not isinstance(data, dict) or not isinstance(template, dict):
-        # Not both dicts — nothing to key-check at this level.
-        # If data is a list, recurse into each item against the template list item.
-        if isinstance(data, list) and isinstance(template, list) and template:
-            item_template = template[0]
-            for i, item in enumerate(data):
-                child_path = f"{path}[{i}]" if path else f"[{i}]"
-                errors.extend(_check_keys_against_template(item, item_template, child_path))
-        return errors
-
-    # Check if this is an open map (template has only placeholder keys, or is
-    # an empty dict {} which means "any keys accepted").
-    template_keys = set(template.keys())
-    if not template_keys or template_keys.issubset(_OPEN_MAP_PLACEHOLDER_KEYS):
-        # Open map — any user-defined key is valid; recurse into values.
-        # Empty template dict ({}) means "accept any keys, no sub-structure to validate".
-        if template_keys:
-            placeholder_key = next(iter(template_keys))
-            item_template = template[placeholder_key]
-            for key, value in data.items():
-                child_path = f"{path}.{key}" if path else key
-                errors.extend(_check_keys_against_template(value, item_template, child_path))
-        return errors
-
-    # Fixed-key dict — every key in data must be in the template.
-    for key in data:
-        child_path = f"{path}.{key}" if path else key
-        if key not in template:
-            errors.append(
-                f"Unknown key '{child_path}' — not in the {path.split('.')[0] if path else 'root'} template. "
-                f"Valid keys here: {sorted(template.keys())}"
-            )
-        else:
-            errors.extend(_check_keys_against_template(data[key], template[key], child_path))
-
-    return errors

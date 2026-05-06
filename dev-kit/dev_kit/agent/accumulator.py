@@ -10,8 +10,11 @@ graph management, serialisation, and status tracking.
 from __future__ import annotations
 
 import logging
+import os
 from copy import deepcopy
 from enum import Enum
+
+from dev_kit.schemas.validation import validate_domain_section
 
 logger = logging.getLogger(__name__)
 
@@ -75,13 +78,30 @@ class ConfigAccumulator:
     def __init__(self) -> None:
         self._data: dict[str, dict] = {block: {} for block in BLOCKS}
         self._statuses: dict[str, ConfigStatus] = {block: ConfigStatus.PENDING for block in BLOCKS}
+        self._validation_attempts: dict[tuple[str, str], int] = {}
+        self._max_validation_attempts: int = int(
+            os.environ.get("DEVKIT_VALIDATION_MAX_ATTEMPTS", "3")
+        )
+        self._strict_mode: bool = os.environ.get("DEVKIT_DPG_SCHEMA_STRICT", "1") == "1"
 
     # ------------------------------------------------------------------
     # Config updates
     # ------------------------------------------------------------------
 
-    def update(self, block: str, section: str, values: dict) -> None:
-        """Deep-merge values into the block config at the given dot-notation section.
+    def update(self, block: str, section: str, values: dict) -> str:
+        """Validate the would-be merged result, then commit only on success.
+
+        Builds a candidate copy of the block, merges ``values`` into the
+        target path, and validates the affected top-level section against
+        its Pydantic schema BEFORE mutating ``self._data``. ``[missing]``
+        errors are filtered so partial drafts can accumulate across turns.
+
+        Once the per-(block, top_level) retry counter reaches the cap, the
+        section is marked STALE and every subsequent call to that section
+        within the same turn is hard-rejected without re-validation. This
+        is the loop safety net — even if the LLM ignores the escalation
+        message, the same-section dispatch returns immediately with a stop
+        instruction.
 
         Args:
             block: One of the 7 DPG block names.
@@ -89,11 +109,28 @@ class ConfigAccumulator:
                      Empty string merges directly into the block root.
             values: Values to merge.
 
+        Returns:
+            "OK" — validation passed (or strict mode is off, or section is
+            unschema'd, or section root). Write committed.
+            "VALIDATION_ERROR (attempt N/M):..." — schema rejected the
+            candidate merge; nothing was written; the LLM should retry
+            with corrected values.
+            "VALIDATION_FAILED_AFTER_M_ATTEMPTS..." — counter just hit the
+            cap; section marked STALE; LLM should escalate or advance.
+            "VALIDATION_SECTION_STALE..." — counter already at cap from a
+            prior attempt this turn; this call is hard-rejected without
+            validation. Returned to keep the LLM from looping on a section
+            it has already failed M times.
+
         Raises:
             ValueError: If block is not a valid DPG block name.
         """
         if block not in BLOCKS:
             raise ValueError(f"Unknown block: {block!r}. Must be one of {BLOCKS}")
+
+        # Section-root writes (empty section): skip schema validation —
+        # they typically span multiple sections and per-section schemas
+        # don't apply. Commit straight to data.
         if not section:
             self._data[block] = _deep_merge(self._data[block], values)
             logger.info(
@@ -105,18 +142,127 @@ class ConfigAccumulator:
                     "path": "(root)",
                 },
             )
-            return
+            return "OK"
+
+        top_level = section.split(".", 1)[0]
+        attempt_key = (block, top_level)
+
+        # Hard-reject if this section already exhausted its retry budget
+        # this turn. Skips validation entirely so the LLM cannot keep the
+        # tool-loop alive with new variations of the same bad write.
+        if (
+            self._strict_mode
+            and self._validation_attempts.get(attempt_key, 0) >= self._max_validation_attempts
+        ):
+            logger.warning(
+                "devkit.accumulator.section_stale_rejected",
+                extra={
+                    "operation": "accumulator.update",
+                    "status": "rejected_section_stale",
+                    "block": block,
+                    "section": section,
+                    "top_level": top_level,
+                    "attempts": self._validation_attempts[attempt_key],
+                    "max_attempts": self._max_validation_attempts,
+                },
+            )
+            return (
+                f"VALIDATION_SECTION_STALE for {block}.{top_level}: "
+                f"already failed {self._max_validation_attempts} times this turn. "
+                f"DO NOT call update_config for this section again — repeated calls "
+                f"will keep returning this same rejection. set_phase may also be "
+                f"blocked because the merged state is still inconsistent. Your "
+                f"correct next action is to STOP calling tools and reply to the "
+                f"user as a text message: tell them which field could not be "
+                f"auto-configured, what value(s) you tried, and ask them to either "
+                f"provide a corrected value or instruct you to skip the section."
+            )
+
+        # Build the would-be merged result without touching self._data.
+        candidate_block = deepcopy(self._data[block])
         keys = section.split(".")
-        target = self._data[block]
-        current = target
+        cursor = candidate_block
         for key in keys[:-1]:
-            if key not in current or not isinstance(current[key], dict):
-                current[key] = {}
-            current = current[key]
+            if key not in cursor or not isinstance(cursor[key], dict):
+                cursor[key] = {}
+            cursor = cursor[key]
         last = keys[-1]
-        if last not in current or not isinstance(current.get(last), dict):
-            current[last] = {}
-        current[last] = _deep_merge(current[last], values)
+        if last not in cursor or not isinstance(cursor.get(last), dict):
+            cursor[last] = {}
+        cursor[last] = _deep_merge(cursor[last], values)
+
+        # Strict mode off: commit without validation.
+        if not self._strict_mode:
+            self._data[block] = candidate_block
+            logger.info(
+                "devkit.accumulator.config_updated",
+                extra={
+                    "operation": "accumulator.update",
+                    "status": "success",
+                    "block": block,
+                    "path": section,
+                },
+            )
+            return "OK"
+
+        merged_top = candidate_block.get(top_level, {})
+        error = validate_domain_section(block, section, merged_top)
+
+        if error:
+            # Filter [missing] errors — partial drafts are allowed during
+            # config building. If only [missing] errors remain, treat as
+            # valid and commit. Pre-existing [missing]-filter behaviour
+            # used to live in validate_partial; consolidating it here.
+            non_missing_lines = [line for line in error.split("\n") if "[missing]" not in line]
+            filtered_error = "\n".join(non_missing_lines).strip()
+
+            if filtered_error:
+                attempt = self._validation_attempts.get(attempt_key, 0) + 1
+                self._validation_attempts[attempt_key] = attempt
+
+                if attempt >= self._max_validation_attempts:
+                    self.set_status(block, ConfigStatus.STALE)
+                    logger.warning(
+                        "devkit.accumulator.validation_cap_reached",
+                        extra={
+                            "operation": "accumulator.update",
+                            "status": "failure_cap_reached",
+                            "block": block,
+                            "section": section,
+                            "top_level": top_level,
+                            "attempts": attempt,
+                            "max_attempts": self._max_validation_attempts,
+                        },
+                    )
+                    return (
+                        f"VALIDATION_FAILED_AFTER_{self._max_validation_attempts}_ATTEMPTS for "
+                        f"{block}.{top_level}:\n{filtered_error}\n\n"
+                        f"Tell the user we couldn't auto-configure this and ask for guidance, "
+                        f"OR call set_phase to advance and fix in Review phase."
+                    )
+
+                logger.warning(
+                    "devkit.accumulator.validation_retry",
+                    extra={
+                        "operation": "accumulator.update",
+                        "status": "validation_error_returned",
+                        "block": block,
+                        "section": section,
+                        "top_level": top_level,
+                        "attempt": attempt,
+                        "max_attempts": self._max_validation_attempts,
+                    },
+                )
+                return (
+                    f"VALIDATION_ERROR (attempt {attempt}/{self._max_validation_attempts}):\n"
+                    f"{filtered_error}"
+                )
+
+        # Validation passed (or only [missing] errors that are tolerated
+        # during partial accumulation). Commit the candidate and clear the
+        # retry counter.
+        self._data[block] = candidate_block
+        self._validation_attempts.pop(attempt_key, None)
         logger.info(
             "devkit.accumulator.config_updated",
             extra={
@@ -126,6 +272,17 @@ class ConfigAccumulator:
                 "path": section,
             },
         )
+        return "OK"
+
+    def reset_validation_attempts(self) -> None:
+        """Clear all per-section retry counters.
+
+        Called by the ConversationEngine at the start of each new user turn
+        so the retry budget resets between turns. Within a single tool-call
+        loop the counters keep climbing until the LLM produces a valid value
+        or hits the cap.
+        """
+        self._validation_attempts.clear()
 
     def get_block(self, block: str) -> dict:
         """Return a deep copy of the full config dict for a block.
@@ -319,15 +476,28 @@ class ConfigAccumulator:
         return bool(self._data.get("azure_storage", {}).get("needed"))
 
     def has_knowledge_base(self) -> bool:
-        """Return True if the knowledge_engine config has a static_knowledge_base enabled.
+        """Return True if the knowledge_engine config has a static_knowledge_base configured.
+
+        The schema's ``StaticKnowledgeBaseSection.enabled`` defaults to ``True``,
+        so a YAML with the section populated but no explicit ``enabled`` key
+        still means "this agent uses a KB." Treat the section as a KB when:
+
+        * the ``static_knowledge_base`` block is present and non-empty, AND
+        * ``enabled`` is not explicitly set to ``False``.
+
+        The previous implementation defaulted ``enabled`` to ``False`` when
+        absent — opposite of the runtime schema — so projects that omitted
+        the redundant flag (most of them) had the deploy wizard mark them as
+        "no KB" and skip the ingest step.
 
         Returns:
-            True if ``knowledge_engine.knowledge.blocks.static_knowledge_base.enabled`` is True,
-            False if absent or disabled.
+            True when the agent uses a KB, False otherwise.
         """
         ke = self._data.get("knowledge_engine", {})
         skb = ke.get("knowledge", {}).get("blocks", {}).get("static_knowledge_base", {})
-        return bool(skb.get("enabled", False))
+        if not skb:
+            return False
+        return skb.get("enabled", True) is not False
 
     def get_required_secrets(self) -> list[dict]:
         """Return the list of API key secrets required by configured tools.
@@ -439,26 +609,22 @@ class ConfigAccumulator:
         return deepcopy(result)
 
     def set_reach_channel_selection(self, channels: list[str]) -> None:
-        """Store the selected deployment channels and write the web service mode.
+        """Store the selected deployment channels.
+
+        The reach_layer_web service mode (full vs routing_only) is derived from
+        this selection at deploy time and injected as the REACH_LAYER_WEB_MODE
+        environment variable; it is not part of the runtime YAML.
 
         Args:
             channels: List of selected channel names (e.g. ['web', 'cli']).
-                When 'web' is not in the list, sets reach_layer.channels.web.mode
-                to 'routing_only' so the web service boots without the full UI stack.
         """
         self._data["reach_layer"]["_selected_channels"] = list(channels)
-        web_mode = "full" if "web" in channels else "routing_only"
-        reach_cfg = self._data["reach_layer"].setdefault("reach_layer", {})
-        channels_cfg = reach_cfg.setdefault("channels", {})
-        web_cfg = channels_cfg.setdefault("web", {})
-        web_cfg["mode"] = web_mode
         logger.info(
             "devkit.accumulator.channels_set",
             extra={
                 "operation": "accumulator.set_reach_channel_selection",
                 "status": "success",
                 "channels": list(channels),
-                "web_mode": web_mode,
             },
         )
 
@@ -582,7 +748,22 @@ class ConfigAccumulator:
     # ------------------------------------------------------------------
 
     def summary(self) -> str:
-        """Return a human-readable summary of current config state for system prompts."""
+        """Return a human-readable summary of current config state for system prompts.
+
+        Renders two sections:
+
+        1. **Per-block top-level keys** — block-by-block snapshot of which
+           top-level sections exist, plus the block's status. Quick visual
+           index of what's been touched.
+        2. **Cross-phase references** — the actual values for fields that
+           later phases must read and reuse character-for-character (NLU
+           intents, supported languages, connector names, intent_filters
+           keys, etc.). The system prompt tells the LLM to ``read these
+           directly``; this is where they become readable.
+
+        Both sections are truncated to keep the prompt compact, but the
+        cross-phase block prints values in full when set, never just keys.
+        """
         lines = ["Current config state:"]
         for block in BLOCKS:
             data = self._data[block]
@@ -604,7 +785,70 @@ class ConfigAccumulator:
             lines.append(f"  selected_channels: {', '.join(selected_channels)}")
         else:
             lines.append("  selected_channels: not yet set")
+
+        # ---- Cross-phase references ----------------------------------
+        # Surface the actual values for paths that later phases must
+        # reference. Without this the LLM can see "preprocessing" exists
+        # under agent_core but cannot read the intents inside it.
+        ref_lines = self._render_cross_phase_references()
+        if ref_lines:
+            lines.append("")
+            lines.append("Cross-phase references (signed-off values — read these directly, do NOT re-ask the user):")
+            lines.extend(ref_lines)
+
         return "\n".join(lines)
+
+    def _render_cross_phase_references(self) -> list[str]:
+        """Build the cross-phase reference block for ``summary()``.
+
+        Returns a list of indented strings, one per populated reference
+        path. Returns an empty list when nothing has been set yet (e.g.
+        in tier/overview phase before the language phase runs).
+
+        The reference set is the closure of fields that downstream phase
+        prompts tell the LLM to "use the value from <path>". If you add
+        a new cross-phase reference rule in phases.py, add the path here
+        too — otherwise the LLM is told to read something it can't see.
+        """
+        refs: list[str] = []
+        ac = self._data.get("agent_core") or {}
+        ke = self._data.get("knowledge_engine") or {}
+
+        agent = ac.get("agent") or {}
+        for field in ("provider", "primary_model", "fallback_model"):
+            val = agent.get(field)
+            if val:
+                refs.append(f"  agent_core.agent.{field}: {val}")
+
+        preprocessing = ac.get("preprocessing") or {}
+        lang_norm = preprocessing.get("language_normalisation") or {}
+        if lang_norm.get("default_language"):
+            refs.append(f"  agent_core.preprocessing.language_normalisation.default_language: {lang_norm['default_language']}")
+        supported = lang_norm.get("supported_languages")
+        if supported:
+            refs.append(f"  agent_core.preprocessing.language_normalisation.supported_languages: {supported}")
+
+        nlu = preprocessing.get("nlu_processor") or {}
+        intents = nlu.get("intents")
+        if intents:
+            refs.append(f"  agent_core.preprocessing.nlu_processor.intents: {intents}")
+        entities = nlu.get("entities")
+        if entities:
+            refs.append(f"  agent_core.preprocessing.nlu_processor.entities: {entities}")
+
+        connectors = ac.get("connectors") or {}
+        for category in ("read", "write", "identity", "internal"):
+            entries = connectors.get(category) or []
+            names = [c.get("name") for c in entries if isinstance(c, dict) and c.get("name")]
+            if names:
+                refs.append(f"  agent_core.connectors.{category} names: {names}")
+
+        kb = ((ke.get("knowledge") or {}).get("blocks") or {}).get("static_knowledge_base") or {}
+        intent_filters = kb.get("intent_filters")
+        if intent_filters:
+            refs.append(f"  knowledge_engine.intent_filters keys: {sorted(intent_filters.keys())}")
+
+        return refs
 
     def to_dict(self) -> dict:
         """Serialise to a JSON-compatible dict for checkpoint storage.

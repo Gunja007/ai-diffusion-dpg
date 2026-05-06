@@ -2,12 +2,102 @@
 dev-kit/dev_kit/agent/prompts/phases.py
 
 Phase-specific additions to the system prompt. Each phase injects the
-relevant YAML template sections so Claude sees the exact valid field names
-and fills in values only — never inventing or renaming keys.
+relevant Pydantic section schemas as source code so Claude sees real
+constraints (ge=1, le=20, model_validator, enums) directly in its
+context — never inventing or renaming keys.
 """
 from __future__ import annotations
 
-from dev_kit.schemas.loader import get_valid_sections, load_template_text
+import inspect
+
+from dev_kit.schemas.domain import (
+    action_gateway as ag_domain,
+    agent_core as ac_domain,
+    knowledge_engine as ke_domain,
+    memory_layer as ml_domain,
+    observability_layer as obs_domain,
+    reach_layer as rl_domain,
+    trust_layer as tl_domain,
+)
+from dev_kit.schemas.enums import (
+    ANTHROPIC_MODELS,
+    EMBEDDING_PROVIDERS,
+    LANGUAGES,
+    OPENAI_MODELS,
+    RAYA_VOICES,
+)
+from dev_kit.schemas.validation import get_valid_sections
+
+
+_RAYA_LANGUAGE_DISPLAY_NAMES = {
+    "mr": "Marathi", "hi": "Hindi", "te": "Telugu", "kn": "Kannada",
+    "bn": "Bengali", "as": "Assamese", "gu": "Gujarati",
+    "en-in": "English India", "en-us": "English US",
+    "ml": "Malayalam", "ne": "Nepali", "ta": "Tamil",
+}
+
+
+def _bullet_list(values: list[str]) -> str:
+    """Render a list of allowed enum values as backtick-quoted markdown bullets.
+
+    Generated dynamically from enums_config.yaml so adding or removing a value
+    in YAML automatically updates what the LLM sees.
+
+    Args:
+        values: List of valid string values for an open enum
+            (e.g. ANTHROPIC_MODELS, OPENAI_MODELS, LANGUAGES,
+            EMBEDDING_PROVIDERS).
+
+    Returns:
+        Markdown bullets, one per value.
+    """
+    return "\n".join(f"- `{v}`" for v in values)
+
+
+def _raya_voice_table() -> str:
+    """Render the Raya voice lookup table from enums_config.yaml.
+
+    Generated dynamically so adding a voice to enums_config.yaml automatically
+    surfaces it in the language-phase prompt.
+
+    Returns:
+        Markdown table with one row per voice (language code + display name,
+        voice name, voice_id).
+    """
+    rows = [
+        f"| {v['language']} ({_RAYA_LANGUAGE_DISPLAY_NAMES.get(v['language'], v['language'])}) "
+        f"| {v['name']} | `{v['voice_id']}` |"
+        for v in RAYA_VOICES
+    ]
+    return (
+        "| Language | Voice Name | voice_id |\n"
+        "|----------|-----------|----------|\n"
+        + "\n".join(rows)
+    )
+
+
+def _schema_source(*classes) -> str:
+    """Render multiple Pydantic classes as a single code block.
+
+    Used in phase prompts to inject real schema source (with constraints,
+    validators, enums) instead of blank YAML templates.
+
+    Args:
+        *classes: Pydantic model classes to render.
+
+    Returns:
+        Concatenated Python source for each class, separated by blank lines.
+    """
+    return "\n\n".join(inspect.getsource(c) for c in classes)
+
+
+_SCHEMA_PREAMBLE = (
+    "### Schema for sections you will configure in this phase\n\n"
+    "All update_config calls must produce values that conform to these "
+    "Pydantic models. Constraints (ge, le, enum, model_validator) are "
+    "enforced by the tool handler — the call will fail if you violate "
+    "them.\n\n"
+)
 
 _WORKFLOW_EXAMPLE = """
 Example subagent (condensed from KKB reference):
@@ -174,7 +264,9 @@ def get_phase_addition(phase: str, available_tools: list[str] | None = None) -> 
             "speak raw numbers, dates, or Roman-script Hindi; you must specify rules "
             "the LLM follows before responses reach TTS.\n\n"
             "### What to include (from guide §2.10 Language & TTS Rules)\n"
-            "- Primary and fallback Claude model IDs (agent.primary_model, fallback_model)\n"
+            "- LLM provider (`anthropic` or `openai`) and primary + fallback model IDs "
+            "(agent.provider, agent.primary_model, agent.fallback_model). Both models "
+            "must belong to the chosen provider.\n"
             "- Default language + supported languages for language normalisation\n"
             "- NLU classifier model + intents/entities/sentiment classes\n"
             "- Conversation-level messages (blocked_message, consent_message, etc.) in "
@@ -190,8 +282,9 @@ def get_phase_addition(phase: str, available_tools: list[str] | None = None) -> 
             "the LLM takes >1.5 s to produce the first sentence (e.g. \"एक सेकंड\", "
             "\"one moment\"). Empty string disables.\n\n"
             "### How the dev-kit captures this\n"
-            "- Set models + consent: `update_config(block=agent_core, section=agent, "
-            "values={primary_model: ..., fallback_model: ..., ask_for_consent: ..., "
+            "- Set provider + models + consent: `update_config(block=agent_core, "
+            "section=agent, values={provider: 'anthropic' | 'openai', "
+            "primary_model: ..., fallback_model: ..., ask_for_consent: ..., "
             "consent_prompt: ...})`\n"
             "- Set language normalisation: `section=preprocessing.language_normalisation`\n"
             "- Set NLU: `section=preprocessing.nlu_processor`\n"
@@ -233,27 +326,68 @@ def get_phase_addition(phase: str, available_tools: list[str] | None = None) -> 
             "system_prompt_suffix covered in Group 3 below. turn_assembler defaults: "
             "silence_ms: 600, max_wait_ms: 8000 (good for Hindi/regional voice cadence).\n\n"
             "Do NOT skip any channel that is in selected_channels, and always include web.\n\n"
-            "### Available Claude model IDs (use ONLY these)\n"
-            "| Model | API ID | Best for | Price (input/output per MTok) |\n"
-            "|-------|--------|----------|-------------------------------|\n"
-            "| Haiku 4.5 | `claude-haiku-4-5-20251001` | Fast, cost-effective | $1 / $5 |\n"
-            "| Sonnet 4.6 | `claude-sonnet-4-6` | Speed + intelligence | $3 / $15 |\n"
-            "| Opus 4.7 | `claude-opus-4-7` | Most capable, complex reasoning | $5 / $25 |\n\n"
-            "**Model selection guidance — choose based on use case:**\n"
-            "- Simple Q&A / FAQ bots → Haiku primary, Sonnet fallback\n"
-            "- Multi-step reasoning, complex domains → Sonnet primary, Haiku fallback\n"
-            "- High-stakes / critical accuracy → Opus primary, Sonnet fallback\n"
-            "Use your judgement based on the agent's domain and complexity.\n\n"
-            "⚠️ Primary and fallback MUST be different models. The fallback exists to handle "
-            "failures on the primary — using the same model for both defeats the purpose. "
-            "NEVER set both to the same model unless the user explicitly requests it.\n"
-            "⚠️ NEVER suggest old model IDs like claude-3-5-sonnet, claude-3-haiku, etc.\n\n"
+            "### LLM provider — ASK THE USER FIRST\n"
+            "Two providers are supported. Ask which one the user wants BEFORE "
+            "recommending specific models, because the model list and pricing differ.\n\n"
+            "| Provider | Strengths | Trade-offs |\n"
+            "|----------|-----------|------------|\n"
+            "| `anthropic` | Strong long-context reasoning, Claude family | Premium pricing |\n"
+            "| `openai` | Lower cost on smaller tasks, GPT family | Shorter context on some models |\n\n"
+            "After the user picks a provider, recommend `primary_model` and "
+            "`fallback_model` from that provider's allowed list only. The schema's "
+            "`models_must_match_provider` validator rejects cross-provider configs.\n\n"
+            "### Anthropic models (use ONLY when provider=anthropic)\n"
+            + _bullet_list(ANTHROPIC_MODELS) + "\n\n"
+            "### OpenAI models (use ONLY when provider=openai)\n"
+            + _bullet_list(OPENAI_MODELS) + "\n\n"
+            "**Model selection guidance:**\n"
+            "Use your training knowledge of each model's capability tier, context "
+            "window, and price to pick `primary_model` and `fallback_model` based on "
+            "the agent's use case:\n"
+            "- Simple Q&A / FAQ bots → smaller/cheaper model primary, mid-tier fallback\n"
+            "- Multi-step reasoning, complex domains → mid-tier primary, smaller fallback\n"
+            "- High-stakes / critical accuracy → top-tier primary, mid-tier fallback\n\n"
+            "⚠️ Primary and fallback MUST be different models AND from the same provider. "
+            "The fallback exists to handle primary failures — using the same model for both "
+            "defeats the purpose, and mixing providers is rejected by the schema.\n"
+            "⚠️ Pick model IDs ONLY from the lists above. Any other ID — older Claude "
+            "versions, GPT-3.5, GPT-4-turbo, hypothetical future models — will be rejected "
+            "by the schema's `ChatModelField` validator.\n\n"
+            "### Valid languages (use ONLY these for default_language and supported_languages)\n"
+            + _bullet_list(LANGUAGES) + "\n\n"
+            "These are the only values the schema's `LanguageField` accepts. Any other "
+            "value — including language codes (`en`, `hi-IN`) or display names "
+            "(`English`, `Hindi`) — will be rejected.\n\n"
+            "**Building `supported_languages` from what the user said:**\n"
+            "1. Take the user's exact list of languages.\n"
+            "2. For each one the user named, check the bullet list above.\n"
+            "   - If it appears verbatim → include it.\n"
+            "   - If it does NOT appear → tell the user explicitly: \"`<lang>` is not "
+            "in the supported list. The available options are: <bullet list>. Which of "
+            "these would you like instead, or should I drop it?\" Wait for the answer "
+            "before proceeding. NEVER silently drop an unsupported language and NEVER "
+            "silently substitute a different one (e.g. swapping in `hinglish` for "
+            "`punjabi` is wrong — `hinglish` is its own thing, not a fallback).\n"
+            "3. Keep every supported language the user named. Do NOT silently drop a\n"
+            "   supported language (e.g. dropping `kannada` when the user explicitly "
+            "asked for it).\n"
+            "4. Do NOT add languages the user did not request. If you think `hinglish` "
+            "would help India-based users, ASK first; do not auto-add.\n"
+            "5. The final list must equal the user-approved set, character-for-character "
+            "from the bullet list above.\n\n"
             "### Conversation style for this phase\n"
-            "Split this phase into **2 groups** and present each as a block with defaults:\n\n"
-            "**Group 1 — Models & Language setup:**\n"
-            "Present the primary model, fallback model, consent setting, default language, "
-            "and supported languages together. Use the model table above to suggest "
-            "appropriate defaults. Ask the user to confirm or edit.\n\n"
+            "Walk through the groups below in order, presenting each as a single block "
+            "with defaults rather than asking field-by-field:\n\n"
+            "**Group 1A — Provider choice (ASK FIRST, before models):**\n"
+            "Ask the user: 'Which LLM provider do you want — `anthropic` (Claude) or "
+            "`openai` (GPT)? Both are supported; the available models and pricing differ.'\n"
+            "Wait for the user's answer before proposing any model IDs. Default lean: "
+            "anthropic, but always ask explicitly.\n\n"
+            "**Group 1B — Models & Language setup:**\n"
+            "Once the provider is chosen, present `primary_model`, `fallback_model`, "
+            "consent setting, default language, and supported languages together. Use the "
+            "matching provider's model table above to suggest defaults. Ask the user to "
+            "confirm or edit.\n\n"
             "**Group 2 — Conversation messages (all at once):**\n"
             "Present ALL conversation messages together with suggested defaults based on "
             "the agent's domain. Include: consent_message, consent_declined_message, "
@@ -294,14 +428,18 @@ def get_phase_addition(phase: str, available_tools: list[str] | None = None) -> 
             "signal to the context graph?'\n"
             "- `user_state_confidence_threshold` (GH-139) — set only for "
             "Conversational agents during the user_state phase; default 0.4 works.\n\n"
-            "Use EXACTLY the key names shown in the template below:\n\n"
-            "```yaml\n"
-            + _extract_template_sections(
-                "agent_core",
-                ["agent", "preprocessing", "conversation", "entity_to_profile_field",
-                 "hitl", "observability", "channels"],
+            + _SCHEMA_PREAMBLE
+            + "```python\n"
+            + _schema_source(
+                ac_domain.AgentSection,
+                ac_domain.LanguageNormalisationSection,
+                ac_domain.NLUProcessorSection,
+                ac_domain.PreprocessingSection,
+                ac_domain.ConversationSection,
+                ac_domain.ChannelsSection,
+                ac_domain.HitlSection,
             )
-            + "```\n\n"
+            + "\n```\n\n"
             "➡️ When models, language normalisation, NLU, conversation messages, "
             "entity_to_profile_field, hitl.response_message, and (if voice is in "
             "selected_channels) agent_core.channels.voice.tts_rules + "
@@ -343,7 +481,12 @@ def get_phase_addition(phase: str, available_tools: list[str] | None = None) -> 
             "  Use the Slug shown in the '## Project' section. Do NOT ask the user.\n\n"
             "**CRITICAL — exact section paths to use, no substitutions:**\n"
             "- RAG config: section=`knowledge.blocks.static_knowledge_base`\n"
-            "  Keys: `collection_name`, `top_k`, `similarity_threshold`, `default_doc_type`, `intent_filters` (dict)\n"
+            "  Keys: `collection_name`, `top_k`, `similarity_threshold`, `default_doc_type`, "
+            "`embedding_provider`, `intent_filters` (dict)\n"
+            "  Valid `embedding_provider` values (schema's `EmbeddingProviderField`):\n"
+            + _bullet_list(EMBEDDING_PROVIDERS) + "\n"
+            "  Default `chroma_default` works for most deployments — only ask the user "
+            "if they have a specific reason to override.\n"
             "  ❌ NEVER write `vector_store` — this key does not exist in the schema.\n"
             "  ❌ NEVER write `sources` — documents are uploaded post-deploy, not configured here.\n"
             "  ❌ NEVER write `conversation`, `persona`, or `language_instruction` — these do not exist in knowledge_engine.\n"
@@ -402,16 +545,34 @@ def get_phase_addition(phase: str, available_tools: list[str] | None = None) -> 
             "`crop_diseases`, `govt_schemes`, `obsrv_docs`)\n"
             "- `intent_filters` mapping NLU intents to the relevant doc_types\n"
             "- Set `default_doc_type` to the most common/general doc_type\n\n"
-            "**CRITICAL — keep NLU intents and intent_filters in sync:**\n"
-            "Every key in `intent_filters` must be a valid NLU intent. After creating "
-            "intent_filters, check the current agent_core NLU intents (visible in the "
-            "config state above). If any intent_filter keys are NOT already in the NLU "
-            "intents list, add them by calling:\n"
-            "  `update_config(block=agent_core, section=preprocessing.nlu_processor, "
-            "values={intents: [... existing intents ..., new_intent_1, new_intent_2]})`\n"
-            "This ensures the NLU classifier knows about every intent that intent_filters "
-            "references. Without this, unrecognised intents fall through to unfiltered "
-            "retrieval.\n\n"
+            "**CRITICAL — keep NLU intents and intent_filters in sync (cross-block invariant):**\n"
+            "Every key in `intent_filters` MUST appear in `agent_core.preprocessing."
+            "nlu_processor.intents`. The NLU classifier can only produce intents that "
+            "are declared there; an `intent_filters` key the NLU never produces is "
+            "dead config — queries fall through to unfiltered retrieval. The deploy "
+            "wizard's cross-block validator and the `set_phase` tool BOTH enforce "
+            "this — if you advance with a mismatch, `set_phase` returns "
+            "PHASE_ADVANCE_BLOCKED and lists every offending key.\n\n"
+            "**The two writes must be paired in the SAME message — worked example:**\n"
+            "If the user wants the agent to filter retrieval by booking intents:\n\n"
+            "```\n"
+            "1. update_config(block='knowledge_engine',\n"
+            "                 section='knowledge.blocks.static_knowledge_base',\n"
+            "                 values={intent_filters: {ask_packages: ['package_info'],\n"
+            "                                          ask_booking:  ['booking_policy']}})\n"
+            "2. update_config(block='agent_core',\n"
+            "                 section='preprocessing.nlu_processor',\n"
+            "                 values={intents: [<existing intents>, 'ask_packages', 'ask_booking']})\n"
+            "```\n\n"
+            "Always merge the new intents with the existing list — never replace. Read "
+            "the current NLU intents from the config state above before constructing the "
+            "second call.\n\n"
+            "**Self-check before set_phase:**\n"
+            "Before calling `set_phase('memory')`, verify in the config state above that "
+            "every key in `knowledge_engine.knowledge.blocks.static_knowledge_base."
+            "intent_filters` also appears in `agent_core.preprocessing.nlu_processor."
+            "intents`. If any are missing, fix the NLU intents list first. The "
+            "set_phase tool will reject the transition otherwise.\n\n"
             "These doc_types will appear as a dropdown when the user uploads documents "
             "after deployment, so they can tag each file with the correct type.\n"
             "Present the doc_types and intent_filters together and confirm with the user.\n\n"
@@ -424,10 +585,16 @@ def get_phase_addition(phase: str, available_tools: list[str] | None = None) -> 
             "- Document file sizes or formats\n"
             "- Document filenames or paths\n"
             "- Where documents are stored (handled by Azure question separately)\n\n"
-            "Use EXACTLY the key names shown in the template below:\n\n"
-            "```yaml\n"
-            + load_template_text("knowledge_engine")
-            + "```\n\n"
+            + _SCHEMA_PREAMBLE
+            + "```python\n"
+            + _schema_source(
+                ke_domain.StaticKnowledgeBaseSection,
+                ke_domain.KnowledgeBlocksSection,
+                ke_domain.KnowledgeSection,
+                ac_domain.InternalConnectorDef,
+                ac_domain.ConnectorsSection,
+            )
+            + "\n```\n\n"
             "➡️ When collection_name, intent_filters, and default_doc_type are set "
             "(and declare_azure_storage called if applicable), call `set_phase('memory')`."
         )
@@ -476,10 +643,27 @@ def get_phase_addition(phase: str, available_tools: list[str] | None = None) -> 
             "'Here is the suggested memory configuration — do these look good, or would "
             "you like to change any?' Only ask about re-engagement triggers separately if "
             "the agent type requires outbound follow-up.\n\n"
-            "Use EXACTLY the key names shown in the template below:\n\n"
-            "```yaml\n"
-            + load_template_text("memory_layer")
-            + "```\n\n"
+            + _SCHEMA_PREAMBLE
+            + "```python\n"
+            + _schema_source(
+                ml_domain.SessionFieldDefinition,
+                ml_domain.SessionStateConfig,
+                # The graph node classes are referenced by type from
+                # GraphConfig and SubnodeConfig — render their bodies
+                # explicitly so the LLM sees that label/key/rel are
+                # required (otherwise it submits empty placeholders like
+                # `user_node: {}` which the runtime rejects at startup).
+                ml_domain.UserNodeConfig,
+                ml_domain.AdhocNodeConfig,
+                ml_domain.ChildNodeConfig,
+                ml_domain.SubnodeConfig,
+                ml_domain.GraphConfig,
+                ml_domain.PersistentStateConfig,
+                ml_domain.StateSection,
+                ml_domain.UserDataPersistenceSection,
+                ml_domain.ReengagementSection,
+            )
+            + "\n```\n\n"
             "➡️ When session schema, persistent graph, user_data_persistence, and "
             "reengagement (if needed) are set, call `set_phase('user_state')`."
         )
@@ -509,9 +693,13 @@ def get_phase_addition(phase: str, available_tools: list[str] | None = None) -> 
             "- Sticky fallback on low-confidence classification is a DPG-specific "
             "mechanism (GH-139) — the guide describes the state model but not how "
             "confidence-thresholded classification handles ambiguous turns.\n\n"
-            "```yaml\n"
-            + _extract_template_sections("agent_core", ["conversation"])
-            + "```\n\n"
+            + _SCHEMA_PREAMBLE
+            + "```python\n"
+            + _schema_source(
+                ac_domain.UserStateDefinition,
+                ac_domain.UserStateModel,
+            )
+            + "\n```\n\n"
             "➡️ When the model is declared, call `set_phase('trust')`."
         )
 
@@ -580,9 +768,13 @@ def get_phase_addition(phase: str, available_tools: list[str] | None = None) -> 
             "**Block 2 (Conversational only) — Dignity check:**\n"
             "Present the 5 canonical dignity check questions together and ask for "
             "confirmation. Do NOT ask about each question individually.\n\n"
-            "```yaml\n"
-            + load_template_text("trust_layer")
-            + "```\n\n"
+            + _SCHEMA_PREAMBLE
+            + "```python\n"
+            + _schema_source(
+                tl_domain.TrustSection,
+                tl_domain.DignityCheckSection,
+            )
+            + "\n```\n\n"
             "➡️ Before calling `set_phase('tools')`, run this self-check:\n"
             "1. Content rules and blocked phrases are non-empty.\n"
             "2. For Conversational agents: `dignity_check.enabled: true`, `questions` has "
@@ -682,10 +874,49 @@ def get_phase_addition(phase: str, available_tools: list[str] | None = None) -> 
             "MCP tools (`add_mcp_tool`) do NOT create connectors — tool schemas come from\n"
             "the server at runtime. Subagents reference MCP tools by their namespaced names\n"
             "(e.g. 'obsrv_docs__searchDocumentation'), not the bare adapter id.\n\n"
-            "Use EXACTLY the key names shown in the template below:\n\n"
-            "```yaml\n"
-            + _extract_template_sections("agent_core", ["connectors"])
-            + "```\n\n"
+            "⚠️ **CRITICAL — connector input_schema.properties must mirror the tool's**\n"
+            "**agent-source params exactly. Do not rename, add, or remove keys.**\n"
+            "The auto-generated connector that `add_rest_api_tool` produces already has\n"
+            "exactly the right set of properties. The REST adapter forwards the LLM's\n"
+            "params verbatim into the HTTP request, so any divergence between connector\n"
+            "and tool causes a real runtime failure:\n"
+            "- **Renamed key** — connector says `<orig>`, tool says `<renamed>`. The\n"
+            "  LLM sends `?<renamed>=…` to an API expecting `?<orig>=…`. Silent empty\n"
+            "  results or 400.\n"
+            "- **Invented key** — connector lists a property `<extra>` that has no\n"
+            "  matching agent-source param in the tool. The API receives a field it\n"
+            "  never declared — either silently ignored (so any filter relying on it\n"
+            "  does nothing) or rejected outright.\n"
+            "- **Dropped key** — a required tool param `<missing>` is omitted from\n"
+            "  the connector. The LLM never supplies it, the request is missing a\n"
+            "  required field, the API fails.\n\n"
+            "Rules:\n"
+            "- ✅ DO edit `description`, `invocation_rules`, or any per-property\n"
+            "  `description` text in the connector — these are LLM-facing hints only.\n"
+            "- ❌ DO NOT rename, add, or remove keys in `input_schema.properties`.\n"
+            "- ❌ DO NOT change the `required` array to a different set than the tool's\n"
+            "  required agent-source params.\n"
+            "- If you genuinely want a different param NAME visible to the LLM, change\n"
+            "  the tool's `source: agent` param name itself — the API receives whatever\n"
+            "  the tool param is named, so they must be edited together.\n"
+            "- If you genuinely want to ADD a new param to the LLM contract, add it to\n"
+            "  the tool's `endpoints[*].params` first (with `source: agent`), then\n"
+            "  re-sync the connector. Do not edit the connector in isolation.\n"
+            "The `set_phase` cross-block validator blocks phase advance if connector and\n"
+            "tool param names diverge — you cannot leave this phase with a mismatch.\n\n"
+            + _SCHEMA_PREAMBLE
+            + "```python\n"
+            + _schema_source(
+                ag_domain.ToolDefinition,
+                ag_domain.EndpointDefinition,
+                ag_domain.ParamDefinition,
+                ag_domain.AuthConfig,
+                ag_domain.ToolsSection,
+                ac_domain.InvocationRules,
+                ac_domain.ConnectorDef,
+                ac_domain.ConnectorsSection,
+            )
+            + "\n```\n\n"
             "➡️ When all external tools are declared with all six invocation_rules "
             "fields populated, call `set_phase('workflow')`."
         )
@@ -799,6 +1030,37 @@ def get_phase_addition(phase: str, available_tools: list[str] | None = None) -> 
             "- Define routing: use `update_subagent` to set routing rules.\n"
             "- Set global routing: `update_config(block=agent_core, "
             "section=agent_workflow.global_routing, values=[...])`.\n\n"
+            "### ⚠️ STEP 0 — Read existing NLU intents BEFORE designing any subagent\n"
+            "The user signed off on a specific NLU intent list in the language phase. "
+            "That list lives in `agent_core.preprocessing.nlu_processor.intents` in "
+            "the config state above. **Read it directly. Use those exact strings. "
+            "DO NOT ask the user to re-confirm or list them — they have already been "
+            "configured and the user expects you to read the state, not re-litigate it. "
+            "Asking \"do these intents look right?\" or proposing a different list and "
+            "asking the user to map between is wrong.**\n\n"
+            "When you design subagents, set their `valid_intents`, `routing[*].intent`, "
+            "and `global_intents` using ONLY names from that existing list — character-for-"
+            "character identical. The renderer will silently merge any new name into NLU "
+            "at YAML write time, which means the user ends up with intents they never "
+            "approved. You must not let that happen.\n\n"
+            "**Common silent-expansion mistakes — do not do these:**\n"
+            "- NLU has `booking_confirmation` — you write `booking_confirmed` in a subagent. "
+            "Different string, treated as a new intent.\n"
+            "- NLU has `package_inquiry` — you write `package_inquiry_v2` or `ask_packages`. "
+            "Same problem.\n"
+            "- NLU has no `pricing_question` — you add it to a subagent's `valid_intents` "
+            "thinking the renderer will pick it up. It will, but the user never approved it.\n\n"
+            "**If you genuinely need an intent the user hasn't approved:**\n"
+            "1. STOP. Do not call `create_subagent` / `update_subagent` yet.\n"
+            "2. ASK the user explicitly: \"To handle <case>, I'd like to add a new NLU "
+            "intent `<intent_name>`. Is that OK?\"\n"
+            "3. After the user confirms, in a SINGLE response do BOTH writes together:\n"
+            "   - `update_config(block=agent_core, section=preprocessing.nlu_processor, "
+            "values={intents: [<all existing intents>, '<new_intent>']})`\n"
+            "   - `create_subagent` / `update_subagent` referencing the new intent.\n\n"
+            "The `set_phase` tool runs a cross-block check that blocks the transition out "
+            "of this phase if any subagent intent is missing from NLU intents. Do not rely "
+            "on the renderer's silent auto-merge — fix it in the conversation.\n\n"
             "### global_intents vs subagent valid_intents — MUST NOT overlap\n"
             "- `global_intents` are intents handled by global routing rules — they apply "
             "across ALL subagents regardless of which subagent is active.\n"
@@ -837,9 +1099,14 @@ def get_phase_addition(phase: str, available_tools: list[str] | None = None) -> 
             "- The guide describes 5 'opening branches' as a single prompt-level "
             "conditional; we represent them via the subagent graph + `opening_phrase` "
             "field, because our subagent abstraction is richer than the guide assumes.\n\n"
-            "```yaml\n"
-            + _extract_template_sections("agent_core", ["agent_workflow"])
-            + "```"
+            + _SCHEMA_PREAMBLE
+            + "```python\n"
+            + _schema_source(
+                ac_domain.RoutingRule,
+                ac_domain.SubAgent,
+                ac_domain.AgentWorkflowSection,
+            )
+            + "\n```"
             + connector_note
             + "\n\n➡️ Before calling `set_phase('observability')`, run this self-check:\n"
             "1. `workflow_id`, `version`, `agent_system_prompt` are all non-empty.\n"
@@ -880,9 +1147,15 @@ def get_phase_addition(phase: str, available_tools: list[str] | None = None) -> 
             "domain-appropriate outcome lifecycle states and quality signals based on "
             "the use case, then ask: 'Here is the suggested observability setup — do "
             "these look good, or would you like to change any?'\n\n"
-            "```yaml\n"
-            + load_template_text("observability_layer")
-            + "```\n\n"
+            + _SCHEMA_PREAMBLE
+            + "```python\n"
+            + _schema_source(
+                obs_domain.LifecycleState,
+                obs_domain.MetricDefinition,
+                obs_domain.OutcomesConfig,
+                obs_domain.ObservabilitySection,
+            )
+            + "\n```\n\n"
             "➡️ When outcomes and quality signals are set, call `set_phase('reach')`."
         )
 
@@ -939,27 +1212,22 @@ def get_phase_addition(phase: str, available_tools: list[str] | None = None) -> 
             "or would you like to change any?'\n"
             "Do NOT ask about app_name, then icon, then tagline separately.\n\n"
             "**For voice channel — present all voice config together:**\n"
-            "The voice channel uses **Raya** as the TTS/STT provider. Ask the user "
-            "which language the bot should speak in, then auto-select the correct voice "
-            "from the table below. Present all settings as one block for confirmation.\n\n"
+            "The voice channel uses **Raya** as the TTS/STT provider. Voice supports "
+            "**only one language at a time** — the schema's `voice_id_matches_language` "
+            "validator enforces that `stt_language`, `tts_language`, and the chosen "
+            "`voice_id` all belong to the same single language. This is unlike the "
+            "web/text channel, which can serve multiple languages from `supported_languages`. "
+            "Ask the user to pick ONE language for voice, auto-select the matching "
+            "voice from the table below, and present all settings as one block for "
+            "confirmation.\n\n"
             "**Raya voice lookup table (use ONLY these voice IDs):**\n"
-            "| Language | Voice Name | voice_id |\n"
-            "|----------|-----------|----------|\n"
-            "| mr (Marathi) | Sneha | `c849b31b-b0ba-488f-b97d-3fd12f2656f4` |\n"
-            "| hi (Hindi) | Priyanka | `d6a002d0-230c-49b1-a137-b8a7d564b1ae` |\n"
-            "| te (Telugu) | Tanvi | `25a7c7d9-57b3-488a-a880-33edf6642902` |\n"
-            "| kn (Kannada) | Meera | `6a897d02-83ab-43ea-b17f-a8cc2d96a279` |\n"
-            "| bn (Bengali) | Aishwarya | `a1b2c3d4-e5f6-4789-a012-b3c4d5e6f789` |\n"
-            "| as (Assamese) | Priti | `d4e5f6a7-b8c9-4a01-d345-e6f7a8b9c012` |\n"
-            "| gu (Gujarati) | Jignesh | `9a01bcde-2345-6789-abc1-123456abcdef` |\n"
-            "| en-in (English India) | Nayra | `0f24fb66-e495-4781-9e84-1224aa7dacde` |\n"
-            "| en-us (English US) | Solene | `90534e23-8bcb-4b1c-a16b-b9a4be646321` |\n"
-            "| ml (Malayalam) | Devika | `57a1e849-8e0f-43ee-adab-b4b74a9d79e1` |\n"
-            "| ne (Nepali) | Ritu | `5d6c7ee4-2563-4dab-9c8a-c3269e22cba9` |\n"
-            "| ta (Tamil) | Abirami | `fed6231c-7e35-4fbe-bbca-254f566e5dd5` |\n\n"
+            + _raya_voice_table() + "\n\n"
             "**How to configure voice:**\n"
-            "1. Ask: 'Which language should the bot speak in over voice?' Show the "
-            "available languages from the table above.\n"
+            "1. Ask: 'Voice supports a single language. Which one language should the "
+            "bot speak in over voice calls?' Show the available languages from the table "
+            "above. Do NOT offer 'multi-language voice' — it is not supported. If the "
+            "user names multiple languages, pick the most representative one and "
+            "explain that voice is single-language by design.\n"
             "2. Auto-select the matching voice_id, stt_language, and tts_language.\n"
             "3. Present the full voice config block with defaults:\n"
             "   - `timeout_ms`: 15000 (default)\n"
@@ -968,9 +1236,18 @@ def get_phase_addition(phase: str, available_tools: list[str] | None = None) -> 
             "4. Ask for confirmation.\n\n"
             "⚠️ NEVER invent voice IDs. Schema validation will reject any ID not in "
             "the table above.\n\n"
-            "```yaml\n"
-            + load_template_text("reach_layer")
-            + "```\n\n"
+            + _SCHEMA_PREAMBLE
+            + "```python\n"
+            + _schema_source(
+                rl_domain.WebUiConfig,
+                rl_domain.WebChannelSection,
+                rl_domain.RayaVoiceConfig,
+                rl_domain.VoiceAgentCoreClient,
+                rl_domain.VoiceChannelSection,
+                rl_domain.ChannelsSection,
+                rl_domain.ReachLayerSection,
+            )
+            + "\n```\n\n"
             "➡️ Before calling `set_phase('review')`, run this self-check:\n"
             "1. `agent_core.channels.web` is configured (always required).\n"
             "2. `agent_core.channels.<X>` is configured for every channel in selected_channels.\n"
@@ -1047,44 +1324,11 @@ def get_phase_addition(phase: str, available_tools: list[str] | None = None) -> 
             "for any block where the value is a dict. "
             "Blocks to verify: agent_core, knowledge_engine, action_gateway, trust_layer, "
             "memory_layer, observability_layer, and reach_layer (check `reach_layer.common.observability.domain`).\n\n"
-            "Fix any violations before announcing completion. The author can then deploy "
-            "via the `deploy_project` tool or export the seven YAMLs."
+            "Fix any violations before announcing completion. Once everything is clean, "
+            "tell the user the configuration is ready and they can move to the **Deploy** "
+            "step in the wizard to push it to their DPG infrastructure. Do NOT name a "
+            "tool to call — deploy is a wizard step the user clicks through, not a tool "
+            "you invoke."
         )
 
     return ""
-
-
-def _extract_template_sections(block: str, sections: list[str]) -> str:
-    """Extract specific top-level sections from a YAML template as a string.
-
-    Reads the template file and returns only the lines belonging to the
-    requested top-level sections, preserving comments.
-
-    Args:
-        block: Block name.
-        sections: List of top-level section names to extract.
-
-    Returns:
-        YAML string containing only the requested sections.
-    """
-    full_text = load_template_text(block)
-    lines = full_text.splitlines()
-
-    result_lines: list[str] = []
-    current_section: str | None = None
-    in_target = False
-
-    for line in lines:
-        # Detect top-level section headers (non-indented keys)
-        if line and not line.startswith(" ") and not line.startswith("\t") and not line.startswith("#"):
-            key = line.split(":")[0].strip()
-            current_section = key
-            in_target = key in sections
-
-        if in_target:
-            result_lines.append(line)
-        elif current_section not in sections and line.startswith("#") and not result_lines:
-            # Skip file-level header comments before we've entered a target section
-            pass
-
-    return "\n".join(result_lines) + "\n"

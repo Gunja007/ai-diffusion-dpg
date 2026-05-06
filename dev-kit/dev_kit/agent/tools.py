@@ -13,7 +13,8 @@ logger = logging.getLogger(__name__)
 
 from dev_kit.agent.accumulator import BLOCKS, PHASES, ConfigAccumulator, ConfigStatus
 from dev_kit.agent.prompts.base import AGENT_TYPES, SHEET_REQUIREMENTS
-from dev_kit.schemas.loader import get_valid_sections
+from dev_kit.schemas.cross_block_validation import validate_cross_block
+from dev_kit.schemas.validation import get_valid_sections
 
 # ---------------------------------------------------------------------------
 # Tool JSON schema definitions passed to the Claude API
@@ -667,8 +668,6 @@ class ToolHandler:
         return f"ok: {phase} skipped by user"
 
     def _handle_update_config(self, inputs: dict) -> str:
-        from dev_kit.schema import validate_partial
-
         block = inputs["block"]
         section = inputs["section"]
         values = inputs["values"]
@@ -697,26 +696,33 @@ class ToolHandler:
                     "turn_assembler policy overrides."
                 )
 
-        # Build the nested partial and validate key names before writing.
-        partial: dict = {}
-        node = partial
-        parts = section.split(".")
-        for part in parts[:-1]:
-            node[part] = {}
-            node = node[part]
-        node[parts[-1]] = values
-
-        errors = validate_partial(block, partial)
-        if errors:
-            error_lines = "\n".join(f"  - {e}" for e in errors)
-            return (
-                f"ERROR — config NOT written. Invalid key names detected:\n{error_lines}\n\n"
-                f"Refer to the YAML template shown in the phase prompt for the exact key names. "
-                f"Correct the section path or key names and retry update_config."
-            )
-
-        self._acc.update(block, section, values)
-        return f"ok: updated {block}.{section}"
+        # acc.update is now the single validation gate. It validates the
+        # would-be merged result before mutating state, filters [missing]
+        # errors during partial accumulation, increments a retry counter
+        # on real failures, and hard-rejects further calls to a section
+        # whose retry budget is already spent this turn.
+        result = self._acc.update(block, section, values)
+        # acc.update returns:
+        #   "OK" — validation passed (or strict mode off / unschema'd section)
+        #   "VALIDATION_ERROR (attempt N/M):..." — schema rejected, LLM should retry
+        #   "VALIDATION_FAILED_AFTER_M_ATTEMPTS..." — cap just reached this call
+        #   "VALIDATION_SECTION_STALE..." — section already at cap, hard reject
+        # Relay the schema verdict directly so the LLM can self-correct
+        # (or stop, in the cap/stale cases).
+        if result == "OK":
+            return f"ok: updated {block}.{section}"
+        logger.warning(
+            "devkit.tool.update_config.rejected",
+            extra={
+                "operation": "tool.update_config",
+                "status": "rejected",
+                "block": block,
+                "section": section,
+                "verdict": result.split(":", 1)[0] if ":" in result else result.split("\n", 1)[0],
+                "response_to_llm": result[:500],
+            },
+        )
+        return result
 
     def _handle_set_phase(self, inputs: dict) -> str:
         """Advance the conversation to ``inputs['phase']``.
@@ -767,6 +773,60 @@ class ToolHandler:
             SHEET_REQUIREMENTS.get(requested, {}).get(agent_type, "optional")
             if agent_type else "required"
         )
+
+        # Cross-block consistency check before advancing. Catches mistakes
+        # that span 2+ blocks (e.g. knowledge_engine.intent_filters keys
+        # missing from agent_core's NLU intents) at the moment the LLM tries
+        # to leave the phase that produced them — not at deploy time. The
+        # invariants self-guard against incomplete data, so checks irrelevant
+        # to the current phase silently pass.
+        #
+        # Use the EXPLICIT selection (no ['web'] fallback) so channel-related
+        # invariants only fire after the LLM has actually called
+        # set_reach_channels — earlier phases have nothing to validate yet.
+        blocks_state = {b: self._acc.get_block(b) for b in BLOCKS}
+        selected_channels = self._acc.get_reach_channel_selection()
+        # Pass the phase the LLM is leaving so phase-tied invariants only
+        # fire once the LLM is past the phase that's supposed to populate
+        # the relevant fields. e.g. channel-shape checks require the
+        # language phase to have run; raya completeness requires reach.
+        cross_errors = validate_cross_block(blocks_state, selected_channels, current_phase=current)
+        if cross_errors:
+            error_lines = "\n".join(f"  - {e}" for e in cross_errors)
+            logger.warning(
+                "devkit.tool.set_phase.cross_block_blocked",
+                extra={
+                    "operation": "tool.set_phase",
+                    "status": "phase_advance_blocked",
+                    "current_phase": current,
+                    "requested_phase": requested,
+                    "violation_count": len(cross_errors),
+                },
+            )
+            stale_blocks = sorted(
+                {b for b in BLOCKS if self._acc.get_status(b) == ConfigStatus.STALE}
+            )
+            stale_hint = ""
+            if stale_blocks:
+                stale_hint = (
+                    f"\n\n⚠️ The following block(s) are STALE — they already exhausted "
+                    f"the per-section retry budget this turn: {stale_blocks}. "
+                    f"update_config will return VALIDATION_SECTION_STALE on those "
+                    f"sections, so further tool calls cannot resolve this. STOP "
+                    f"calling tools and reply to the user as text: explain the "
+                    f"violations above and ask them how to proceed (correct a value, "
+                    f"skip the section, or rollback to a checkpoint)."
+                )
+            return (
+                f"PHASE_ADVANCE_BLOCKED — cross-block consistency check failed "
+                f"for the leaving phase '{current}'. Fix these before advancing "
+                f"to '{requested}':\n{error_lines}\n\n"
+                f"Each violation spans two or more blocks (e.g. an intent "
+                f"declared in one block but missing from another). Make the "
+                f"corresponding update_config calls to bring the blocks back "
+                f"in sync, then call set_phase('{requested}') again."
+                f"{stale_hint}"
+            )
 
         if status == "skip":
             # Auto-advance past this phase; record the decision for audit.
