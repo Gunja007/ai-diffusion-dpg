@@ -233,6 +233,10 @@ class OpenAIChatProvider(ChatProviderBase):
                     latency_ms = int((time.time() - start) * 1000)
                     span.set_attribute("gen_ai.usage.input_tokens", response.usage.input_tokens or 0)
                     span.set_attribute("gen_ai.usage.output_tokens", response.usage.output_tokens or 0)
+                    span.set_attribute(
+                        "gen_ai.usage.cache_read_input_tokens",
+                        response.usage.cache_read_tokens or 0,
+                    )
 
                 record_call_metrics(
                     model=self._active_model,
@@ -252,6 +256,7 @@ class OpenAIChatProvider(ChatProviderBase):
                         "latency_ms": latency_ms,
                         "input_tokens": response.usage.input_tokens,
                         "output_tokens": response.usage.output_tokens,
+                        "cache_read_input_tokens": response.usage.cache_read_tokens,
                     },
                 )
                 return response
@@ -449,6 +454,10 @@ class OpenAIChatProvider(ChatProviderBase):
 
                     span.set_attribute("gen_ai.usage.input_tokens", input_tokens)
                     span.set_attribute("gen_ai.usage.output_tokens", output_tokens)
+                    span.set_attribute(
+                        "gen_ai.usage.cache_read_input_tokens",
+                        cache_read_tokens or 0,
+                    )
 
                 latency_ms = int((time.time() - start) * 1000)
                 synth_resp = ChatResponse(
@@ -486,6 +495,7 @@ class OpenAIChatProvider(ChatProviderBase):
                         "latency_ms": latency_ms,
                         "input_tokens": input_tokens,
                         "output_tokens": output_tokens,
+                        "cache_read_input_tokens": cache_read_tokens,
                         "stop_reason": stop_reason,
                     },
                 )
