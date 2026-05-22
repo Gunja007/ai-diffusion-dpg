@@ -210,7 +210,12 @@ class UserStateDefinition(BaseModel):
 
 
 class UserStateModel(BaseModel):
-    """Conversational-agent user-state model. When enabled, default_state must be one of declared states."""
+    """Conversational-agent user-state model.
+
+    Invariant when fully configured: `default_state` references an `id` in
+    `states`. Enforced ONLY once `states` is non-empty — see
+    `default_must_be_in_states` below.
+    """
     model_config = ConfigDict(extra="forbid")
     enabled: bool = False
     default_state: str = ""
@@ -218,13 +223,34 @@ class UserStateModel(BaseModel):
 
     @model_validator(mode="after")
     def default_must_be_in_states(self) -> "UserStateModel":
-        """When enabled, default_state must reference an id in the declared states list."""
-        if self.enabled:
-            ids = {s.id for s in self.states}
-            if not self.default_state or self.default_state not in ids:
-                raise ValueError(
-                    f"default_state '{self.default_state}' must be one of declared states: {sorted(ids)}"
-                )
+        """When the model is fully populated, default_state must be a declared id.
+
+        The dev-kit's predetermined cascade flips `enabled=True` on tier
+        completion for companion-style agents, but `states` and
+        `default_state` are populated only later in the user_state phase. If
+        this validator fired during that gap, every `update_config` write to
+        `conversation.*` (e.g. `consent_message`) in language/memory/trust
+        phases would be rejected — exactly the loop the GoGuide chat hit.
+
+        We deliberately keep the check lenient at chat time:
+
+        - `enabled=False`                      → no constraint (vacuous OK)
+        - `enabled=True`, `states=[]`          → partial draft, accept it
+        - `enabled=True`, `states=[...]`       → enforce `default_state in states`
+
+        Strict deploy-time enforcement happens against the runtime schema in
+        the pre-deploy dry-run (see `renderer.runtime_validate`).
+        """
+        if not self.enabled:
+            return self
+        if not self.states:
+            # Partial draft — user_state phase has not populated `states` yet.
+            return self
+        ids = {s.id for s in self.states}
+        if not self.default_state or self.default_state not in ids:
+            raise ValueError(
+                f"default_state '{self.default_state}' must be one of declared states: {sorted(ids)}"
+            )
         return self
 
 
@@ -274,12 +300,43 @@ class TtsRulesConfig(BaseModel):
     named_entities: str = ""      # KKB has this; LLM doesn't generate
 
 
-class TurnAssemblerConfig(BaseModel):
-    """TurnAssembler policy stack — semantic gate + silence trigger + max-wait ceiling."""
+class SemanticGateConfig(BaseModel):
+    """Mirrors runtime SemanticGateConfig 1:1.
+
+    Earlier the parent ``TurnAssemblerConfig`` typed this as a bare
+    ``dict``, which let typo keys like ``threshhold`` through the
+    mirror; the runtime's strict ``SemanticGateConfig(extra="forbid")``
+    then crashed at boot. Same fix pattern as ConnectorDef.input_schema
+    above.
+    """
     model_config = ConfigDict(extra="forbid")
-    semantic_gate: dict = Field(default_factory=lambda: {"enabled": False, "confidence_threshold": 0.75})
-    silence_trigger: dict = Field(default_factory=lambda: {"silence_ms": 0})
-    max_wait_ceiling: dict = Field(default_factory=lambda: {"max_wait_ms": 0})
+    enabled: bool = False
+    confidence_threshold: float = Field(default=0.75, ge=0.0, le=1.0)
+
+
+class SilenceTriggerConfig(BaseModel):
+    """Mirrors runtime SilenceTriggerConfig 1:1."""
+    model_config = ConfigDict(extra="forbid")
+    silence_ms: int = Field(default=0, ge=0)
+
+
+class MaxWaitCeilingConfig(BaseModel):
+    """Mirrors runtime MaxWaitCeilingConfig 1:1."""
+    model_config = ConfigDict(extra="forbid")
+    max_wait_ms: int = Field(default=0, ge=0)
+
+
+class TurnAssemblerConfig(BaseModel):
+    """TurnAssembler policy stack — semantic gate + silence trigger + max-wait ceiling.
+
+    Sub-fields now use strict Pydantic classes that mirror the runtime
+    exactly. Previously each was typed ``dict``, which silently
+    accepted wrong keys and only failed at boot.
+    """
+    model_config = ConfigDict(extra="forbid")
+    semantic_gate: SemanticGateConfig = Field(default_factory=SemanticGateConfig)
+    silence_trigger: SilenceTriggerConfig = Field(default_factory=SilenceTriggerConfig)
+    max_wait_ceiling: MaxWaitCeilingConfig = Field(default_factory=MaxWaitCeilingConfig)
 
 
 class ChannelEntry(BaseModel):
@@ -335,6 +392,29 @@ class InvocationRules(BaseModel):
     safety: InvocationSafety = Field(default_factory=InvocationSafety)
 
 
+class InputSchema(BaseModel):
+    """JSON-Schema-shaped description of a connector's input.
+
+    Mirrors the runtime ``InputSchema`` at
+    ``agent_core/src/schema/config.py`` 1:1. The runtime enforces
+    ``extra="forbid"`` and rejects anything that isn't a JSON Schema
+    of shape ``{type, properties, required}`` — most commonly with
+    ``type="object"`` and ``properties`` keyed by parameter name.
+    Earlier this mirror used ``dict[str, Any]``, which silently
+    accepted wrong shapes (e.g. ``{'query': {'type': 'string'}}``
+    instead of ``{'type': 'object', 'properties': {'query': {...}}}``)
+    and the runtime crashed on boot with
+    ``connectors.internal.0.input_schema.query Extra inputs are not
+    permitted``. Tightening the mirror catches that drift at chat
+    time rather than at deploy.
+    """
+    model_config = ConfigDict(extra="forbid")
+    type: str = "object"
+    properties: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    required: list[str] = Field(default_factory=list)
+    additionalProperties: bool = False
+
+
 class ConnectorDef(BaseModel):
     """External tool/connector exposed to the LLM (REST API, identity, write actions).
 
@@ -345,7 +425,7 @@ class ConnectorDef(BaseModel):
     model_config = ConfigDict(extra="forbid")
     name: str = Field(..., min_length=1)
     description: str = ""
-    input_schema: dict[str, Any] = Field(default_factory=dict)
+    input_schema: InputSchema = Field(default_factory=InputSchema)
     invocation_rules: InvocationRules = Field(default_factory=InvocationRules)
 
 
@@ -521,6 +601,15 @@ class ReachLayerDefaultsSection(BaseModel):
 # -- agent_core.observability (observability phase) --------------------------
 
 class ObservabilitySection(BaseModel):
-    """agent_core.observability — domain identifier (slug pattern)."""
+    """agent_core.observability — domain identifier (slug pattern).
+
+    The pattern accepts both ``-`` and ``_`` separators so the mirror does
+    not reject values produced by ``derived_fields.slug()`` (underscore-
+    based) OR by the project-creation slug in ``app.py:_slugify`` (hyphen-
+    based). The runtime ``ObservabilityConfig.domain`` field has no
+    pattern constraint at all (``agent_core/src/schema/config.py``), so
+    the only reason this regex exists is to keep the LLM from writing
+    obvious junk values (capitalised names, spaces, etc.).
+    """
     model_config = ConfigDict(extra="forbid")
-    domain: str = Field(..., min_length=1, pattern=r"^[a-z][a-z0-9-]*$")
+    domain: str = Field(..., min_length=1, pattern=r"^[a-z][a-z0-9_-]*$")

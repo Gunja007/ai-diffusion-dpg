@@ -12,7 +12,7 @@ os.environ.setdefault("ANTHROPIC_API_KEY", "test-key-placeholder")
 
 import dev_kit.agent.app as app_module
 import dev_kit.agent.deployer.dependencies as deps_module
-from dev_kit.agent.accumulator import BLOCKS
+from dev_kit.agent.project_state import BLOCKS
 
 
 def _create_infra_tmp(tmp_path: Path) -> Path:
@@ -41,8 +41,6 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(app_module, "CONFIGS_DIR", tmp_path)
     monkeypatch.setattr(app_module, "DPG_DIR", dpg_tmp)
     monkeypatch.setattr(deps_module, "HELM_INFRA_DIR", infra_tmp)
-    app_module._engines.clear()
-
     # Enable strict schema validation
     monkeypatch.setenv("DEVKIT_DPG_SCHEMA_STRICT", "1")
 

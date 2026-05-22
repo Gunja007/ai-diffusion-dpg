@@ -1,559 +1,1275 @@
 """
 dev-kit/dev_kit/agent/tools.py
 
-Tool definitions (JSON schemas for Claude) and handler dispatch for the
-DPG conversation agent.
+Canonical 8-tool set for the deterministic wizard (design §6: "Slimmed tool
+surface").
+
+The 8 top-level functions (``update_intake``, ``update_config``,
+``add_subagent``, ``update_subagent``, ``add_routing_rule``, ``add_tool``,
+``parse_openapi_spec``, ``discover_mcp_tools``) are Python callables routed
+by ``phase_driver.TOOL_HANDLERS`` when the LLM emits a tool call by name.
+They are NOT Anthropic tool_use JSON schemas.
+
+All 8 tools share a uniform signature::
+
+    def tool_fn(
+        args: dict[str, Any],
+        intake_state: IntakeState,
+        accumulator: dict[str, dict],
+        field_status: dict[str, str],
+    ) -> dict[str, Any]:
+
+Return value: ``{"ok": True, ...}`` on success, ``{"ok": False, "error": "..."}``
+on failure.
+
+Belongs to the dev-kit deterministic wizard.
+See docs/superpowers/specs/2026-05-13-devkit-deterministic-wizard-design.md §6.
 """
 from __future__ import annotations
 
-from pathlib import Path
+import copy
 import logging
+from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
-from dev_kit.agent.accumulator import BLOCKS, PHASES, ConfigAccumulator, ConfigStatus
-from dev_kit.agent.prompts.base import AGENT_TYPES, SHEET_REQUIREMENTS
+from dev_kit.agent.intake_state import IntakeState
+from dev_kit.agent.router import on_config_update, on_intake_update
 from dev_kit.schemas.cross_block_validation import validate_cross_block
 from dev_kit.schemas.validation import get_valid_sections
 
+
 # ---------------------------------------------------------------------------
-# Tool JSON schema definitions passed to the Claude API
+# § 6 — Canonical tool set (phase_driver.TOOL_HANDLERS uses these)
+#
+# Tool count: 9. Started at 8 (commit b0c2d33's trim); the tools phase later
+# needed three independent entry points for external-tool registration —
+# manual spec paste, OpenAPI URL fetch, and MCP discovery — so
+# ``fetch_openapi_spec_from_url`` was restored as a sibling of
+# ``parse_openapi_spec``. Without the URL fetcher, the LLM has to ask the
+# user to paste a multi-thousand-line spec into chat, which is a non-starter
+# for any production API.
 # ---------------------------------------------------------------------------
 
-TOOL_DEFINITIONS: list[dict] = [
+__all__ = [
+    "update_intake",
+    "update_config",
+    "add_subagent",
+    "update_subagent",
+    "add_routing_rule",
+    "add_tool",
+    "parse_openapi_spec",
+    "fetch_openapi_spec_from_url",
+    "discover_mcp_tools",
+    "DEVKIT_TOOL_SCHEMAS",
+]
+
+
+# Anthropic tool-use JSON schemas for the canonical 8-tool set. Exposed so the
+# new-wizard path in conversation.py can hand them to the Claude API.
+#
+# These are intentionally MINIMAL ("type": "object" with no strict properties)
+# so phase_driver.run_turn dispatches by name regardless of arg shape. The 8
+# Python handlers in this module perform their own arg validation and return
+# structured errors on malformed input. Schema strictness can be tightened in a
+# follow-up once the new wizard end-to-end flow is stable.
+DEVKIT_TOOL_SCHEMAS: list[dict] = [
     {
-        "name": "set_project_meta",
+        "name": "update_intake",
         "description": (
-            "Set the project name, description, persona, and domain summary. "
-            "Call once you understand the use case from the Domain Overview phase. "
-            "NOTE: the project slug is fixed at create-time (derived from the original "
-            "project name) and cannot be changed here — it is the on-disk directory key."
+            "Set or update a single IntakeState field. Use this for every yes/no "
+            "answer the user gives during the tier intake phase. Cascades through "
+            "FIELD_RULES to invalidate dependent answers when intake changes."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "name": {"type": "string", "description": "Human-readable project name"},
-                "description": {"type": "string", "description": "One-paragraph description of the use case"},
-                "user_persona": {"type": "string", "description": "Who the end users are"},
-                "domain_summary": {"type": "string", "description": "The domain and problem the AI agent addresses"},
+                "field": {
+                    "type": "string",
+                    "description": (
+                        "IntakeState field name. One of: has_kb, has_external_tools, "
+                        "is_multi_turn, needs_persistent_user_data, is_companion_style, "
+                        "needs_consent, has_hitl (booleans), or selected_channels, "
+                        "supported_languages (list[str]), or default_language, "
+                        "domain_description, project_name (str)."
+                    ),
+                },
+                "value": {
+                    "description": (
+                        "New value for the field. Use a boolean for the 7 binary flags; "
+                        "a list of strings for selected_channels/supported_languages; "
+                        "a string for the rest."
+                    ),
+                },
             },
-            "required": ["name", "description"],
+            "required": ["field", "value"],
         },
     },
     {
         "name": "update_config",
         "description": (
-            "Update a section of a block's domain config. Values are deep-merged into the current state for that block.\n\n"
-            "Valid top-level sections per block (the first segment of the dot-notation path):\n"
-            + "\n".join(
-                f"  - {block}: {', '.join(get_valid_sections(block))}"
-                for block in BLOCKS
-            )
+            "Write a user chat answer to the accumulator with mirror validation. "
+            "Preferred form: {path: 'block.section.field', value: ...}. "
+            "Legacy form: {block, section, values: {...}}."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "block": {"type": "string", "enum": BLOCKS},
-                "section": {
+                "path": {
+                    "type": "string",
+                    "description": "Dotted path 'block.section.field' (preferred form).",
+                },
+                "value": {
+                    "description": "Value to write at path (preferred form).",
+                },
+                "block": {
                     "type": "string",
                     "description": (
-                        "Dot-notation path to the config section. "
-                        "The first segment MUST be one of the valid top-level sections listed in the tool description. "
-                        "Examples: 'agent', 'preprocessing.nlu_processor', 'agent_workflow', 'trust', 'state.session'"
+                        "Block name (legacy form). One of: agent_core, trust_layer, "
+                        "knowledge_engine, memory_layer, action_gateway, reach_layer, "
+                        "observability_layer."
                     ),
                 },
-                "values": {"type": "object", "description": "Key-value pairs to merge into the section"},
-            },
-            "required": ["block", "section", "values"],
-        },
-    },
-    {
-        "name": "set_agent_type",
-        "description": (
-            "Sets the agent type classification for this project. Valid values: "
-            "transactional, informational, agentic, conversational. Driven by the "
-            "3-question decision tree in the tier phase."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "type": {"type": "string", "enum": AGENT_TYPES},
-            },
-            "required": ["type"],
-        },
-    },
-    {
-        "name": "skip_optional_phase",
-        "description": (
-            "Record that the user has chosen to skip an optional phase. "
-            "Only allowed when SHEET_REQUIREMENTS marks the phase as 'optional' "
-            "for the current agent type. Writes phase_decisions[phase] = skipped_by_user "
-            "to project meta."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "phase": {"type": "string", "enum": PHASES},
-            },
-            "required": ["phase"],
-        },
-    },
-    {
-        "name": "set_phase",
-        "description": "Advance the conversation to the next phase. Call when you have collected enough information for the current phase.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "phase": {
+                "section": {
                     "type": "string",
-                    "enum": PHASES,
+                    "description": "Section name within the block (legacy form).",
+                },
+                "values": {
+                    "type": "object",
+                    "description": "Dict of field-value pairs to apply (legacy form).",
                 },
             },
-            "required": ["phase"],
         },
     },
     {
-        "name": "create_subagent",
-        "description": "Add a new subagent node to the agent_workflow. Appears as a node in the conversation flow graph.",
+        "name": "add_subagent",
+        "description": (
+            "Append a subagent definition to agent_core.agent_workflow.subagents. "
+            "Used during the workflow phase to build the subagent graph."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "id": {"type": "string", "description": "Unique snake_case identifier"},
-                "name": {"type": "string", "description": "Human-readable name"},
-                "description": {"type": "string", "description": "What this subagent does"},
-                "system_prompt": {"type": "string", "description": "LLM instructions for this conversation state"},
-                "is_start": {"type": "boolean", "default": False},
-                "is_terminal": {"type": "boolean", "default": False},
-                "valid_intents": {"type": "array", "items": {"type": "string"}, "default": []},
-                "tools": {"type": "array", "items": {"type": "string"}, "default": []},
-                "opening_phrase": {"type": "string", "description": "Phrase emitted on the first turn only (after consent). Empty string means none.", "default": ""},
+                "definition": {
+                    "type": "object",
+                    "description": (
+                        "Subagent definition. Must include 'id' (str) and typically "
+                        "'name', 'description', 'is_start', 'is_terminal', "
+                        "'opening_phrase', 'system_prompt', 'valid_intents', 'routing'."
+                    ),
+                },
             },
-            "required": ["id", "name", "description", "system_prompt"],
+            "required": ["definition"],
         },
     },
     {
         "name": "update_subagent",
-        "description": "Modify an existing subagent's fields.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "id": {"type": "string"},
-                "fields": {"type": "object", "description": "Any subset of the subagent definition to update"},
-            },
-            "required": ["id", "fields"],
-        },
-    },
-    {
-        "name": "add_routing_rule",
-        "description": "Add a routing rule (transition edge) from one subagent to another, triggered by an intent.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "from_subagent_id": {"type": "string"},
-                "intent": {"type": "string", "description": "Intent that triggers this transition. Use '*' for catch-all."},
-                "next_subagent_id": {"type": "string"},
-                "conditions": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "field": {"type": "string"},
-                            "operator": {"type": "string", "enum": ["eq", "not_eq", "gt", "lt", "in"]},
-                            "value": {},
-                        },
-                        "required": ["field", "operator", "value"],
-                    },
-                    "description": "Optional session state conditions",
-                    "default": [],
-                },
-                "session_writes": {
-                    "type": "object",
-                    "description": "Optional session field writes when this rule fires",
-                    "default": {},
-                },
-            },
-            "required": ["from_subagent_id", "intent", "next_subagent_id"],
-        },
-    },
-    {
-        "name": "update_routing_rule",
-        "description": "Modify an existing routing rule identified by from_subagent_id + intent.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "from_subagent_id": {"type": "string"},
-                "intent": {"type": "string"},
-                "fields": {"type": "object", "description": "Fields to update on the routing rule"},
-            },
-            "required": ["from_subagent_id", "intent", "fields"],
-        },
-    },
-    {
-        "name": "remove_subagent",
-        "description": "Remove a subagent and all its outgoing routing rules from the workflow.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "id": {"type": "string", "description": "ID of the subagent to remove"},
-            },
-            "required": ["id"],
-        },
-    },
-    {
-        "name": "finalize_config",
-        "description": "Mark a config as complete. Use after confirming a block's config is fully specified.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "block": {"type": "string", "enum": BLOCKS},
-            },
-            "required": ["block"],
-        },
-    },
-    {
-        "name": "rollback_to_checkpoint",
-        "description": "Signal that the conversation should roll back to a previous checkpoint. Use only when the user explicitly requests it.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "phase": {"type": "string", "description": "Checkpoint phase identifier, e.g. '01_overview'"},
-            },
-            "required": ["phase"],
-        },
-    },
-    {
-        "name": "parse_openapi_spec",
         "description": (
-            "Parse a raw OpenAPI 3.0/3.1 spec (JSON or YAML string) and return a list of candidate tool definitions. "
-            "Use this when the user uploads or pastes an OpenAPI spec. "
-            "The returned candidates help you decide which endpoints to add with add_rest_api_tool."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "spec_json": {
-                    "type": "string",
-                    "description": "The full OpenAPI spec as a JSON or YAML string",
-                },
-            },
-            "required": ["spec_json"],
-        },
-    },
-    {
-        "name": "fetch_openapi_spec_from_url",
-        "description": (
-            "Fetch an OpenAPI 3.0/3.1 spec from a URL and return candidate tool definitions. "
-            "Use this when the user pastes a URL to their API spec. "
-            "Supports JSON and YAML. Returns the same candidate list as parse_openapi_spec."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "url": {
-                    "type": "string",
-                    "description": "URL of the OpenAPI spec file (JSON or YAML), e.g. https://api.example.com/openapi.yaml",
-                },
-            },
-            "required": ["url"],
-        },
-    },
-    {
-        "name": "add_rest_api_tool",
-        "description": (
-            "Add a REST API tool to the Action Gateway config. "
-            "Call this once per tool after confirming details with the user — whether from an OpenAPI spec or collected conversationally. "
-            "This also auto-creates the matching connector in agent_core.connectors."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "id": {"type": "string", "description": "Unique snake_case tool ID, e.g. onest_market_lookup"},
-                "category": {"type": "string", "enum": ["read", "write", "identity"], "description": "read = no consent; write/identity = Trust Layer consent required"},
-                "description": {"type": "string", "description": "What this tool does — shown to the LLM for routing decisions"},
-                "base_url": {"type": "string", "description": "API base URL, e.g. https://api.example.com/v2"},
-                "auth_type": {"type": "string", "enum": ["none", "api_key", "bearer", "oauth2"]},
-                "auth_header": {"type": "string", "description": "Header name for api_key auth, e.g. X-API-KEY"},
-                "auth_secret_env": {"type": "string", "description": "Env var name holding the API key"},
-                "timeout_ms": {"type": "integer", "default": 5000},
-                "endpoints": {
-                    "type": "array",
-                    "description": "One or more endpoint definitions",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "name": {"type": "string"},
-                            "method": {"type": "string", "enum": ["GET", "POST", "PUT", "DELETE", "PATCH"]},
-                            "path": {"type": "string"},
-                            "params": {
-                                "type": "array",
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "name": {"type": "string"},
-                                        "source": {"type": "string", "enum": ["agent", "static"]},
-                                        "type": {"type": "string"},
-                                        "required": {"type": "boolean"},
-                                        "description": {"type": "string"},
-                                        "value": {"description": "Fixed value when source is static"},
-                                        "default": {"description": "Default value for optional agent params"},
-                                    },
-                                    "required": ["name", "source", "type"],
-                                },
-                            },
-                        },
-                        "required": ["name", "method", "path"],
-                    },
-                },
-            },
-            "required": ["id", "category", "description", "base_url", "auth_type", "endpoints"],
-        },
-    },
-    {
-        "name": "set_response_transformation",
-        "description": (
-            "Set the response projection for a REST API tool. "
-            "Call this after add_rest_api_tool, once the user tells you which fields from the API response the LLM should see. "
-            "If the response wraps a list of items (e.g. search results), set list_key to the dot-path of that list "
-            "and each field's source is a dot-path into one item. Without list_key, sources are dot-paths into the response root. "
-            "Calling this again for the same tool replaces the previous projection."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "tool_id": {
-                    "type": "string",
-                    "description": "ID of the REST API tool to configure (must already exist via add_rest_api_tool)",
-                },
-                "list_key": {
-                    "type": "string",
-                    "description": (
-                        "Optional dot-path to a list in the response (e.g. 'data.items'). "
-                        "When set, each list element is projected; when empty, the response root is projected."
-                    ),
-                    "default": "",
-                },
-                "fields": {
-                    "type": "array",
-                    "description": "Response fields to extract and expose to the LLM",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "source": {
-                                "type": "string",
-                                "description": "Dot-path into each item (or response root if no list_key), e.g. 'job.title' or 'employer.name'",
-                            },
-                            "target": {
-                                "type": "string",
-                                "description": "Field name the LLM sees in the projected result, e.g. 'job_title'",
-                            },
-                        },
-                        "required": ["source", "target"],
-                    },
-                },
-            },
-            "required": ["tool_id", "fields"],
-        },
-    },
-    {
-        "name": "discover_mcp_tools",
-        "description": (
-            "Fetch the list of available tools from an MCP server by calling its tools/list endpoint. "
-            "Use this when the user provides an MCP server URL. "
-            "Returns the raw tools list so you can present options to the user."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "mcp_server_url": {
-                    "type": "string",
-                    "description": "Base URL of the MCP server, e.g. https://mcp.example.com",
-                },
-            },
-            "required": ["mcp_server_url"],
-        },
-    },
-    {
-        "name": "add_mcp_tool",
-        "description": (
-            "Register an MCP server with the Action Gateway. "
-            "Call this once per MCP server — the adapter auto-discovers all available tools at startup. "
-            "Each discovered tool is registered as '{id}.{tool_name}' "
-            "(e.g. 'obsrv_docs.searchDocumentation'). "
-            "Use these namespaced names when assigning tools to subagents. "
-            "Do NOT call this once per tool — one call per server is correct."
+            "Modify fields on an existing subagent in agent_core.agent_workflow.subagents."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "id": {
                     "type": "string",
-                    "description": (
-                        "Unique snake_case namespace for this MCP server's tools "
-                        "(e.g. 'obsrv_docs'). All tools discovered from the server "
-                        "are prefixed with this id."
-                    ),
+                    "description": "The subagent's id (must already exist).",
                 },
-                "category": {"type": "string", "enum": ["read", "write", "identity"]},
-                "description": {
-                    "type": "string",
-                    "description": "What this MCP server provides — used in Action Gateway config.",
+                "fields": {
+                    "type": "object",
+                    "description": "Field-value pairs to overwrite on the subagent.",
                 },
-                "mcp_server_url": {"type": "string", "description": "Base URL of the MCP server"},
-                "transport": {
-                    "type": "string",
-                    "enum": ["sse", "streamable_http"],
-                    "default": "sse",
-                    "description": (
-                        "MCP transport protocol. Use 'streamable_http' for GitBook, Notion, "
-                        "and other hosted servers (POST-only, MCP spec 2025-03-26). "
-                        "Use 'sse' for self-hosted servers that support the older SSE transport."
-                    ),
-                },
-                "timeout_ms": {"type": "integer", "default": 5000},
             },
-            "required": ["id", "category", "description", "mcp_server_url"],
+            "required": ["id", "fields"],
         },
     },
     {
-        "name": "set_reach_channels",
+        "name": "add_routing_rule",
         "description": (
-            "Record which deployment channels the user wants (web, cli, voice). "
-            "Call this in the overview phase after understanding the use case. "
-            "Later phases (language, reach) use the selection to skip irrelevant config."
+            "Append a routing rule (transition edge) to a subagent's 'routing' list. "
+            "Used to wire intent → next-subagent transitions during the workflow phase."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "channels": {
-                    "type": "array",
-                    "items": {"type": "string", "enum": ["web", "cli", "voice"]},
-                    "description": "One or more of: web, cli, voice",
-                    "minItems": 1,
+                "from_subagent_id": {
+                    "type": "string",
+                    "description": "ID of the subagent whose routing list gets a new rule.",
+                },
+                "intent": {
+                    "type": "string",
+                    "description": "Intent name (must subset nlu_processor.intents) or '*' wildcard.",
+                },
+                "to_subagent_id": {
+                    "type": "string",
+                    "description": "ID of the target subagent (must already be declared).",
+                },
+                "condition": {
+                    "type": ["object", "null"],
+                    "description": "Optional RoutingCondition {field, operator, value}.",
                 },
             },
-            "required": ["channels"],
+            "required": ["from_subagent_id", "intent", "to_subagent_id"],
         },
     },
     {
-        "name": "declare_azure_storage",
+        "name": "add_tool",
         "description": (
-            "Record that this domain uses Azure Blob Storage for KB document ingestion. "
-            "Call only if the operator confirms they have Azure Blob Storage. "
-            "Takes no parameters — all Azure credentials and config (account name, "
-            "account key, container name) are entered securely in the Deployment "
-            "Inputs step, never in chat."
+            "Add an external tool to action_gateway.tools and the matching connector "
+            "entry in agent_core. Used during the tools phase."
         ),
         "input_schema": {
             "type": "object",
-            "properties": {},
-            "required": [],
+            "properties": {
+                "spec": {
+                    "type": "object",
+                    "description": (
+                        "Tool spec. Must include id (str), type ('rest_api' or 'mcp'), "
+                        "category ('read', 'write', or 'identity'), and the type-specific "
+                        "fields (endpoints for rest_api, mcp_server_url for mcp)."
+                    ),
+                },
+            },
+            "required": ["spec"],
+        },
+    },
+    {
+        "name": "parse_openapi_spec",
+        "description": (
+            "Parse an OpenAPI 3.0/3.1 spec the user pasted into chat (JSON or YAML "
+            "string, or a parsed dict) and return candidate tool operations. Does "
+            "NOT mutate state — call add_tool afterwards to register the chosen "
+            "operations. Use this when the user pastes the spec inline."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "spec": {
+                    "description": (
+                        "The OpenAPI spec as a JSON/YAML string or a parsed dict."
+                    ),
+                },
+            },
+            "required": ["spec"],
+        },
+    },
+    {
+        "name": "fetch_openapi_spec_from_url",
+        "description": (
+            "Download an OpenAPI 3.0/3.1 spec from a URL and return candidate tool "
+            "operations. Accepts JSON or YAML responses, follows redirects, and "
+            "returns the same shape as parse_openapi_spec. Does NOT mutate state — "
+            "call add_tool afterwards to register the chosen operations. Use this "
+            "when the user gives a URL instead of pasting the spec."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "Direct URL to the OpenAPI spec (JSON or YAML).",
+                },
+            },
+            "required": ["url"],
+        },
+    },
+    {
+        "name": "discover_mcp_tools",
+        "description": (
+            "List tools exposed by an MCP server via JSON-RPC tools/list. "
+            "Auto-detects plain JSON or SSE responses. Returns each tool's name, "
+            "description, and input_schema so you can decide whether to register "
+            "the server via add_tool(spec={type:'mcp',...})."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "server_url": {
+                    "type": "string",
+                    "description": "URL of the MCP server (the JSON-RPC endpoint).",
+                },
+                "timeout_ms": {
+                    "type": "integer",
+                    "description": "Optional timeout in milliseconds (default 10000).",
+                },
+            },
+            "required": ["server_url"],
         },
     },
 ]
 
-# ---------------------------------------------------------------------------
-# Recording wizard helper
-# ---------------------------------------------------------------------------
 
+def update_intake(
+    args: dict[str, Any],
+    intake_state: IntakeState,
+    accumulator: dict[str, dict],
+    field_status: dict[str, str],
+) -> dict[str, Any]:
+    """Mutate an IntakeState field and cascade through FIELD_RULES.
 
-def collect_recording_settings(existing: dict) -> dict:
-    """Assemble a recording configuration dict for the voice channel.
-
-    Accepts an ``existing`` dict containing whatever the operator has already
-    provided (e.g. from a previous wizard turn or from a pre-filled form).
-    Missing or blank values are filled in with safe defaults. When ``source``
-    is ``"disabled"`` (the default) only the ``source`` key is kept — no
-    further recording fields are needed and the block is effectively a no-op.
-
-    The function never prompts interactively; it is designed to be called
-    from both the schema-driven Configuration Agent wizard (which collects
-    values via the React UI and passes them as ``existing``) and from unit
-    tests.
-
-    Caller-ID hash salt auto-generation: if ``caller_id_hash_salt`` is absent
-    or blank in ``existing``, a 64-character hex token is generated via
-    ``secrets.token_hex(32)``.  The minimum required length is 32 chars.
+    Delegates to ``router.on_intake_update`` to apply the change and
+    re-evaluate any predetermined rules that depend on the updated field.
 
     Args:
-        existing: Dict of recording settings already collected.  Any key may
-                  be absent or set to ``None`` / ``""``; all are handled
-                  gracefully.
+        args: Must contain ``field`` (str) and ``value`` (Any).
+        intake_state: Current IntakeState — mutated in-place on success.
+        accumulator: Per-block YAML dicts — may be mutated by cascade.
+        field_status: Per-field status registry — may be mutated by cascade.
 
     Returns:
-        Fully-populated recording config dict ready to be merged into the
-        ``reach_layer.channels.voice.recording`` path via ``update_config``.
-
-    Raises:
-        ValueError: If ``existing`` is not a dict.
+        ``{"ok": True, ...}`` from ``on_intake_update`` on success.
+        ``{"ok": False, "error": "..."}`` if ``field`` is unknown or missing.
     """
-    import secrets as _secrets
+    field = args.get("field")
+    if not field:
+        return {"ok": False, "error": "args.field is required"}
+    if "value" not in args:
+        return {"ok": False, "error": "args.value is required"}
+    try:
+        return on_intake_update(
+            field,
+            args["value"],
+            intake_state,
+            accumulator,
+            field_status,
+        )
+    except AttributeError as exc:
+        logger.warning(
+            "update_intake.rejected",
+            extra={
+                "operation": "tools.update_intake",
+                "status": "failure",
+                "error": str(exc),
+                "field": field,
+            },
+        )
+        return {"ok": False, "error": str(exc)}
 
-    if not isinstance(existing, dict):
-        raise ValueError(f"existing must be a dict, got {type(existing).__name__!r}")
 
-    source = existing.get("source") or "disabled"
+def update_config(
+    args: dict[str, Any],
+    intake_state: IntakeState,  # unused — kept for signature uniformity
+    accumulator: dict[str, dict],
+    field_status: dict[str, str],
+) -> dict[str, Any]:
+    """Apply a user chat answer to the accumulator with mirror validation.
 
-    # Disabled path — return minimal dict; framework YAML defaults cover the rest.
-    if source == "disabled":
-        return {"source": "disabled"}
+    Accepts two calling forms:
 
-    # Opted-in path — fill in all required fields.
-    salt = existing.get("caller_id_hash_salt") or ""
-    if not salt or len(salt) < 32:
-        salt = _secrets.token_hex(32)  # 64 hex chars
+    * **Path form** (preferred): ``args = {"path": "block.section.field", "value": ...}``
+      — delegates directly to ``router.on_config_update``.
+    * **Block/section/values form**: ``args = {"block": "...", "section": "...",
+      "values": {...}}`` — normalises each key to path form.
 
-    # Store defaults.
-    store_in = existing.get("store") or {}
-    if not isinstance(store_in, dict):
-        store_in = {}
+    Args:
+        args: Tool arguments. Must provide either ``path``+``value`` or
+            ``block``+``section``+``values``.
+        intake_state: Not used by this tool; accepted for signature uniformity.
+        accumulator: Per-block YAML dicts — mutated in-place on success.
+        field_status: Per-field status registry — mutated on success.
 
-    backend = store_in.get("backend") or "local"
+    Returns:
+        ``{"ok": True, "path": ..., "value": ...}`` on success (path form).
+        ``{"ok": True, "results": [...]}`` on success (block/section form).
+        ``{"ok": False, "error": "..."}`` on validation failure or bad args.
+    """
+    if "path" in args:
+        if "value" not in args:
+            return {"ok": False, "error": "args.value is required when args.path is set"}
+        try:
+            return on_config_update(args["path"], args["value"], accumulator, field_status)
+        except ValueError as exc:
+            logger.warning(
+                "update_config.rejected",
+                extra={
+                    "operation": "tools.update_config",
+                    "status": "failure",
+                    "error": str(exc),
+                    "path": args.get("path"),
+                },
+            )
+            return {"ok": False, "error": str(exc), "path": args.get("path")}
 
-    local_cfg = store_in.get("local") or {}
-    if not isinstance(local_cfg, dict):
-        local_cfg = {}
-    local_section = {
-        "base_path": local_cfg.get("base_path") or "/var/recordings",
-    }
+    # Block/section/values form
+    block = args.get("block")
+    section = args.get("section")
+    values = args.get("values") or {}
+    if not block:
+        return {"ok": False, "error": "args.block is required"}
+    if not section:
+        return {"ok": False, "error": "args.section is required"}
+    if not isinstance(values, dict):
+        return {
+            "ok": False,
+            "error": f"args.values must be a dict, got {type(values).__name__!r}",
+        }
 
-    s3_in = store_in.get("s3") or {}
-    if not isinstance(s3_in, dict):
-        s3_in = {}
-    s3_section = {
-        "bucket": s3_in.get("bucket") or "",
-        "prefix": s3_in.get("prefix") or "recordings/",
-        "region": s3_in.get("region") or "ap-south-1",
-        "kms_key_id": s3_in.get("kms_key_id") or "",
-    }
+    results: list[dict[str, Any]] = []
+    for key, value in values.items():
+        path = f"{block}.{section}.{key}"
+        try:
+            result = on_config_update(path, value, accumulator, field_status)
+            results.append(result)
+        except ValueError as exc:
+            logger.warning(
+                "update_config.rejected",
+                extra={
+                    "operation": "tools.update_config",
+                    "status": "failure",
+                    "error": str(exc),
+                    "path": path,
+                },
+            )
+            return {"ok": False, "error": str(exc), "path": path}
 
-    store_out: dict = {
-        "backend": backend,
-        "local": local_section,
-        "s3": s3_section,
-    }
+    return {"ok": True, "results": results}
+
+
+def add_subagent(
+    args: dict[str, Any],
+    intake_state: IntakeState,  # unused — kept for signature uniformity
+    accumulator: dict[str, dict],
+    field_status: dict[str, str],
+) -> dict[str, Any]:
+    """Append a new subagent definition to ``agent_core.agent_workflow.subagents``.
+
+    The definition is validated via ``validate_partial`` against the mirror
+    schema. On failure the appended item is removed (reverted) and an error
+    is returned.
+
+    Args:
+        args: Must contain ``definition`` (dict) with at least an ``id`` key.
+        intake_state: Not used; accepted for signature uniformity.
+        accumulator: Per-block YAML dicts — mutated in-place on success.
+        field_status: Mutated on success — ``agent_core.agent_workflow.subagents``
+            is marked ``"answered"`` so the workflow phase can advance once at
+            least one subagent has been registered.
+
+    Returns:
+        ``{"ok": True, "id": subagent_id}`` on success.
+        ``{"ok": False, "error": "..."}`` on validation failure or missing id.
+    """
+    from dev_kit.schemas.validation import validate_partial  # noqa: PLC0415
+
+    definition = args.get("definition")
+    if not isinstance(definition, dict):
+        return {"ok": False, "error": "args.definition must be a dict"}
+
+    subagent_id = definition.get("id")
+    if not subagent_id:
+        return {"ok": False, "error": "definition.id is required"}
+
+    # Candidate-copy commit. Building the would-be merged agent_core on a
+    # deep copy means the live accumulator is never mutated until the
+    # validate_partial gate passes — no bad subagent can leak into the
+    # per-turn YAML render.
+    candidate_agent_core = copy.deepcopy(accumulator.get("agent_core", {}))
+    workflow = candidate_agent_core.setdefault("agent_workflow", {})
+    subagents: list[dict] = workflow.setdefault("subagents", [])
+
+    if any(sa.get("id") == subagent_id for sa in subagents):
+        return {
+            "ok": False,
+            "error": f"subagent id {subagent_id!r} already exists; use update_subagent to modify it",
+        }
+
+    subagents.append(copy.deepcopy(definition))
+
+    errors = validate_partial("agent_core", candidate_agent_core)
+    if errors:
+        error_msg = "; ".join(errors)
+        logger.warning(
+            "add_subagent.validation_failed",
+            extra={
+                "operation": "tools.add_subagent",
+                "status": "failure",
+                "error": error_msg,
+                "subagent_id": subagent_id,
+            },
+        )
+        return {"ok": False, "error": f"Validation failed: {error_msg}"}
+
+    # Commit the validated candidate.
+    accumulator["agent_core"] = candidate_agent_core
+    # Mark the workflow's `subagents` chat field as answered. Without this
+    # the workflow phase stays incomplete forever because field_status
+    # never transitions out of `pending` — the LLM has no signal that the
+    # field has been populated, and `_is_phase_complete("workflow")`
+    # keeps returning False even after subagents have been registered.
+    field_status["agent_core.agent_workflow.subagents"] = "answered"
+    logger.info(
+        "add_subagent.success",
+        extra={
+            "operation": "tools.add_subagent",
+            "status": "success",
+            "subagent_id": subagent_id,
+        },
+    )
+    return {"ok": True, "id": subagent_id}
+
+
+def update_subagent(
+    args: dict[str, Any],
+    intake_state: IntakeState,  # unused — kept for signature uniformity
+    accumulator: dict[str, dict],
+    field_status: dict[str, str],  # unused — kept for signature uniformity
+) -> dict[str, Any]:
+    """Modify fields on an existing subagent in-place.
+
+    Finds the subagent by ``id``, applies ``fields`` as a shallow update, then
+    re-validates. On validation failure the update is reverted.
+
+    Args:
+        args: Must contain ``id`` (str) and ``fields`` (dict).
+        intake_state: Not used; accepted for signature uniformity.
+        accumulator: Per-block YAML dicts — mutated in-place on success.
+        field_status: Not used; accepted for signature uniformity.
+
+    Returns:
+        ``{"ok": True, "id": subagent_id}`` on success.
+        ``{"ok": False, "error": "..."}`` if not found or validation fails.
+    """
+    from dev_kit.schemas.validation import validate_partial  # noqa: PLC0415
+
+    subagent_id = args.get("id")
+    fields = args.get("fields")
+    if not subagent_id:
+        return {"ok": False, "error": "args.id is required"}
+    if not isinstance(fields, dict):
+        return {"ok": False, "error": "args.fields must be a dict"}
+
+    # Candidate-copy commit. Builds the would-be merged agent_core on a
+    # deep copy first so the live accumulator never carries a half-updated
+    # subagent if validation fails mid-merge.
+    candidate_agent_core = copy.deepcopy(accumulator.get("agent_core", {}))
+    candidate_subagents = (
+        candidate_agent_core.get("agent_workflow", {}).get("subagents", [])
+    )
+
+    target = next(
+        (sa for sa in candidate_subagents if sa.get("id") == subagent_id),
+        None,
+    )
+    if target is None:
+        return {"ok": False, "error": f"subagent id {subagent_id!r} not found"}
+
+    target.update(fields)
+
+    errors = validate_partial("agent_core", candidate_agent_core)
+    if errors:
+        error_msg = "; ".join(errors)
+        logger.warning(
+            "update_subagent.validation_failed",
+            extra={
+                "operation": "tools.update_subagent",
+                "status": "failure",
+                "error": error_msg,
+                "subagent_id": subagent_id,
+            },
+        )
+        return {"ok": False, "error": f"Validation failed: {error_msg}"}
+
+    # Commit the validated candidate.
+    accumulator["agent_core"] = candidate_agent_core
+    logger.info(
+        "update_subagent.success",
+        extra={
+            "operation": "tools.update_subagent",
+            "status": "success",
+            "subagent_id": subagent_id,
+        },
+    )
+    return {"ok": True, "id": subagent_id}
+
+
+def add_routing_rule(
+    args: dict[str, Any],
+    intake_state: IntakeState,  # unused — kept for signature uniformity
+    accumulator: dict[str, dict],
+    field_status: dict[str, str],  # unused — kept for signature uniformity
+) -> dict[str, Any]:
+    """Append a routing rule (transition edge) to a subagent's routing list.
+
+    Finds ``from_subagent_id`` in the subagents list and appends a rule
+    ``{"intent": ..., "to": ..., "condition": ...}``.
+
+    Args:
+        args: Must contain ``from_subagent_id`` (str), ``intent`` (str), and
+            ``to_subagent_id`` (str). Optional: ``condition`` (str).
+        intake_state: Not used; accepted for signature uniformity.
+        accumulator: Per-block YAML dicts — mutated in-place on success.
+        field_status: Not used; accepted for signature uniformity.
+
+    Returns:
+        ``{"ok": True, "from": ..., "intent": ..., "to": ...}`` on success.
+        ``{"ok": False, "error": "..."}`` if the source subagent is not found.
+    """
+    from_id = args.get("from_subagent_id")
+    intent = args.get("intent")
+    to_id = args.get("to_subagent_id")
+
+    if not from_id:
+        return {"ok": False, "error": "args.from_subagent_id is required"}
+    if not intent:
+        return {"ok": False, "error": "args.intent is required"}
+    if not to_id:
+        return {"ok": False, "error": "args.to_subagent_id is required"}
+
+    from dev_kit.schemas.validation import validate_partial  # noqa: PLC0415
+
+    # Candidate-copy commit. Builds the routing addition on a deep copy
+    # of agent_core, validates, and only swaps in on success — keeps
+    # invalid rules (e.g. an intent that crashes startup invariants) out
+    # of the live accumulator and the per-turn YAML render.
+    candidate_agent_core = copy.deepcopy(accumulator.get("agent_core", {}))
+    candidate_subagents = (
+        candidate_agent_core.get("agent_workflow", {}).get("subagents", [])
+    )
+
+    target = next(
+        (sa for sa in candidate_subagents if sa.get("id") == from_id),
+        None,
+    )
+    if target is not None:
+        # Match the mirror schema (RoutingRule in
+        # dev_kit/schemas/domain/agent_core.py): the field is
+        # `next_subagent_id`, not `to`, and `conditions` is a list of
+        # RoutingCondition objects, not a single `condition`.
+        rule: dict[str, Any] = {"intent": intent, "next_subagent_id": to_id}
+        condition = args.get("condition")
+        if condition:
+            # Tool API accepts a single condition object for ergonomics;
+            # promote to the schema's list shape.
+            rule["conditions"] = condition if isinstance(condition, list) else [condition]
+        # Idempotent dedupe — match sibling tools ``add_subagent``
+        # (id check) and ``add_tool`` (name check). The LLM tool-loop
+        # retry pattern (``_MAX_TOOL_ROUNDS=4``) regularly re-emits a
+        # batch when one call in the batch fails validation, so
+        # without this check the routing list grows by one each retry.
+        existing_routes = target.setdefault("routing", [])
+        for r in existing_routes:
+            if (
+                r.get("intent") == intent
+                and r.get("next_subagent_id") == to_id
+                and r.get("conditions") == rule.get("conditions")
+            ):
+                return {
+                    "ok": True,
+                    "noop": True,
+                    "reason": "duplicate routing rule skipped",
+                    "from": from_id,
+                    "intent": intent,
+                    "to": to_id,
+                }
+        existing_routes.append(rule)
+
+        errors = validate_partial("agent_core", candidate_agent_core)
+        if errors:
+            error_msg = "; ".join(errors)
+            logger.warning(
+                "add_routing_rule.validation_failed",
+                extra={
+                    "operation": "tools.add_routing_rule",
+                    "status": "failure",
+                    "from_subagent_id": from_id,
+                    "intent": intent,
+                    "to_subagent_id": to_id,
+                    "error": error_msg,
+                },
+            )
+            return {"ok": False, "error": f"Validation failed: {error_msg}"}
+
+        # Commit the validated candidate.
+        accumulator["agent_core"] = candidate_agent_core
+        logger.info(
+            "add_routing_rule.success",
+            extra={
+                "operation": "tools.add_routing_rule",
+                "status": "success",
+                "from_subagent_id": from_id,
+                "intent": intent,
+                "to_subagent_id": to_id,
+            },
+        )
+        return {"ok": True, "from": from_id, "intent": intent, "to": to_id}
 
     return {
-        "source": source,
-        "consent_purpose": existing.get("consent_purpose") or "recording",
-        "webhook_timeout_s": existing.get("webhook_timeout_s") or 30,
-        "fetch_timeout_s": existing.get("fetch_timeout_s") or 60,
-        "min_duration_ms": existing.get("min_duration_ms") or 500,
-        "caller_id_hash_salt": salt,
-        "store": store_out,
+        "ok": False,
+        "error": f"source subagent id {from_id!r} not found",
     }
 
 
-# ---------------------------------------------------------------------------
-# Transport helpers
-# ---------------------------------------------------------------------------
+def add_tool(
+    args: dict[str, Any],
+    intake_state: IntakeState,  # unused — kept for signature uniformity
+    accumulator: dict[str, dict],
+    field_status: dict[str, str],
+) -> dict[str, Any]:
+    """Add an action_gateway tool and matching agent_core connector.
+
+    Appends ``spec`` to ``accumulator["action_gateway"]["tools"]`` and syncs
+    the LLM-facing connector into ``accumulator["agent_core"]["connectors"]``
+    under the appropriate category (``read``, ``write``, or ``identity``).
+
+    Both additions are validated via ``validate_partial``. On failure the
+    appended items are reverted.
+
+    Args:
+        args: Must contain ``spec`` (dict) with at least ``id``, ``type``
+            (``rest_api`` or ``mcp``), and ``category``
+            (``read``, ``write``, or ``identity``).
+        intake_state: Not used; accepted for signature uniformity.
+        accumulator: Per-block YAML dicts — mutated in-place on success.
+        field_status: Mutated on success — both ``action_gateway.tools`` and
+            the matching ``agent_core.connectors.<category>`` field are
+            marked ``"answered"`` so the tools phase can advance once at
+            least one tool has been registered.
+
+    Returns:
+        ``{"ok": True, "id": tool_id}`` on success.
+        ``{"ok": False, "error": "..."}`` on duplicate id or validation failure.
+    """
+    from dev_kit.schemas.validation import (  # noqa: PLC0415
+        validate_domain_section,
+        validate_partial,
+    )
+
+    spec = args.get("spec")
+    if not isinstance(spec, dict):
+        return {"ok": False, "error": "args.spec must be a dict"}
+
+    tool_id = spec.get("id")
+    if not tool_id:
+        return {"ok": False, "error": "spec.id is required"}
+
+    # Auto-coerce four common LLM mistakes BEFORE validation so the
+    # error feedback is about real issues, not noise the wizard can fix
+    # itself:
+    #
+    #   1. params[i].source defaults to "agent" (the parser sets this on
+    #      the dataclass but the LLM often drops it when reconstructing
+    #      the spec by hand).
+    #   2. params[i].type="number" / "float" → "string" (the mirror's
+    #      ParamType allowlist excludes them; the REST adapter passes
+    #      strings through to the HTTP query verbatim, so the user can
+    #      type "12.97" without issue).
+    #   3. auth defaults to {type: "none"} on REST tools when the LLM
+    #      omits it (e.g. Open-Meteo, webhook.site test APIs have no
+    #      auth). The legacy deploy schema requires auth (not Optional),
+    #      so the dev-kit's host validation would let the spec through
+    #      but /deploy/validate would reject it later.  Inject the
+    #      no-auth block here so both layers agree.
+    #   4. response.max_size_chars defaults are filled in by the mirror;
+    #      no auto-coerce needed here.
+    if spec.get("type") != "mcp":
+        for endpoint in spec.get("endpoints", []) or []:
+            for param in endpoint.get("params", []) or []:
+                if "source" not in param:
+                    param["source"] = "agent"
+                if param.get("type") in ("number", "float"):
+                    param["type"] = "string"
+        if spec.get("auth") is None:
+            spec["auth"] = {"type": "none"}
+
+    # Candidate-copy commit. add_tool touches two blocks (action_gateway
+    # for the tool spec, agent_core for the matching connector) so we
+    # build both on deep copies, validate each, and only swap them into
+    # the live accumulator once both pass. No half-applied state can
+    # reach the per-turn YAML render.
+    candidate_ag = copy.deepcopy(accumulator.get("action_gateway", {}))
+    candidate_ag_tools: list[dict] = candidate_ag.setdefault("tools", [])
+    if any(t.get("id") == tool_id for t in candidate_ag_tools):
+        return {"ok": False, "error": f"tool id {tool_id!r} already exists"}
+
+    # Also dedupe by (method, base_url + path) — the LLM has been known
+    # to register the same OpenAPI operation TWICE under different IDs
+    # (e.g. `get_v1_forecast` from parse_openapi_spec, then
+    # `weather_forecast` as a custom user-facing name on a later turn).
+    # Result: 6 connector entries for 3 actual APIs, all routed to the
+    # same underlying URL. Subagent tool references become ambiguous.
+    if spec.get("type") != "mcp":
+        existing_operations: dict[tuple[str, str], str] = {}
+        for existing in candidate_ag_tools:
+            existing_base = existing.get("base_url", "")
+            for ep in existing.get("endpoints", []) or []:
+                key = (
+                    str(ep.get("method", "")).upper(),
+                    existing_base + str(ep.get("path", "")),
+                )
+                existing_operations[key] = existing.get("id", "?")
+        for ep in spec.get("endpoints", []) or []:
+            key = (
+                str(ep.get("method", "")).upper(),
+                spec.get("base_url", "") + str(ep.get("path", "")),
+            )
+            if key in existing_operations:
+                return {
+                    "ok": False,
+                    "error": (
+                        f"This API operation ({key[0]} {key[1]}) is already "
+                        f"registered as tool {existing_operations[key]!r}. "
+                        f"If you want to change its name or projection, use "
+                        f"update_subagent / a different tool — do NOT call "
+                        f"add_tool a second time for the same operation."
+                    ),
+                }
+
+    candidate_ag_tools.append(copy.deepcopy(spec))
+
+    # Strict validation (omit_missing=False) — a tool spec must be
+    # complete before it reaches the accumulator. Earlier add_tool used
+    # partial validation, which silently dropped "required field missing"
+    # errors and committed broken specs that only failed at deploy-time.
+    # The Akashvani Concierge E2E shipped 3 tools missing description,
+    # base_url, auth, and endpoint name; deploy-validate then raised 27
+    # cascading errors.
+    errors = validate_domain_section(
+        "action_gateway", "tools", candidate_ag_tools, omit_missing=False
+    )
+    if errors:
+        logger.warning(
+            "add_tool.ag_validation_failed",
+            extra={
+                "operation": "tools.add_tool",
+                "status": "failure",
+                "error": errors,
+                "tool_id": tool_id,
+            },
+        )
+        return {"ok": False, "error": f"action_gateway validation failed: {errors}"}
+
+    # --- Agent Core connector side ---
+    # MCP tools — schemas come from the server at runtime; no static connector.
+    candidate_ac = None
+    if spec.get("type") != "mcp":
+        category = spec.get("category", "read")
+        properties: dict[str, Any] = {}
+        required_list: list[str] = []
+        for endpoint in spec.get("endpoints", []):
+            for param in endpoint.get("params", []):
+                if param.get("source") != "agent":
+                    continue
+                prop: dict[str, Any] = {"type": param.get("type", "string")}
+                if param.get("description"):
+                    prop["description"] = param["description"]
+                if param.get("default") is not None:
+                    prop["default"] = param["default"]
+                properties[param["name"]] = prop
+                if param.get("required"):
+                    required_list.append(param["name"])
+        input_schema: dict[str, Any] = {"type": "object", "properties": properties}
+        if required_list:
+            input_schema["required"] = required_list
+
+        connector = {
+            "name": tool_id,
+            "description": spec.get("description", ""),
+            "input_schema": input_schema,
+        }
+        candidate_ac = copy.deepcopy(accumulator.get("agent_core", {}))
+        connectors_block = candidate_ac.setdefault("connectors", {})
+        connector_list: list[dict] = connectors_block.setdefault(category, [])
+
+        replaced = False
+        for i, c in enumerate(connector_list):
+            if c.get("name") == tool_id:
+                connector_list[i] = connector
+                replaced = True
+                break
+        if not replaced:
+            connector_list.append(connector)
+
+        errors = validate_partial("agent_core", candidate_ac)
+        if errors:
+            error_msg = "; ".join(errors)
+            logger.warning(
+                "add_tool.ac_validation_failed",
+                extra={
+                    "operation": "tools.add_tool",
+                    "status": "failure",
+                    "error": error_msg,
+                    "tool_id": tool_id,
+                },
+            )
+            return {"ok": False, "error": f"agent_core validation failed: {error_msg}"}
+
+    # Both candidates passed — commit them atomically to the live accumulator.
+    accumulator["action_gateway"] = candidate_ag
+    if candidate_ac is not None:
+        accumulator["agent_core"] = candidate_ac
+
+    # Mark the chat fields this tool just populated. Without these flips
+    # the tools phase stays incomplete — `add_tool` writes the connector
+    # list directly (via the candidate-copy commit above) but never
+    # transitions the matching `field_status` entries out of `pending`,
+    # so `_is_phase_complete("tools")` keeps reporting "stay" even
+    # after every requested tool has been registered.
+    field_status["action_gateway.tools"] = "answered"
+    if spec.get("type") != "mcp":
+        category = spec.get("category", "read")
+        # Only flip the category that was actually written. The mirror
+        # schema allows `connectors.read/write/identity` to stay absent,
+        # so we don't promise that the OTHER categories are answered.
+        field_status[f"agent_core.connectors.{category}"] = "answered"
+
+    logger.info(
+        "add_tool.success",
+        extra={
+            "operation": "tools.add_tool",
+            "status": "success",
+            "tool_id": tool_id,
+            "tool_type": spec.get("type", "unknown"),
+        },
+    )
+    return {"ok": True, "id": tool_id}
+
+
+def parse_openapi_spec(
+    args: dict[str, Any],
+    intake_state: IntakeState,  # unused — kept for signature uniformity
+    accumulator: dict[str, dict],  # unused — kept for signature uniformity
+    field_status: dict[str, str],  # unused — kept for signature uniformity
+) -> dict[str, Any]:
+    """Parse an uploaded OpenAPI JSON/YAML spec and return discovered operations.
+
+    Does not mutate state. Returns a list of operation summaries so the caller
+    can decide which endpoints to add via ``add_tool``.
+
+    Args:
+        args: Must contain ``spec`` (dict or str). If a string is provided it
+            is parsed as JSON first, then YAML.
+        intake_state: Not used; accepted for signature uniformity.
+        accumulator: Not used; accepted for signature uniformity.
+        field_status: Not used; accepted for signature uniformity.
+
+    Returns:
+        ``{"ok": True, "operations": [...]}`` where each entry has
+        underscore-prefixed discovery keys: ``_discovery_id``, ``_path``,
+        ``_method``, ``_summary``, ``_params``, ``_response_fields``.
+        The prefix is intentional — it visually distinguishes the
+        discovery shape from the ``add_tool`` spec shape the LLM must
+        construct on its next turn.
+        ``{"ok": False, "error": "..."}`` on parse failure.
+    """
+    import json as _json  # noqa: PLC0415
+
+    from dev_kit.agent.openapi_parser import parse_openapi_spec as _parse  # noqa: PLC0415
+
+    raw = args.get("spec")
+    if raw is None:
+        return {"ok": False, "error": "args.spec is required"}
+
+    if isinstance(raw, str):
+        try:
+            spec = _json.loads(raw)
+        except _json.JSONDecodeError:
+            try:
+                import yaml as _yaml  # noqa: PLC0415
+                spec = _yaml.safe_load(raw)
+            except Exception as exc:
+                return {"ok": False, "error": f"could not parse spec: {exc}"}
+    elif isinstance(raw, dict):
+        spec = raw
+    else:
+        return {
+            "ok": False,
+            "error": f"args.spec must be a dict or string, got {type(raw).__name__!r}",
+        }
+
+    if not isinstance(spec, dict):
+        return {"ok": False, "error": "spec must be a JSON/YAML object"}
+
+    try:
+        tools = _parse(spec)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+
+    # Surface the params + a best-effort response-field projection list so
+    # the LLM can render the confirmation table the tools-phase prompt
+    # mandates (operation | method+path | params | response fields). The
+    # LLM can also see the raw spec text in its context, but giving it a
+    # pre-extracted list avoids the model having to re-walk YAML and
+    # invent JSONPaths from scratch.
+    #
+    # ALL DISCOVERY KEYS ARE PREFIXED WITH ``_`` to make them visually
+    # distinct from the ``add_tool`` spec shape the LLM must construct on
+    # the next turn. Earlier the discovery payload used identical key
+    # names (``id``, ``path``, ``method``, ``summary``, ``params``,
+    # ``response_fields``) which the LLM copied verbatim into
+    # ``add_tool(spec.endpoints[i])`` — every one of those keys fails the
+    # mirror's strict ``EndpointDefinition`` schema with
+    # ``extra_forbidden``, and the wizard ate four LLM rounds of retries
+    # per tool. The prefix forces the model to consciously rename when
+    # building the add_tool spec.
+    operations: list[dict[str, Any]] = []
+    paths_spec = spec.get("paths", {})
+    for t in tools:
+        op_spec = paths_spec.get(t.path, {}).get(t.method.lower(), {})
+        response_fields = _extract_response_fields(op_spec)
+        operations.append({
+            "_discovery_id": t.suggested_id,
+            "_path": t.path,
+            "_method": t.method,
+            "_summary": t.description,
+            "_params": [
+                {
+                    "name": p.name,
+                    "type": p.type,
+                    "required": p.required,
+                    "description": p.description,
+                }
+                for p in t.params
+            ],
+            "_response_fields": response_fields,
+        })
+
+    logger.info(
+        "parse_openapi_spec.success",
+        extra={
+            "operation": "tools.parse_openapi_spec",
+            "status": "success",
+            "operation_count": len(operations),
+        },
+    )
+    return {
+        "ok": True,
+        "operations": operations,
+        # Belt-and-braces nudge for the LLM in case the prompt rule
+        # gets ignored. The tools-phase prompt mandates a
+        # parse → confirm → add_tool pacing; this echo in the tool
+        # result reinforces it from the LLM's other context channel.
+        "next_step": (
+            "Do NOT call add_tool yet. Render the operations + their "
+            "response_fields in a table for the user, then ask them to "
+            "confirm or edit the projection list. Only call add_tool "
+            "on the NEXT turn, after the user has confirmed."
+        ),
+    }
+
+
+def _extract_response_fields(op_spec: dict[str, Any]) -> list[str]:
+    """Return dotted JSONPaths for every leaf field in the 200 JSON response.
+
+    Walks ``op_spec["responses"]["200"]["content"]["application/json"]["schema"]``
+    and emits one path per primitive leaf (string/number/integer/boolean).
+    Arrays contribute their item schema's paths prefixed with ``[].`` so
+    the operator can see, e.g., ``results[].latitude``. Objects nest with
+    ``.``. Returns an empty list if the operation has no JSON 200
+    response or the schema is too opaque to walk (``$ref``-only, no
+    ``properties``, etc.).
+
+    Used by ``parse_openapi_spec`` to populate each operation's
+    ``response_fields`` projection list so the tools-phase prompt can
+    show the user which API response fields will flow into the LLM
+    context. The user can then edit the projection (drop some, add
+    others) before ``add_tool`` is called with the final
+    ``response_filter`` list.
+
+    Args:
+        op_spec: A single operation dict from
+            ``spec["paths"][<path>][<method>]``.
+
+    Returns:
+        A list of dotted JSONPath strings, deduplicated and order-preserving.
+        Empty list if the response schema cannot be walked.
+    """
+    if not isinstance(op_spec, dict):
+        return []
+    responses = op_spec.get("responses") or {}
+    if not isinstance(responses, dict):
+        return []
+    # Try 200, then any 2xx, then default.
+    success = responses.get("200") or responses.get("default")
+    if not success:
+        for code, body in responses.items():
+            if isinstance(code, str) and code.startswith("2"):
+                success = body
+                break
+    if not isinstance(success, dict):
+        return []
+    content = success.get("content") or {}
+    schema = (content.get("application/json") or {}).get("schema") or {}
+    if not isinstance(schema, dict):
+        return []
+
+    paths: list[str] = []
+    seen: set[str] = set()
+
+    def _walk(node: Any, prefix: str) -> None:
+        if not isinstance(node, dict):
+            return
+        # Inline $ref — we don't resolve refs; treat as opaque leaf.
+        if "$ref" in node:
+            if prefix and prefix not in seen:
+                seen.add(prefix)
+                paths.append(prefix)
+            return
+        node_type = node.get("type")
+        if node_type == "object" or "properties" in node:
+            props = node.get("properties") or {}
+            for key, sub in props.items():
+                _walk(sub, f"{prefix}.{key}" if prefix else key)
+        elif node_type == "array":
+            items = node.get("items") or {}
+            _walk(items, f"{prefix}[]" if prefix else "[]")
+        else:
+            # Primitive leaf — emit the path.
+            if prefix and prefix not in seen:
+                seen.add(prefix)
+                paths.append(prefix)
+
+    _walk(schema, "")
+    return paths
+
+
+def fetch_openapi_spec_from_url(
+    args: dict[str, Any],
+    intake_state: IntakeState,  # unused — kept for signature uniformity
+    accumulator: dict[str, dict],  # unused — kept for signature uniformity
+    field_status: dict[str, str],  # unused — kept for signature uniformity
+) -> dict[str, Any]:
+    """Download an OpenAPI 3.x spec from a URL and parse it into tool candidates.
+
+    Wraps the same parser used by ``parse_openapi_spec`` so the caller gets a
+    consistent ``operations`` shape regardless of whether the spec arrived as a
+    pasted string or via HTTP. Accepts JSON or YAML payloads.
+
+    Mirrors the implementation that shipped on ``main`` before the state-layer
+    migration trimmed it out. The wizard's tools phase needs this entry point
+    so users with a real-world OpenAPI doc don't have to paste a multi-thousand-
+    line spec into chat.
+
+    Args:
+        args: Must contain ``url`` (str). The URL may serve JSON or YAML; the
+            response is auto-detected by trying JSON first.
+        intake_state: Not used; accepted for signature uniformity.
+        accumulator: Not used; accepted for signature uniformity.
+        field_status: Not used; accepted for signature uniformity.
+
+    Returns:
+        ``{"ok": True, "operations": [...]}`` with each entry's discovery
+        keys prefixed (``_discovery_id``, ``_path``, ``_method``,
+        ``_summary``) so the LLM can't blindly copy them into the
+        ``add_tool`` spec shape (see parse_openapi_spec docstring).
+        ``{"ok": False, "error": "..."}`` on missing arg, network failure,
+        or parse failure.
+    """
+    import json as _json  # noqa: PLC0415
+    import time as _time  # noqa: PLC0415
+
+    import httpx  # noqa: PLC0415
+
+    from dev_kit.agent.openapi_parser import parse_openapi_spec as _parse  # noqa: PLC0415
+
+    url = args.get("url")
+    if not url or not isinstance(url, str) or not url.strip():
+        return {"ok": False, "error": "args.url is required and must be a non-empty string"}
+    url = url.strip()
+
+    start = _time.time()
+    try:
+        transport = httpx.HTTPTransport(retries=1)
+        with httpx.Client(
+            transport=transport,
+            timeout=15.0,
+            follow_redirects=True,
+        ) as client:
+            response = client.get(url)
+            response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        logger.warning(
+            "fetch_openapi_spec_from_url.http_error",
+            extra={
+                "operation": "tools.fetch_openapi_spec_from_url",
+                "status": "failure",
+                "url": url,
+                "http_status": exc.response.status_code,
+                "latency_ms": int((_time.time() - start) * 1000),
+            },
+        )
+        return {"ok": False, "error": f"HTTP {exc.response.status_code} fetching {url}"}
+    except httpx.HTTPError as exc:
+        logger.warning(
+            "fetch_openapi_spec_from_url.network_error",
+            extra={
+                "operation": "tools.fetch_openapi_spec_from_url",
+                "status": "failure",
+                "url": url,
+                "error": str(exc),
+                "latency_ms": int((_time.time() - start) * 1000),
+            },
+        )
+        return {"ok": False, "error": f"could not fetch spec from {url} — {exc}"}
+
+    content = response.text
+    try:
+        spec = _json.loads(content)
+    except _json.JSONDecodeError:
+        try:
+            import yaml as _yaml  # noqa: PLC0415
+            spec = _yaml.safe_load(content)
+        except Exception as exc:  # yaml emits a soup of exceptions; catch them all here
+            logger.warning(
+                "fetch_openapi_spec_from_url.parse_failed",
+                extra={
+                    "operation": "tools.fetch_openapi_spec_from_url",
+                    "status": "failure",
+                    "url": url,
+                    "error": str(exc),
+                },
+            )
+            return {"ok": False, "error": f"could not parse fetched content as JSON or YAML — {exc}"}
+
+    if not isinstance(spec, dict):
+        return {"ok": False, "error": "fetched content is not a JSON/YAML object"}
+
+    try:
+        tools = _parse(spec)
+    except ValueError as exc:
+        logger.warning(
+            "fetch_openapi_spec_from_url.openapi_invalid",
+            extra={
+                "operation": "tools.fetch_openapi_spec_from_url",
+                "status": "failure",
+                "url": url,
+                "error": str(exc),
+            },
+        )
+        return {"ok": False, "error": str(exc)}
+
+    operations = [
+        # Discovery keys are prefixed with `_` for the same reason as
+        # `parse_openapi_spec` above (see its long comment): the LLM
+        # previously copied these keys verbatim into add_tool's spec
+        # shape, triggering ``extra_forbidden`` mirror rejections on
+        # every tool registration.
+        {
+            "_discovery_id": t.suggested_id,
+            "_path": t.path,
+            "_method": t.method,
+            "_summary": t.description,
+        }
+        for t in tools
+    ]
+    logger.info(
+        "fetch_openapi_spec_from_url.success",
+        extra={
+            "operation": "tools.fetch_openapi_spec_from_url",
+            "status": "success",
+            "url": url,
+            "operation_count": len(operations),
+            "latency_ms": int((_time.time() - start) * 1000),
+        },
+    )
+    return {"ok": True, "operations": operations, "source_url": url}
 
 
 def _parse_sse_json(text: str) -> dict | None:
     """Extract the first JSON-RPC payload from an SSE response body.
 
-    SSE lines have the form ``data: <json>``.  This function scans the
+    SSE lines have the form ``data: <json>``. This function scans the
     response text for the first such line and returns the parsed dict, or
-    ``None`` if no ``data:`` line is found or the payload is not valid JSON.
+    ``None`` if no valid ``data:`` line is found.
 
     Args:
         text: Raw response body string.
@@ -561,967 +1277,165 @@ def _parse_sse_json(text: str) -> dict | None:
     Returns:
         Parsed dict from the first ``data:`` line, or None.
     """
-    import json
+    import json as _json  # noqa: PLC0415
 
     for line in text.splitlines():
         stripped = line.strip()
         if stripped.startswith("data:"):
             payload = stripped[len("data:"):].strip()
             try:
-                return json.loads(payload)
-            except json.JSONDecodeError:
+                return _json.loads(payload)
+            except _json.JSONDecodeError:
                 continue
     return None
 
 
-# ---------------------------------------------------------------------------
-# Handler dispatch
-# ---------------------------------------------------------------------------
+def discover_mcp_tools(
+    args: dict[str, Any],
+    intake_state: IntakeState,  # unused — kept for signature uniformity
+    accumulator: dict[str, dict],  # unused — kept for signature uniformity
+    field_status: dict[str, str],  # unused — kept for signature uniformity
+) -> dict[str, Any]:
+    """List tools available on an MCP server via JSON-RPC ``tools/list``.
 
+    Performs the standard MCP discovery handshake:
 
-class ToolHandler:
-    """Dispatches Claude tool calls to their handler methods.
+    1. POST a JSON-RPC ``tools/list`` payload to ``server_url``.
+    2. Accept both plain JSON and SSE (``data: <json>``) responses — auto-
+       detects by trying JSON first and falling back to line-by-line SSE
+       parsing.
+    3. Extract ``result.tools`` and surface each tool's
+       ``name``/``description``/``inputSchema``.
 
-    Handlers modify the ConfigAccumulator and/or the shared mutable state dict.
+    Mirrors the implementation that shipped on ``main`` before the
+    state-layer migration trimmed it out. The wizard's tools phase uses
+    this output to suggest which MCP server to register via ``add_tool``.
 
     Args:
-        accumulator: The project's config accumulator.
-        state: Mutable dict with keys 'phase' (str) and 'phase_changed' (str | None).
-               Handlers set state['phase_changed'] to the new phase name when set_phase
-               is called, so the ConversationEngine can trigger a checkpoint.
+        args: Must contain ``server_url`` (str). May contain
+            ``timeout_ms`` (int, default 10000).
+        intake_state: Not used; accepted for signature uniformity.
+        accumulator: Not used; accepted for signature uniformity.
+        field_status: Not used; accepted for signature uniformity.
+
+    Returns:
+        ``{"ok": True, "tools": [...]}`` with each entry shaped as
+        ``{"name", "description", "input_schema"}``. ``tools`` is empty
+        when the server returns no tools.
+        ``{"ok": False, "error": "..."}`` on missing arg, network error,
+        or unparseable response.
     """
+    import httpx  # noqa: PLC0415
 
-    def __init__(
-        self,
-        accumulator: ConfigAccumulator,
-        state: dict,
-        project_path: "Path | None" = None,
-    ) -> None:
-        self._acc = accumulator
-        self._state = state
-        self._project_path = project_path
-
-    def _read_project_meta(self) -> dict:
-        """Read the persisted project meta dict from disk.
-
-        Falls back to ``state['project_meta']`` (an in-memory copy maintained
-        by ConversationEngine) when no project_path is configured, which is
-        the case in unit tests that do not provide disk state.
-
-        Returns:
-            Parsed project meta dict, or an empty dict if nothing is available.
-        """
-        import json
-
-        if self._project_path is not None:
-            meta_file = self._project_path / "_meta" / "project.json"
-            if meta_file.exists():
-                try:
-                    return json.loads(meta_file.read_text())
-                except json.JSONDecodeError:
-                    return {}
-        return dict(self._state.get("project_meta") or {})
-
-    def _update_project_meta(self, updates: dict) -> None:
-        """Merge ``updates`` into the project meta on disk and in state.
-
-        When no ``project_path`` is configured, updates are applied only to
-        ``state['project_meta']`` so tests and in-memory callers still observe
-        the change.
-
-        Args:
-            updates: Partial meta dict to merge into the stored metadata.
-        """
-        import json
-
-        meta = self._read_project_meta()
-        meta.update(updates)
-        # Mirror into in-memory state for consumers that read from there.
-        state_meta = self._state.setdefault("project_meta", {})
-        state_meta.update(updates)
-        if self._project_path is not None:
-            meta_dir = self._project_path / "_meta"
-            meta_dir.mkdir(parents=True, exist_ok=True)
-            (meta_dir / "project.json").write_text(
-                json.dumps(meta, ensure_ascii=False, indent=2)
-            )
-
-    def dispatch(self, tool_name: str, tool_input: dict) -> str:
-        """Route a tool call to the appropriate handler.
-
-        Args:
-            tool_name: Tool name matching one of TOOL_DEFINITIONS.
-            tool_input: Tool input values from the LLM.
-
-        Returns:
-            Result string to send back as tool_result content.
-
-        Raises:
-            ValueError: If tool_name is not recognised.
-        """
-        handlers = {
-            "set_project_meta": self._handle_set_project_meta,
-            "set_agent_type": self._handle_set_agent_type,
-            "skip_optional_phase": self._handle_skip_optional_phase,
-            "update_config": self._handle_update_config,
-            "set_phase": self._handle_set_phase,
-            "create_subagent": self._handle_create_subagent,
-            "update_subagent": self._handle_update_subagent,
-            "add_routing_rule": self._handle_add_routing_rule,
-            "update_routing_rule": self._handle_update_routing_rule,
-            "remove_subagent": self._handle_remove_subagent,
-            "finalize_config": self._handle_finalize_config,
-            "rollback_to_checkpoint": self._handle_rollback_to_checkpoint,
-            "parse_openapi_spec": self._handle_parse_openapi_spec,
-            "fetch_openapi_spec_from_url": self._handle_fetch_openapi_spec_from_url,
-            "add_rest_api_tool": self._handle_add_rest_api_tool,
-            "set_response_transformation": self._handle_set_response_transformation,
-            "discover_mcp_tools": self._handle_discover_mcp_tools,
-            "add_mcp_tool": self._handle_add_mcp_tool,
-            "set_reach_channels": self._handle_set_reach_channels,
-            "declare_azure_storage": self._handle_declare_azure_storage,
+    server_url = args.get("server_url")
+    if not server_url:
+        return {"ok": False, "error": "args.server_url is required"}
+    if not isinstance(server_url, str):
+        return {
+            "ok": False,
+            "error": f"args.server_url must be a string, got {type(server_url).__name__!r}",
         }
-        handler = handlers.get(tool_name)
-        if handler is None:
-            raise ValueError(f"Unknown tool: {tool_name!r}")
-        slug = self._state.get("project_meta", {}).get("slug", "")
-        logger.info(
-            "devkit.tool.dispatch",
-            extra={"operation": f"tool.{tool_name}", "status": "start", "slug": slug},
-        )
-        try:
-            result = handler(tool_input)
-            logger.info(
-                "devkit.tool.dispatch",
-                extra={"operation": f"tool.{tool_name}", "status": "success", "slug": slug},
-            )
-            return result
-        except Exception as e:
-            logger.error(
-                "devkit.tool.dispatch_failed",
-                extra={"operation": f"tool.{tool_name}", "status": "failure", "slug": slug, "error": str(e)},
-                exc_info=True,
-            )
-            raise
 
-    def _handle_set_project_meta(self, inputs: dict) -> str:
-        # Slug is the on-disk directory key; renaming it here would orphan the
-        # directory created at project-create time. Strip any slug the LLM
-        # supplies and persist the rest. Other meta fields with their own
-        # dedicated handlers are also stripped to prevent accidental overwrite.
-        protected = {"slug", "current_phase", "phases_completed", "agent_type", "phase_decisions"}
-        clean = {k: v for k, v in inputs.items() if k not in protected}
-        self._update_project_meta(clean)
-        slug = self._read_project_meta().get("slug", "")
-        return f"Project meta updated: {clean.get('name', '')} ({slug})"
+    timeout_ms = args.get("timeout_ms", 10_000)
+    try:
+        timeout_seconds = float(timeout_ms) / 1000.0
+    except (TypeError, ValueError):
+        timeout_seconds = 10.0
 
-    def _handle_set_agent_type(self, inputs: dict) -> str:
-        """Record the project's agent type in ``_meta/project.json``.
+    url = server_url.rstrip("/")
+    payload = {"jsonrpc": "2.0", "method": "tools/list", "id": 1}
 
-        Args:
-            inputs: Dict with ``type`` key — one of the AGENT_TYPES values.
-
-        Returns:
-            Confirmation string, or an ERROR string for an invalid type.
-        """
-        agent_type = inputs.get("type", "")
-        if agent_type not in AGENT_TYPES:
-            return f"ERROR — invalid agent type: {agent_type!r}. Must be one of: {AGENT_TYPES}"
-        self._update_project_meta({"agent_type": agent_type})
-        return f"ok: agent_type set to {agent_type}"
-
-    def _handle_skip_optional_phase(self, inputs: dict) -> str:
-        """Record a user-initiated skip of an optional phase.
-
-        Args:
-            inputs: Dict with ``phase`` key naming the phase to skip.
-
-        Returns:
-            Confirmation string, or an ERROR if the phase is not ``optional``
-            for the current agent type.
-        """
-        from datetime import datetime, timezone
-
-        phase = inputs.get("phase", "")
-        meta = self._read_project_meta()
-        agent_type = meta.get("agent_type", "")
-        status = SHEET_REQUIREMENTS.get(phase, {}).get(agent_type, "required")
-        if status != "optional":
-            return (
-                f"ERROR — phase {phase!r} is {status!r} for {agent_type!r} agents; "
-                "cannot skip."
-            )
-        phase_decisions = dict(meta.get("phase_decisions", {}))
-        phase_decisions[phase] = {
-            "status": "skipped_by_user",
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-        self._update_project_meta({"phase_decisions": phase_decisions})
-        return f"ok: {phase} skipped by user"
-
-    def _handle_update_config(self, inputs: dict) -> str:
-        block = inputs["block"]
-        section = inputs["section"]
-        values = inputs["values"]
-
-        if not isinstance(values, dict):
-            return (
-                f"ERROR — `values` must be an object (dict), got {type(values).__name__!r}. "
-                f"Pass a JSON object with key-value pairs, e.g. {{\"key\": \"value\"}}. "
-                f"Do not pass a string, list, or other scalar."
-            )
-
-        # GH-137 hard-cut: channel configuration has moved to the top-level
-        # `channels` section inside each block. Reject the legacy paths with
-        # explicit migration guidance so the LLM retries with the new path.
-        if block == "agent_core":
-            if section == "agent.channels" or section.startswith("agent.channels."):
-                return (
-                    "ERROR — agent.channels is removed (GH-137). "
-                    "Use section=`channels` at the top level instead "
-                    "(e.g. section=`channels`, values={voice: {...}})."
-                )
-            if section == "reach_layer.channels" or section.startswith("reach_layer.channels."):
-                return (
-                    "ERROR — reach_layer.channels inside agent_core is removed (GH-137). "
-                    "Use section=`channels.<name>.turn_assembler` at the top level for "
-                    "turn_assembler policy overrides."
-                )
-
-        # acc.update is now the single validation gate. It validates the
-        # would-be merged result before mutating state, filters [missing]
-        # errors during partial accumulation, increments a retry counter
-        # on real failures, and hard-rejects further calls to a section
-        # whose retry budget is already spent this turn.
-        result = self._acc.update(block, section, values)
-        # acc.update returns:
-        #   "OK" — validation passed (or strict mode off / unschema'd section)
-        #   "VALIDATION_ERROR (attempt N/M):..." — schema rejected, LLM should retry
-        #   "VALIDATION_FAILED_AFTER_M_ATTEMPTS..." — cap just reached this call
-        #   "VALIDATION_SECTION_STALE..." — section already at cap, hard reject
-        # Relay the schema verdict directly so the LLM can self-correct
-        # (or stop, in the cap/stale cases).
-        if result == "OK":
-            return f"ok: updated {block}.{section}"
-        logger.warning(
-            "devkit.tool.update_config.rejected",
-            extra={
-                "operation": "tool.update_config",
-                "status": "rejected",
-                "block": block,
-                "section": section,
-                "verdict": result.split(":", 1)[0] if ":" in result else result.split("\n", 1)[0],
-                "response_to_llm": result[:500],
-            },
-        )
-        return result
-
-    def _handle_set_phase(self, inputs: dict) -> str:
-        """Advance the conversation to ``inputs['phase']``.
-
-        Consults SHEET_REQUIREMENTS for the requested phase: if the matrix
-        marks the phase as ``skip`` for the current project's agent type,
-        the phase is auto-advanced and a ``not_applicable_for_type`` entry
-        is written to ``phase_decisions``. When leaving an ``optional``
-        phase the current phase is recorded as ``answered`` unless it was
-        previously skipped by the user.
-
-        Args:
-            inputs: Dict with a ``phase`` key naming a member of PHASES.
-
-        Returns:
-            Human-readable advance/skip message, or an ERROR string when
-            the requested phase is unknown or sequencing is invalid.
-        """
-        from datetime import datetime, timezone
-
-        requested = inputs["phase"]
-        current = self._state.get("phase", PHASES[0])
-
-        if requested not in PHASES:
-            return f"ERROR — unknown phase: {requested!r}"
-
-        current_idx = PHASES.index(current) if current in PHASES else 0
-        requested_idx = PHASES.index(requested)
-
-        if requested_idx < current_idx:
-            return (
-                f"ERROR — cannot go back from '{current}' to '{requested}'. "
-                "Use rollback_to_checkpoint if you need to revisit an earlier phase."
-            )
-        if requested_idx > current_idx + 1:
-            next_phase = PHASES[current_idx + 1]
-            return (
-                f"ERROR — cannot skip from '{current}' to '{requested}'. "
-                f"You must complete '{next_phase}' next. "
-                f"Call set_phase('{next_phase}') when you are ready."
-            )
-
-        # Consult SHEET_REQUIREMENTS for the phase we are entering.
-        meta = self._read_project_meta()
-        agent_type = meta.get("agent_type", "")
-        phase_decisions = dict(meta.get("phase_decisions", {}))
-        status = (
-            SHEET_REQUIREMENTS.get(requested, {}).get(agent_type, "optional")
-            if agent_type else "required"
-        )
-
-        # Cross-block consistency check before advancing. Catches mistakes
-        # that span 2+ blocks (e.g. knowledge_engine.intent_filters keys
-        # missing from agent_core's NLU intents) at the moment the LLM tries
-        # to leave the phase that produced them — not at deploy time. The
-        # invariants self-guard against incomplete data, so checks irrelevant
-        # to the current phase silently pass.
-        #
-        # Use the EXPLICIT selection (no ['web'] fallback) so channel-related
-        # invariants only fire after the LLM has actually called
-        # set_reach_channels — earlier phases have nothing to validate yet.
-        blocks_state = {b: self._acc.get_block(b) for b in BLOCKS}
-        selected_channels = self._acc.get_reach_channel_selection()
-        # Pass the phase the LLM is leaving so phase-tied invariants only
-        # fire once the LLM is past the phase that's supposed to populate
-        # the relevant fields. e.g. channel-shape checks require the
-        # language phase to have run; raya completeness requires reach.
-        cross_errors = validate_cross_block(blocks_state, selected_channels, current_phase=current)
-        if cross_errors:
-            error_lines = "\n".join(f"  - {e}" for e in cross_errors)
-            logger.warning(
-                "devkit.tool.set_phase.cross_block_blocked",
-                extra={
-                    "operation": "tool.set_phase",
-                    "status": "phase_advance_blocked",
-                    "current_phase": current,
-                    "requested_phase": requested,
-                    "violation_count": len(cross_errors),
-                },
-            )
-            stale_blocks = sorted(
-                {b for b in BLOCKS if self._acc.get_status(b) == ConfigStatus.STALE}
-            )
-            stale_hint = ""
-            if stale_blocks:
-                stale_hint = (
-                    f"\n\n⚠️ The following block(s) are STALE — they already exhausted "
-                    f"the per-section retry budget this turn: {stale_blocks}. "
-                    f"update_config will return VALIDATION_SECTION_STALE on those "
-                    f"sections, so further tool calls cannot resolve this. STOP "
-                    f"calling tools and reply to the user as text: explain the "
-                    f"violations above and ask them how to proceed (correct a value, "
-                    f"skip the section, or rollback to a checkpoint)."
-                )
-            return (
-                f"PHASE_ADVANCE_BLOCKED — cross-block consistency check failed "
-                f"for the leaving phase '{current}'. Fix these before advancing "
-                f"to '{requested}':\n{error_lines}\n\n"
-                f"Each violation spans two or more blocks (e.g. an intent "
-                f"declared in one block but missing from another). Make the "
-                f"corresponding update_config calls to bring the blocks back "
-                f"in sync, then call set_phase('{requested}') again."
-                f"{stale_hint}"
-            )
-
-        if status == "skip":
-            # Auto-advance past this phase; record the decision for audit.
-            phase_decisions[requested] = {
-                "status": "not_applicable_for_type",
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            }
-            self._update_project_meta({"phase_decisions": phase_decisions})
-            if requested == "tools":
-                self._acc.set_status("action_gateway", ConfigStatus.COMPLETE)
-            self._state["phase_changed"] = requested
-            next_idx = requested_idx + 1
-            if next_idx < len(PHASES):
-                return (
-                    f"Phase '{requested}' skipped ({agent_type} agents). "
-                    f"Advancing directly past it. Call set_phase('{PHASES[next_idx]}') next."
-                )
-            return f"Phase '{requested}' skipped ({agent_type} agents)."
-
-        # Required / optional phases are entered normally. When leaving an
-        # 'optional' phase, record the answered decision unless the user
-        # explicitly skipped it via skip_optional_phase.
-        self._state["phase_changed"] = requested
-        if current in PHASES and agent_type:
-            if SHEET_REQUIREMENTS.get(current, {}).get(agent_type) == "optional":
-                existing = phase_decisions.get(current, {})
-                if existing.get("status") != "skipped_by_user":
-                    phase_decisions[current] = {
-                        "status": "answered",
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                    }
-                    self._update_project_meta({"phase_decisions": phase_decisions})
-        return f"Phase advancing to: {requested}"
-
-    def _handle_create_subagent(self, inputs: dict) -> str:
-        existing = [
-            sa for sa in self._acc.get_block("agent_core")
-            .get("agent_workflow", {})
-            .get("subagents", [])
-            if sa.get("id") == inputs["id"]
-        ]
-        if existing:
-            return f"Subagent '{inputs['id']}' already exists — use update_subagent to modify it."
-        sa = {
-            "id": inputs["id"],
-            "name": inputs["name"],
-            "description": inputs["description"],
-            "is_start": inputs.get("is_start", False),
-            "is_terminal": inputs.get("is_terminal", False),
-            "special_handler": None,
-            "valid_intents": inputs.get("valid_intents", []),
-            "tools": inputs.get("tools", []),
-            "system_prompt": inputs["system_prompt"],
-            "opening_phrase": inputs.get("opening_phrase", ""),
-            "routing": [],
-        }
-        self._acc.set_subagent(sa)
-        if sa["is_terminal"]:
-            return f"Subagent '{inputs['id']}' created (terminal — no routing required)."
-        return (
-            f"Subagent '{inputs['id']}' created. "
-            f"REMINDER: non-terminal subagents must have at least one routing rule. "
-            f"Call `add_routing_rule` for every intent in valid_intents that should "
-            f"transition to another subagent, plus a catch-all "
-            f"`add_routing_rule(from_subagent_id='{inputs['id']}', intent='*', "
-            f"next_subagent_id='<target>')` so unmatched intents have a destination. "
-            f"If you do nothing, the renderer will insert a self-loop catch-all to "
-            f"prevent a startup crash, but this is a safety net — design the routing "
-            f"explicitly."
-        )
-
-    def _handle_update_subagent(self, inputs: dict) -> str:
-        try:
-            self._acc.update_subagent(inputs["id"], inputs["fields"])
-            return f"Subagent '{inputs['id']}' updated."
-        except ValueError as exc:
-            return str(exc)
-
-    def _handle_add_routing_rule(self, inputs: dict) -> str:
-        try:
-            self._acc.add_routing_rule(
-                inputs["from_subagent_id"],
-                inputs["intent"],
-                inputs["next_subagent_id"],
-                inputs.get("conditions", []),
-                inputs.get("session_writes", {}),
-            )
-            return (
-                f"Routing rule added: {inputs['from_subagent_id']}"
-                f" --[{inputs['intent']}]--> {inputs['next_subagent_id']}"
-            )
-        except ValueError as exc:
-            return str(exc)
-
-    def _handle_update_routing_rule(self, inputs: dict) -> str:
-        try:
-            self._acc.update_routing_rule(inputs["from_subagent_id"], inputs["intent"], inputs["fields"])
-            return f"Routing rule updated: {inputs['from_subagent_id']} --[{inputs['intent']}]-->"
-        except ValueError as exc:
-            return str(exc)
-
-    def _handle_remove_subagent(self, inputs: dict) -> str:
-        removed = self._acc.remove_subagent(inputs["id"])
-        if not removed:
-            return f"error: subagent '{inputs['id']}' not found — nothing removed."
-        return f"Subagent '{inputs['id']}' removed."
-
-    def _handle_finalize_config(self, inputs: dict) -> str:
-        self._acc.set_status(inputs["block"], ConfigStatus.COMPLETE)
-        return f"Config '{inputs['block']}' marked complete."
-
-    def _handle_rollback_to_checkpoint(self, inputs: dict) -> str:
-        self._state["rollback_to"] = inputs["phase"]
-        return f"Rollback to checkpoint '{inputs['phase']}' requested."
-
-    def _handle_parse_openapi_spec(self, inputs: dict) -> str:
-        """Parse an OpenAPI spec string and return candidate tool definitions as JSON.
-
-        Args:
-            inputs: Dict with 'spec_json' key containing a JSON or YAML string.
-
-        Returns:
-            JSON array of candidate tool dicts, or an ERROR string on failure.
-        """
-        import json
-        import yaml as _yaml
-        from dev_kit.agent.openapi_parser import parse_openapi_spec
-
-        spec_json = inputs.get("spec_json", "")
-        try:
-            try:
-                spec = json.loads(spec_json)
-            except json.JSONDecodeError:
-                spec = _yaml.safe_load(spec_json)
-            if not isinstance(spec, dict):
-                return "ERROR: spec must be a JSON or YAML object"
-        except Exception as exc:
-            return f"ERROR: could not parse spec — {exc}"
-
-        try:
-            tools = parse_openapi_spec(spec)
-        except ValueError as exc:
-            return f"ERROR: {exc}"
-
-        candidates = [
-            {
-                "suggested_id": t.suggested_id,
-                "path": t.path,
-                "method": t.method,
-                "description": t.description,
-                "base_url": t.base_url,
-                "param_names": [p.name for p in t.params],
-                "auth_type": t.auth_type,
-                "auth_header": t.auth_header,
-            }
-            for t in tools
-        ]
-        logger.info(
-            "devkit.tool.openapi_parsed",
-            extra={
-                "operation": "tool.parse_openapi_spec",
-                "status": "success",
-                "endpoint_count": len(candidates),
-            },
-        )
-        return json.dumps(candidates, ensure_ascii=False, indent=2)
-
-    def _handle_fetch_openapi_spec_from_url(self, inputs: dict) -> str:
-        """Fetch an OpenAPI spec from a URL and return candidate tool definitions as JSON.
-
-        Downloads the spec via httpx (JSON or YAML), validates it is an OpenAPI 3.x
-        document, parses it, and returns the same candidate array as
-        _handle_parse_openapi_spec.
-
-        Args:
-            inputs: Dict with 'url' key containing the spec URL.
-
-        Returns:
-            JSON array of candidate tool dicts, or an ERROR string on failure.
-        """
-        import json
-        import yaml as _yaml
-        import httpx
-        import time
-
-        from dev_kit.agent.openapi_parser import parse_openapi_spec
-
-        url = inputs.get("url", "").strip()
-        if not url:
-            logger.warning(
-                "fetch_openapi_spec_from_url.failure",
-                extra={
-                    "operation": "tools.fetch_openapi_spec_from_url",
-                    "status": "failure",
-                    "url": url,
-                    "error": "url is required",
-                    "latency_ms": 0,
-                },
-            )
-            return "ERROR: url is required"
-
-        start = time.time()
-        try:
-            transport = httpx.HTTPTransport(retries=1)
-            with httpx.Client(transport=transport, timeout=15.0, follow_redirects=True) as client:
-                response = client.get(url)
-                response.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            logger.warning(
-                "fetch_openapi_spec_from_url.failure",
-                extra={
-                    "operation": "tools.fetch_openapi_spec_from_url",
-                    "status": "failure",
-                    "url": url,
-                    "error": f"HTTP {exc.response.status_code}",
-                    "latency_ms": int((time.time() - start) * 1000),
-                },
-                exc_info=True,
-            )
-            return f"ERROR: HTTP {exc.response.status_code} fetching {url}"
-        except httpx.HTTPError as exc:
-            logger.warning(
-                "fetch_openapi_spec_from_url.failure",
-                extra={
-                    "operation": "tools.fetch_openapi_spec_from_url",
-                    "status": "failure",
-                    "url": url,
-                    "error": str(exc),
-                    "latency_ms": int((time.time() - start) * 1000),
-                },
-                exc_info=True,
-            )
-            return f"ERROR: could not fetch spec from {url} — {exc}"
-
-        content = response.text
-        try:
-            try:
-                spec = json.loads(content)
-            except json.JSONDecodeError:
-                spec = _yaml.safe_load(content)
-            if not isinstance(spec, dict):
-                logger.warning(
-                    "fetch_openapi_spec_from_url.failure",
-                    extra={
-                        "operation": "tools.fetch_openapi_spec_from_url",
-                        "status": "failure",
-                        "url": url,
-                        "error": "fetched content is not a JSON/YAML object",
-                        "latency_ms": int((time.time() - start) * 1000),
-                    },
-                )
-                return "ERROR: fetched content is not a JSON/YAML object"
-        except Exception as exc:
-            logger.warning(
-                "fetch_openapi_spec_from_url.failure",
-                extra={
-                    "operation": "tools.fetch_openapi_spec_from_url",
-                    "status": "failure",
-                    "url": url,
-                    "error": f"could not parse fetched content — {exc}",
-                    "latency_ms": int((time.time() - start) * 1000),
-                },
-                exc_info=True,
-            )
-            return f"ERROR: could not parse fetched content — {exc}"
-
-        try:
-            tools = parse_openapi_spec(spec)
-        except ValueError as exc:
-            logger.warning(
-                "fetch_openapi_spec_from_url.failure",
-                extra={
-                    "operation": "tools.fetch_openapi_spec_from_url",
-                    "status": "failure",
-                    "url": url,
-                    "error": str(exc),
-                    "latency_ms": int((time.time() - start) * 1000),
-                },
-                exc_info=True,
-            )
-            return f"ERROR: {exc}"
-
-        candidates = [
-            {
-                "suggested_id": t.suggested_id,
-                "path": t.path,
-                "method": t.method,
-                "description": t.description,
-                "base_url": t.base_url,
-                "param_names": [p.name for p in t.params],
-                "auth_type": t.auth_type,
-                "auth_header": t.auth_header,
-            }
-            for t in tools
-        ]
-        logger.info(
-            "fetch_openapi_spec_from_url",
-            extra={
-                "operation": "tools.fetch_openapi_spec_from_url",
-                "status": "success",
-                "url": url,
-                "endpoint_count": len(candidates),
-                "latency_ms": int((time.time() - start) * 1000),
-            },
-        )
-        return json.dumps(candidates, ensure_ascii=False, indent=2)
-
-    def _handle_add_rest_api_tool(self, inputs: dict) -> str:
-        """Add a REST API tool to action_gateway and auto-sync agent_core connector.
-
-        Args:
-            inputs: Dict containing id, category, description, base_url, auth_type,
-                    and endpoints. Optional: auth_header, auth_secret_env, timeout_ms.
-
-        Returns:
-            Confirmation string, or an ERROR string if the tool id is duplicate.
-        """
-        auth: dict = {"type": inputs["auth_type"]}
-        if inputs.get("auth_header"):
-            auth["header"] = inputs["auth_header"]
-        if inputs.get("auth_secret_env"):
-            auth["secret_env"] = inputs["auth_secret_env"]
-
-        tool = {
-            "id": inputs["id"],
-            "type": "rest_api",
-            "category": inputs["category"],
-            "description": inputs["description"],
-            "base_url": inputs["base_url"],
-            "auth": auth,
-            "timeout_ms": inputs.get("timeout_ms", 5000),
-            "endpoints": inputs.get("endpoints", []),
-            "response": {"max_size_chars": 4000},
-        }
-        try:
-            self._acc.add_action_gateway_tool(tool)
-        except ValueError as exc:
-            return f"ERROR: {exc}"
-
-        self._sync_connector_from_tool(tool)
-        return f"Tool '{inputs['id']}' added to Action Gateway config."
-
-    def _handle_set_response_transformation(self, inputs: dict) -> str:
-        """Write response projection for a REST API tool into the accumulator.
-
-        Args:
-            inputs: Dict with 'tool_id' (str), 'fields' (list of dicts with
-                    'source' and 'target'), and optional 'list_key' (str).
-
-        Returns:
-            Confirmation string with the number and names of projected fields,
-            or an ERROR string if the tool does not exist.
-        """
-        import time
-
-        tool_id = inputs.get("tool_id", "")
-        fields = inputs.get("fields", [])
-        list_key = inputs.get("list_key", "") or ""
-
-        start = time.time()
-        try:
-            self._acc.update_tool_response_mapping(tool_id, fields, list_key=list_key)
-        except ValueError as exc:
-            logger.warning(
-                "set_response_transformation.failure",
-                extra={
-                    "operation": "tools.set_response_transformation",
-                    "status": "failure",
-                    "tool_id": tool_id,
-                    "error": str(exc),
-                    "latency_ms": int((time.time() - start) * 1000),
-                },
-                exc_info=True,
-            )
-            return f"ERROR: {exc}"
-
-        logger.info(
-            "set_response_transformation",
-            extra={
-                "operation": "tools.set_response_transformation",
-                "status": "success",
-                "tool_id": tool_id,
-                "field_count": len(fields),
-                "latency_ms": int((time.time() - start) * 1000),
-            },
-        )
-        field_names = ", ".join(f.get("target", "?") for f in fields[:5])
-        if len(fields) > 5:
-            field_names += "…"
-        return (
-            f"Response mapping set for tool '{tool_id}': "
-            f"{len(fields)} field(s)"
-            + (f" — {field_names}" if field_names else "")
-        )
-
-    def _handle_discover_mcp_tools(self, inputs: dict) -> str:
-        """Fetch tools/list from an MCP server and return the tool list as JSON.
-
-        Supports both plain JSON-RPC responses and SSE (Server-Sent Events)
-        transport. The response format is detected automatically: plain JSON is
-        tried first; if that fails, each line is scanned for a ``data:`` prefix
-        and the JSON payload is extracted from the first matching line.
-
-        Args:
-            inputs: Dict with 'mcp_server_url' key.
-
-        Returns:
-            JSON array of tool summaries, or an ERROR string on connection failure.
-        """
-        import json
-        import httpx
-
-        url = inputs["mcp_server_url"].rstrip("/")
-        payload = {"jsonrpc": "2.0", "method": "tools/list", "id": 1}
-        try:
-            response = httpx.post(
+    try:
+        # Route through a client with a 1-retry transport so a single
+        # transient 503 / connection-reset on the MCP server doesn't
+        # bounce the LLM into a regeneration cycle. Mirrors the retry
+        # behaviour of sibling ``fetch_openapi_spec_from_url`` and
+        # satisfies .claude/rules/error-handling.md.
+        transport = httpx.HTTPTransport(retries=1)
+        with httpx.Client(transport=transport, timeout=timeout_seconds) as client:
+            response = client.post(
                 url,
                 json=payload,
                 headers={
                     "Content-Type": "application/json",
                     "Accept": "application/json, text/event-stream",
                 },
-                timeout=10.0,
             )
-            response.raise_for_status()
-        except httpx.HTTPError as exc:
-            return f"ERROR: could not reach MCP server at {url} — {exc}"
-        except Exception as exc:
-            return f"ERROR: unexpected error contacting MCP server — {exc}"
-
-        # Auto-detect transport: try plain JSON first, fall back to SSE parsing.
-        try:
-            data = response.json()
-        except Exception:
-            data = _parse_sse_json(response.text)
-            if data is None:
-                return (
-                    f"ERROR: MCP server at {url} returned an unrecognised response format. "
-                    f"Expected JSON-RPC or SSE. Response preview: {response.text[:200]!r}"
-                )
-
-        tools = data.get("result", {}).get("tools", [])
-        if not tools:
-            return f"No tools found at {url}. Verify the URL and that the server supports JSON-RPC tools/list."
-
-        summary = [
-            {
-                "name": t.get("name", ""),
-                "description": t.get("description", ""),
-                "input_schema": t.get("inputSchema", {}),
-            }
-            for t in tools
-        ]
-        logger.info(
-            "devkit.tool.mcp_discovered",
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        logger.warning(
+            "discover_mcp_tools.http_error",
             extra={
-                "operation": "tool.discover_mcp_tools",
-                "status": "success",
+                "operation": "tools.discover_mcp_tools",
+                "status": "failure",
                 "server_url": url,
-                "tool_count": len(tools),
+                "http_status": exc.response.status_code,
+                "error": str(exc),
             },
         )
-        return json.dumps(summary, ensure_ascii=False, indent=2)
-
-    def _handle_add_mcp_tool(self, inputs: dict) -> str:
-        """Register an MCP server with the Action Gateway.
-
-        One entry per MCP server. McpAdapter connects at startup, discovers all
-        tools via tools/list, and registers them as '{id}__{tool_name}'. No
-        agent_core connector is written — MCP tool schemas come from the server
-        at runtime. Subagents reference tools by their namespaced names directly
-        (e.g. 'obsrv_docs__searchDocumentation').
-
-        Args:
-            inputs: Dict containing id, category, description, mcp_server_url.
-                    Optional: transport (default 'sse'), timeout_ms (default 5000).
-
-        Returns:
-            Confirmation string with namespace hint, or an ERROR string if the
-            tool id is duplicate.
-        """
-        tool = {
-            "id": inputs["id"],
-            "type": "mcp",
-            "category": inputs["category"],
-            "description": inputs["description"],
-            "server_url": inputs["mcp_server_url"],
-            "transport": inputs.get("transport", "sse"),
-            "timeout_ms": inputs.get("timeout_ms", 5000),
+        return {
+            "ok": False,
+            "error": f"MCP server at {url} returned HTTP {exc.response.status_code}",
         }
-        try:
-            self._acc.add_action_gateway_tool(tool)
-        except ValueError as exc:
-            return f"ERROR: {exc}"
-        logger.info(
-            "devkit.tool.mcp_registered",
+    except httpx.HTTPError as exc:
+        logger.warning(
+            "discover_mcp_tools.network_error",
             extra={
-                "operation": "tool.add_mcp_tool",
-                "status": "success",
-                "server_name": inputs["id"],
-                "transport": tool["transport"],
+                "operation": "tools.discover_mcp_tools",
+                "status": "failure",
+                "server_url": url,
+                "error": str(exc),
             },
         )
-        return (
-            f"MCP server '{inputs['id']}' registered with Action Gateway (transport: {tool['transport']}). "
-            f"Tools discovered at startup will be available as '{inputs['id']}__<tool_name>'. "
-            f"Assign tools to subagents using these namespaced names."
-        )
-
-    def _handle_set_reach_channels(self, inputs: dict) -> str:
-        """Store the user's selected deployment channels in reach_layer config.
-
-        Args:
-            inputs: Dict with 'channels' key containing a list of channel names.
-
-        Returns:
-            Confirmation string, or an ERROR string for unknown/empty channel list.
-        """
-        channels = inputs.get("channels", [])
-        valid = {"web", "cli", "voice"}
-        invalid = [c for c in channels if c not in valid]
-        if invalid:
-            return f"ERROR: unknown channel(s): {invalid}. Valid channels: {sorted(valid)}"
-        if not channels:
-            return "ERROR: at least one channel must be selected."
-        self._acc.set_reach_channel_selection(channels)
-        return f"Channels selected: {', '.join(channels)}. Now configure each selected channel."
-
-    def _handle_declare_azure_storage(self, tool_input: dict) -> str:
-        """Record that Azure Blob Storage is needed for this domain.
-
-        Takes no parameters. All Azure details (account name, account key,
-        container name) are collected in the Deployment Inputs UI.
-        Credentials never travel through the LLM.
-
-        Args:
-            tool_input: Ignored — this tool accepts no parameters.
-
-        Returns:
-            Confirmation string prompting the user to have all Azure details ready.
-        """
-        import time
-
-        start = time.time()
-        self._acc.declare_azure_needed()
-        logger.info(
-            "declare_azure_storage",
-            extra={
-                "operation": "tools.declare_azure_storage",
-                "status": "success",
-                "latency_ms": int((time.time() - start) * 1000),
-            },
-        )
-        return (
-            "Azure Blob Storage noted. In the Deployment Inputs step you will be "
-            "asked for your Azure account name, account key, and container name — "
-            "keep all three ready."
-        )
-
-    def _sync_connector_from_tool(self, tool: dict) -> None:
-        """Auto-create or update agent_core connector from a tool definition.
-
-        Generates the LLM-facing connector (name, description, input_schema) from
-        the full tool definition. For rest_api tools, only agent-sourced params are
-        included (static params are hidden from the LLM). For mcp tools, the
-        input_schema from the MCP server is used directly.
-
-        Args:
-            tool: Tool dict from action_gateway.tools with at minimum:
-                  id, category, description, type. Plus endpoints (rest_api) or
-                  input_schema (mcp).
-        """
-        category = tool.get("category", "read")
-        tool_id = tool["id"]
-
-        if tool.get("type") == "mcp":
-            # MCP tools are external — schemas come from the server at runtime.
-            # Subagents reference them by namespaced names ('{id}.{tool_name}').
-            # No agent_core connector entry is created.
-            return
-        else:
-            properties: dict = {}
-            required_list: list = []
-            for endpoint in tool.get("endpoints", []):
-                for param in endpoint.get("params", []):
-                    if param.get("source") != "agent":
-                        continue
-                    prop: dict = {"type": param.get("type", "string")}
-                    if param.get("description"):
-                        prop["description"] = param["description"]
-                    if param.get("default") is not None:
-                        prop["default"] = param["default"]
-                    properties[param["name"]] = prop
-                    if param.get("required"):
-                        required_list.append(param["name"])
-            input_schema = {"type": "object", "properties": properties}
-            if required_list:
-                input_schema["required"] = required_list
-
-        connector = {
-            "name": tool_id,
-            "description": tool.get("description", ""),
-            "input_schema": input_schema,
+        return {
+            "ok": False,
+            "error": f"could not reach MCP server at {url} — {exc}",
         }
 
-        self._acc.set_agent_core_connector(category, connector)
+    # Auto-detect transport: plain JSON first, fall back to SSE parsing.
+    import json as _json  # noqa: PLC0415
+    try:
+        data = response.json()
+    except (_json.JSONDecodeError, ValueError):
+        data = _parse_sse_json(response.text)
+        if data is None:
+            preview = response.text[:200]
+            logger.warning(
+                "discover_mcp_tools.unparseable_response",
+                extra={
+                    "operation": "tools.discover_mcp_tools",
+                    "status": "failure",
+                    "server_url": url,
+                    "preview": preview,
+                },
+            )
+            return {
+                "ok": False,
+                "error": (
+                    f"MCP server at {url} returned an unrecognised response "
+                    f"format (expected JSON-RPC or SSE). Preview: {preview!r}"
+                ),
+            }
+
+    raw_tools = data.get("result", {}).get("tools", []) if isinstance(data, dict) else []
+    tools = [
+        {
+            "name": t.get("name", ""),
+            "description": t.get("description", ""),
+            "input_schema": t.get("inputSchema", {}),
+        }
+        for t in raw_tools
+        if isinstance(t, dict)
+    ]
+    logger.info(
+        "discover_mcp_tools.success",
+        extra={
+            "operation": "tools.discover_mcp_tools",
+            "status": "success",
+            "server_url": url,
+            "tool_count": len(tools),
+        },
+    )
+    return {"ok": True, "tools": tools, "server_url": url}
+
+

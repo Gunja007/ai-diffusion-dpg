@@ -68,11 +68,28 @@ class InvocationRulesConfig(BaseModel):
     )
 
 
+class InputSchema(BaseModel):
+    """JSON-Schema-shaped description of a connector's input.
+
+    Passed verbatim to the Anthropic tools API. ``properties`` is an
+    open map of param name → JSON Schema fragment. ``extra='forbid'``
+    matches the runtime block's strict ``InputSchema`` — preventing the
+    domain config from carrying inline param values (e.g.
+    ``{query: 'placeholder'}``) under ``input_schema``.
+    """
+
+    model_config = {"extra": "forbid"}
+    type: str = Field(default="object")
+    properties: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    required: list[str] = Field(default_factory=list)
+    additionalProperties: bool = False
+
+
 class ConnectorDef(BaseModel):
     name: str = Field(..., description="Connector name matching a key in action_gateway.connectors")
     description: str = Field(default="", description="Description shown to LLM explaining when to call this connector")
-    input_schema: dict[str, Any] = Field(
-        default_factory=dict,
+    input_schema: InputSchema = Field(
+        default_factory=InputSchema,
         description="JSON Schema object for the tool's input. Passed verbatim to the Anthropic tools API.",
     )
     invocation_rules: InvocationRulesConfig = Field(
@@ -85,8 +102,8 @@ class InternalConnectorDef(BaseModel):
     name: str = Field(..., description="Internal connector name, e.g. knowledge_retrieval")
     route: str = Field(..., description="Internal routing destination, e.g. knowledge_engine")
     description: str = Field(default="", description="Description shown to LLM explaining when to call this connector")
-    input_schema: dict[str, Any] = Field(
-        default_factory=dict,
+    input_schema: InputSchema = Field(
+        default_factory=InputSchema,
         description="JSON Schema object for the tool's input.",
     )
     invocation_rules: InvocationRulesConfig = Field(
@@ -106,9 +123,36 @@ class ConnectorsConfig(BaseModel):
     )
 
 
+class FeaturesConfig(BaseModel):
+    """Per-deployment chat-provider feature toggles.
+
+    Mirrors the runtime ``agent_core/src/schema/config.py:FeaturesConfig``.
+    Each toggle's ``None`` means "use the provider's intrinsic capability";
+    a bool tightens the effective feature for this deployment.
+    """
+
+    model_config = {"extra": "forbid"}
+    prompt_cache: bool | None = None
+    streaming: bool | None = None
+    image_input: bool | None = None
+
+
 class AgentConfig(BaseModel):
-    primary_model: str = Field(..., description="Claude model ID for primary inference, e.g. claude-haiku-4-5-20251001")
-    fallback_model: str = Field(..., description="Claude model ID used if primary call fails")
+    # Runtime ``agent_core/src/schema/config.py:AgentConfig`` declares
+    # ``primary_model`` and ``fallback_model`` with ``= ""`` defaults
+    # (not required). Matching that so host validation accepts a config
+    # that hasn't named a model yet.
+    primary_model: str = Field(default="", description="Claude model ID for primary inference, e.g. claude-haiku-4-5-20251001")
+    fallback_model: str = Field(default="", description="Claude model ID used if primary call fails")
+    # GH-289: provider selection. Runtime makes this a ``Literal``;
+    # switching away from ``anthropic`` requires the matching API key in
+    # env (e.g. ``OPENAI_API_KEY``) and tightens the feature set the
+    # chat_provider factory accepts.
+    provider: Literal["anthropic", "openai"] = "anthropic"
+    features: FeaturesConfig = Field(
+        default_factory=FeaturesConfig,
+        description="Per-deployment chat-provider feature toggles (GH-289)",
+    )
     timeout_ms: int = Field(default=10000, description="LLM call timeout in milliseconds")
     retry_attempts: int = Field(default=2, description="Number of retry attempts on transient failure")
     retry_backoff_seconds: list[float] = Field(default=[0, 0.5, 1.0])
@@ -402,9 +446,13 @@ class AgentWorkflowConfig(BaseModel):
         default="",
         description="Subagent to route to when no routing rule matches the current intent",
     )
+    # Runtime ``agent_core/src/schema/config.py`` declares
+    # ``subagents: list[SubAgent] = []`` — allows an empty list at boot
+    # so a partially-rendered config doesn't crash the service. The old
+    # ``min_length=1`` here over-rejected the partial-but-valid case at
+    # host deploy review.
     subagents: list[SubAgentSchema] = Field(
-        ...,
-        min_length=1,
+        default_factory=list,
         description="All subagent definitions. Must contain exactly one subagent with is_start: true.",
     )
 
@@ -468,15 +516,16 @@ class ChannelConfig(BaseModel):
 
 
 class ChannelsTopLevelConfig(BaseModel):
-    """Top-level per-channel configuration block (GH-137)."""
+    """Top-level per-channel configuration block (GH-137).
+
+    Runtime ``agent_core/src/schema/config.py:ChannelsConfig`` carries
+    only ``voice``, ``web``, ``cli`` (``chat`` was removed). Keeping the
+    dev-kit copy in lockstep so host validation matches runtime.
+    """
 
     voice: ChannelConfig = Field(
         default_factory=lambda: ChannelConfig(tts_rules=TtsRulesConfig()),
         description="Voice channel configuration",
-    )
-    chat: ChannelConfig = Field(
-        default_factory=ChannelConfig,
-        description="Chat channel configuration",
     )
     web: ChannelConfig = Field(
         default_factory=ChannelConfig,
@@ -722,6 +771,22 @@ class MemgraphConfig(BaseModel):
     connection_timeout_s: int = Field(default=5, description="Connection timeout in seconds")
 
 
+class SessionFieldDefinition(BaseModel):
+    """One declared domain session field.
+
+    Mirrors the runtime ``memory_layer/src/schema/config.py:SessionFieldDefinition``.
+    ``type`` is restricted to the runtime's ``SessionFieldType`` enum
+    values — typos like ``"date"`` (not a valid type) would crash the
+    Memory Layer at boot if the dev-kit copy left this as
+    ``dict[str, Any]``.
+    """
+
+    model_config = {"extra": "forbid"}
+    type: Literal["enum", "string", "int", "list"]
+    values: list[str] | None = None
+    default: Any = None
+
+
 class SessionStateConfig(BaseModel):
     model_config = {"populate_by_name": True}
 
@@ -730,7 +795,7 @@ class SessionStateConfig(BaseModel):
         description="Session TTL in minutes. Redis evicts inactive sessions after this period.",
     )
     # Field named 'schema' in YAML; aliased to avoid shadowing BaseModel.schema()
-    session_schema: dict[str, Any] = Field(
+    session_schema: dict[str, SessionFieldDefinition] = Field(
         default_factory=dict,
         alias="schema",
         description="Domain-specific session fields. Each key is a field name; value declares "
@@ -783,7 +848,14 @@ class PersistentStateConfig(BaseModel):
 
 class StateConfig(BaseModel):
     session: SessionStateConfig = Field(default_factory=SessionStateConfig)
-    persistent: PersistentStateConfig = Field(default_factory=PersistentStateConfig)
+    # Optional to match runtime ``memory_layer/src/schema/config.py``,
+    # which declares ``persistent: Optional[PersistentConfig] = None``.
+    # When ``needs_persistent_user_data=false`` the wizard correctly
+    # omits this block; a non-Optional declaration here would force
+    # ``user_node`` to exist whether the project needs persistence or
+    # not — surfacing as false "user_node: Field required" errors at
+    # deploy review.
+    persistent: PersistentStateConfig | None = None
 
 
 class UserDataPersistenceConfig(BaseModel):
@@ -943,12 +1015,22 @@ class ToolParamDef(BaseModel):
 
 
 class ToolEndpointDef(BaseModel):
-    """One HTTP endpoint within a REST API tool definition."""
+    """One HTTP endpoint within a REST API tool definition.
+
+    ``body_template`` mirrors the runtime ``EndpointDefinition.body_template``
+    field — an optional nested body shape for non-GET methods, with
+    ``{placeholder}`` strings filled at call time. When absent, non-GET
+    bodies fall back to the historical flat ``json=all_params`` form.
+    """
 
     name: str = Field(..., description="Endpoint name, e.g. 'search', 'apply'")
     method: Literal["GET", "POST", "PUT", "DELETE", "PATCH"] = Field(..., description="HTTP method")
     path: str = Field(..., description="Path appended to base_url, e.g. '/search'")
     params: list[ToolParamDef] = Field(default=[], description="Parameters for this endpoint")
+    body_template: dict | list | None = Field(
+        default=None,
+        description="Optional nested request body shape for non-GET methods; placeholders {key} are filled from static + agent params at call time",
+    )
 
 
 class ToolResponseConfig(BaseModel):
@@ -1147,9 +1229,58 @@ class ChannelsConfig(BaseModel):
     voice: VoiceChannelConfig | None = Field(default=None, description="Voice channel config. None = not deployed.")
 
 
-class CommonReachConfig(BaseModel):
-    """Common settings shared across all channels."""
+class ReachHttpClientConfig(BaseModel):
+    """Generic HTTP client config for Reach Layer inter-service calls.
 
+    Mirrors the runtime ``reach_layer/base/schema/config.py:HttpClientConfig``.
+    """
+
+    model_config = {"extra": "forbid"}
+    endpoint: str
+    timeout_s: float = Field(default=10.0, gt=0)
+
+
+class LearningClientConfig(BaseModel):
+    """Observability-layer learning-signal client (ms timeouts).
+
+    Mirrors the runtime ``reach_layer/base/schema/config.py:LearningClientConfig``
+    added by GH-330. Used by Reach Layer voice/web channels to POST
+    ``recording.*`` audit signals at session-end.
+    """
+
+    model_config = {"extra": "forbid"}
+    endpoint: str
+    timeout_ms: int = Field(default=2000, gt=0)
+
+
+class CommonReachConfig(BaseModel):
+    """Common settings shared across all channel services.
+
+    Mirrors the runtime ``reach_layer/base/schema/config.py:CommonConfig``
+    1:1. Earlier this class only modelled ``observability`` and relied on
+    Pydantic's default ``extra="ignore"`` to drop everything else — which
+    silently let drift through (host validation passed configs the
+    runtime would later validate strictly). With ``extra="forbid"`` and
+    the three missing client sub-configs, host-mode deploy review now
+    catches the same drift Docker mode would.
+    """
+
+    model_config = {"extra": "forbid"}
+    agent_core_client: ReachHttpClientConfig = Field(
+        default_factory=lambda: ReachHttpClientConfig(
+            endpoint="http://agent_core:8000/process_turn", timeout_s=30.0
+        )
+    )
+    memory_layer_client: ReachHttpClientConfig = Field(
+        default_factory=lambda: ReachHttpClientConfig(
+            endpoint="http://memory_layer:8002", timeout_s=10.0
+        )
+    )
+    learning_client: LearningClientConfig = Field(
+        default_factory=lambda: LearningClientConfig(
+            endpoint="http://observability_layer:8004", timeout_ms=2000
+        )
+    )
     observability: dict[str, Any] = Field(
         default_factory=dict,
         description="Observability settings. At minimum: {domain: 'your_domain_slug'}",

@@ -1,92 +1,74 @@
 import { render, screen, fireEvent } from '@testing-library/react'
-import { describe, it, expect, vi } from 'vitest'
+import { describe, it, expect } from 'vitest'
 import PhaseBar from '../PhaseBar'
 
 const PHASE_LABELS = {
-  tier: 'Agent Type', overview: 'Overview', language: 'Language', knowledge: 'Knowledge',
+  tier: 'Intake', language: 'Language', knowledge: 'Knowledge',
   memory: 'Memory', user_state: 'User State', trust: 'Trust', tools: 'Tools',
-  workflow: 'Workflow', observability: 'Observability', reach: 'Reach Layer', review: 'Review',
+  workflow: 'Workflow', observability: 'Observability', reach: 'Reach', review: 'Review',
 }
 
 describe('PhaseBar', () => {
   it('renders in expanded state by default showing all phase labels', () => {
-    render(<PhaseBar currentPhase="overview" checkpoints={[]} onRestoreCheckpoint={vi.fn()} />)
+    render(<PhaseBar currentPhase="tier" />)
     Object.values(PHASE_LABELS).forEach(label => {
       expect(screen.getByText(label)).toBeInTheDocument()
     })
   })
 
+  it('does not render "overview" or "Agent Type" phases', () => {
+    render(<PhaseBar currentPhase="tier" />)
+    expect(screen.queryByText('Overview')).toBeNull()
+    expect(screen.queryByText('Agent Type')).toBeNull()
+  })
+
+  it('renders tier phase as "Intake"', () => {
+    render(<PhaseBar currentPhase="tier" />)
+    expect(screen.getByText('Intake')).toBeInTheDocument()
+  })
+
   it('collapses when toggle button is clicked and hides labels', () => {
-    render(<PhaseBar currentPhase="overview" checkpoints={[]} onRestoreCheckpoint={vi.fn()} />)
+    render(<PhaseBar currentPhase="tier" />)
     // Click the collapse toggle (‹)
     fireEvent.click(screen.getByTitle('Collapse phases'))
     // Labels should no longer be rendered as text elements
-    expect(screen.queryByText('Overview')).toBeNull()
+    expect(screen.queryByText('Intake')).toBeNull()
     expect(screen.queryByText('Language')).toBeNull()
   })
 
   it('shows expand arrow title when collapsed', () => {
-    render(<PhaseBar currentPhase="overview" checkpoints={[]} onRestoreCheckpoint={vi.fn()} />)
+    render(<PhaseBar currentPhase="tier" />)
     fireEvent.click(screen.getByTitle('Collapse phases'))
     expect(screen.getByTitle('Expand phases')).toBeInTheDocument()
   })
 
   it('re-expands when toggle clicked again', () => {
-    render(<PhaseBar currentPhase="overview" checkpoints={[]} onRestoreCheckpoint={vi.fn()} />)
+    render(<PhaseBar currentPhase="tier" />)
     fireEvent.click(screen.getByTitle('Collapse phases'))
     fireEvent.click(screen.getByTitle('Expand phases'))
-    expect(screen.getByText('Overview')).toBeInTheDocument()
+    expect(screen.getByText('Intake')).toBeInTheDocument()
   })
 
   it('marks phases before current as done (✓)', () => {
-    render(<PhaseBar currentPhase="knowledge" checkpoints={[]} onRestoreCheckpoint={vi.fn()} />)
-    // overview and language are before knowledge
-    const buttons = screen.getAllByRole('button')
-    const phaseButtons = buttons.filter(b => b.textContent.includes('Overview') || b.textContent.includes('Language'))
-    phaseButtons.forEach(btn => {
-      expect(btn.textContent).toContain('✓')
-    })
+    render(<PhaseBar currentPhase="knowledge" />)
+    // tier and language are before knowledge
+    const tierRow = screen.getByText('Intake').closest('div[title]')
+    const languageRow = screen.getByText('Language').closest('div[title]')
+    expect(tierRow.textContent).toContain('✓')
+    expect(languageRow.textContent).toContain('✓')
   })
 
   it('marks current phase with ●', () => {
-    render(<PhaseBar currentPhase="memory" checkpoints={[]} onRestoreCheckpoint={vi.fn()} />)
-    const memoryBtn = screen.getByText('Memory').closest('button')
-    expect(memoryBtn.textContent).toContain('●')
+    render(<PhaseBar currentPhase="memory" />)
+    const memoryRow = screen.getByText('Memory').closest('div[title]')
+    expect(memoryRow.textContent).toContain('●')
   })
 
-  it('disables phases with no checkpoint', () => {
-    render(<PhaseBar currentPhase="memory" checkpoints={[]} onRestoreCheckpoint={vi.fn()} />)
-    const overviewBtn = screen.getByText('Overview').closest('button')
-    expect(overviewBtn).toBeDisabled()
-  })
-
-  it('enables phases that have a checkpoint', () => {
-    const checkpoints = [{ phase: '01_overview', created_at: '2024-01-01' }]
-    render(<PhaseBar currentPhase="memory" checkpoints={checkpoints} onRestoreCheckpoint={vi.fn()} />)
-    const overviewBtn = screen.getByText('Overview').closest('button')
-    expect(overviewBtn).not.toBeDisabled()
-  })
-
-  it('calls onRestoreCheckpoint with checkpoint phase when enabled phase is clicked', () => {
-    const onRestore = vi.fn()
-    const checkpoints = [{ phase: '01_overview' }]
-    render(<PhaseBar currentPhase="memory" checkpoints={checkpoints} onRestoreCheckpoint={onRestore} />)
-    fireEvent.click(screen.getByText('Overview').closest('button'))
-    expect(onRestore).toHaveBeenCalledWith('01_overview')
-  })
-
-  it('does not call onRestoreCheckpoint when disabled phase is clicked', () => {
-    const onRestore = vi.fn()
-    render(<PhaseBar currentPhase="memory" checkpoints={[]} onRestoreCheckpoint={onRestore} />)
-    fireEvent.click(screen.getByText('Overview').closest('button'))
-    expect(onRestore).not.toHaveBeenCalled()
-  })
-
-  it('renders dots in collapsed mode for each phase', () => {
-    render(<PhaseBar currentPhase="overview" checkpoints={[]} onRestoreCheckpoint={vi.fn()} />)
+  it('renders dots in collapsed mode for each of the 11 phases', () => {
+    render(<PhaseBar currentPhase="tier" />)
     fireEvent.click(screen.getByTitle('Collapse phases'))
-    // 12 phases = 12 dot spans; they have title attributes
-    const dots = screen.getAllByTitle(/Agent Type|Overview|Language|Knowledge|Memory|User State|Trust|Tools|Workflow|Observability|Reach Layer|Review/)
-    expect(dots).toHaveLength(12)
+    // 11 phases = 11 dot spans; they have title attributes
+    const dots = screen.getAllByTitle(/Intake|Language|Knowledge|Memory|User State|Trust|Tools|Workflow|Observability|Reach|Review/)
+    expect(dots).toHaveLength(11)
   })
 })

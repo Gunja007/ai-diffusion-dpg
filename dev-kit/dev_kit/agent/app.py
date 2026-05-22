@@ -4,8 +4,7 @@ dev-kit/dev_kit/agent/app.py
 FastAPI application for the DPG conversation agent.
 
 Serves the conversation API and the React SPA (built frontend output
-mounted at agent/static/). Manages an in-memory registry of
-ConversationEngine instances keyed by project slug.
+mounted at agent/static/).
 """
 from __future__ import annotations
 
@@ -30,12 +29,28 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from dev_kit.agent.accumulator import BLOCKS, ConfigAccumulator
 from dev_kit.agent.auth import verify_api_key as _verify_api_key
-from dev_kit.agent.checkpoints import list_checkpoints, restore_checkpoint
-from dev_kit.agent.conversation import ConversationEngine
+from dev_kit.agent.block_status import all_block_statuses, block_completion_status
 from dev_kit.agent.crypto import decrypt_secrets_dict, get_public_key_spki_b64
-from dev_kit.agent.errors import ConversationError
+from dev_kit.agent.field_status import load_field_status
+from dev_kit.agent.history import load_history
+from dev_kit.agent.intake_state import IntakeState, load_intake_state, save_intake_state
+from dev_kit.agent import phase_driver
+from dev_kit.agent.phase_driver import (
+    LLMResponse,
+    ToolCall,
+    save_accumulator,
+    save_current_phase,
+)
+from dev_kit.agent.project_state import (
+    BLOCKS,
+    empty_accumulator,
+    load_accumulator,
+    # Aliased to disambiguate from phase_driver.save_accumulator (line 45) which
+    # takes a slug_root rather than an explicit file path. Both are imported.
+    save_accumulator as _save_accumulator_path,
+)
+from dev_kit.agent.tools import DEVKIT_TOOL_SCHEMAS
 from dev_kit.agent.renderer import load_block_from_file, render_all
 from dev_kit.config.loader import load_devkit_config as _load_devkit_config
 from dev_kit.schemas.validation import validate_partial
@@ -64,9 +79,33 @@ if not _api_key:
         "Set it before starting the server."
     )
 _anthropic_client = anthropic.AsyncAnthropic(api_key=_api_key)
-_engines: dict[str, ConversationEngine] = {}
 
 logger = logging.getLogger(__name__)
+
+
+# Per-slug locks for serialising concurrent chat turns on the same
+# project. ``phase_driver.run_turn`` loads/mutates/saves five
+# ``_meta/*.json`` files plus appends to ``history.jsonl``; two
+# concurrent ``POST /api/projects/{slug}/chat`` requests (two browser
+# tabs, a stale-refresh retry, etc.) would race and produce
+# last-write-wins corruption. The lock is per-slug so cross-project
+# parallelism is preserved. ``_slug_locks_guard`` serialises the
+# get-or-create itself.
+_slug_locks: dict[str, "asyncio.Lock"] = {}
+_slug_locks_guard: "asyncio.Lock | None" = None
+
+
+async def _acquire_slug_lock(slug: str) -> "asyncio.Lock":
+    """Return the per-slug ``asyncio.Lock``, creating it if needed.
+
+    Lazy-creates the guard lock on first use so module import doesn't
+    require an active event loop.
+    """
+    global _slug_locks_guard
+    if _slug_locks_guard is None:
+        _slug_locks_guard = asyncio.Lock()
+    async with _slug_locks_guard:
+        return _slug_locks.setdefault(slug, asyncio.Lock())
 
 
 def _rewrite_compose_bind_paths_to_host(services: dict) -> None:
@@ -386,8 +425,31 @@ app.add_middleware(
 
 
 class CreateProjectRequest(BaseModel):
+    """Request body for POST /api/projects.
+
+    The 5 new intake fields (project_name, domain_description, selected_channels,
+    default_language, supported_languages) are optional so the old form shape
+    ``{name, description}`` continues to work as a fallback.
+    """
+
+    # Legacy fields — kept for backwards compatibility.
     name: str
-    description: str
+    description: str = ""
+
+    # New deterministic-wizard intake fields.
+    project_name: Optional[str] = None
+    domain_description: Optional[str] = None
+    selected_channels: list[str] = ["web"]
+    default_language: str = "english"
+    supported_languages: list[str] = ["english"]
+
+    def effective_project_name(self) -> str:
+        """Return project_name if set, falling back to name."""
+        return self.project_name or self.name
+
+    def effective_domain_description(self) -> str:
+        """Return domain_description if set, falling back to description."""
+        return self.domain_description or self.description
 
 
 class ChatRequest(BaseModel):
@@ -440,13 +502,301 @@ def _load_project_meta(slug: str) -> dict:
         raise HTTPException(status_code=500, detail="Project metadata is corrupt") from exc
 
 
-def _get_engine(slug: str) -> ConversationEngine:
-    if slug not in _engines:
-        project_path = _get_project_path(slug)
-        if not project_path.exists():
-            raise HTTPException(status_code=404, detail=f"Project '{slug}' not found")
-        _engines[slug] = ConversationEngine(project_path, _anthropic_client)
-    return _engines[slug]
+# ---------------------------------------------------------------------------
+# Dev-kit LLM call builder (used by the migrated /chat endpoint)
+# ---------------------------------------------------------------------------
+
+_DEVKIT_MODEL = os.environ.get("DEVKIT_MODEL", "claude-haiku-4-5-20251001")
+_DEVKIT_MAX_TOKENS = int(os.environ.get("DEVKIT_MAX_TOKENS", "4096"))
+
+
+def _build_devkit_llm_call():
+    """Return a sync ``(system_prompt, messages) -> LLMResponse`` callable.
+
+    Each invocation builds a fresh sync Anthropic client (cheap), so the
+    callable is safe to use under ``asyncio.to_thread`` from the chat handler.
+
+    The returned callable accepts the full Anthropic-format ``messages`` list
+    (text turns plus any ``tool_use``/``tool_result`` rounds for an in-turn
+    tool loop) and surfaces ``stop_reason`` and the model's raw content blocks
+    on the response so ``phase_driver.run_turn`` can echo them back on the
+    next loop iteration.
+
+    Returns:
+        A callable accepting ``(system_prompt, messages)`` and returning an
+        ``LLMResponse`` with text, tool_calls (each carrying the provider
+        ``tool_use_id``), raw_content, stop_reason, model, and token counts.
+
+    Raises:
+        anthropic.APIError: On Anthropic API failures (timeout, connection,
+            status error). Propagates from the inner ``_llm_call`` through
+            ``asyncio.to_thread`` to the chat handler's exception handler,
+            which logs and returns HTTP 500.
+    """
+    def _llm_call(system_prompt: str, messages: list[dict]) -> LLMResponse:
+        sync_client = anthropic.Anthropic()
+        response = sync_client.messages.create(
+            model=_DEVKIT_MODEL,
+            max_tokens=_DEVKIT_MAX_TOKENS,
+            system=system_prompt,
+            messages=messages,
+            tools=DEVKIT_TOOL_SCHEMAS,
+            timeout=30.0,
+        )
+        text_parts: list[str] = []
+        tool_calls: list[ToolCall] = []
+        raw_content: list[dict] = []
+        for block in response.content:
+            # Serialize each content block to the Anthropic message-format dict
+            # so phase_driver can echo it back verbatim as the assistant turn
+            # on the next tool-use loop iteration.
+            if hasattr(block, "model_dump"):
+                raw_content.append(block.model_dump())
+            block_type = getattr(block, "type", None)
+            if block_type == "text":
+                text_parts.append(block.text)
+            elif block_type == "tool_use":
+                tool_calls.append(
+                    ToolCall(
+                        name=block.name,
+                        args=dict(block.input),
+                        id=getattr(block, "id", None),
+                    )
+                )
+        usage = getattr(response, "usage", None)
+        return LLMResponse(
+            text="\n".join(text_parts),
+            tool_calls=tool_calls,
+            model=getattr(response, "model", None),
+            input_tokens=getattr(usage, "input_tokens", None),
+            output_tokens=getattr(usage, "output_tokens", None),
+            stop_reason=getattr(response, "stop_reason", None),
+            raw_content=raw_content,
+        )
+
+    return _llm_call
+
+
+# ---------------------------------------------------------------------------
+# Project-route helpers (stateless, per-request)
+# ---------------------------------------------------------------------------
+
+
+def _reach_channels_from_accumulator(accumulator: dict[str, dict]) -> list[str]:
+    """Return the channels configured in reach_layer YAML; fall back to ['web'].
+
+    Used as a fallback when the project predates the deterministic wizard and
+    has no intake_state.json.  Mirrors the logic of
+    ``ConfigAccumulator.get_reach_channel_selection_or_default``.
+
+    Args:
+        accumulator: The full accumulator dict (one entry per block).
+
+    Returns:
+        List of non-null channel names from ``reach_layer.reach_layer.channels``,
+        or ``['web']`` when none are configured.
+    """
+    channels_cfg = (
+        accumulator.get("reach_layer", {})
+        .get("reach_layer", {})
+        .get("channels", {})
+    )
+    inferred = [ch for ch, cfg in channels_cfg.items() if cfg is not None]
+    return inferred if inferred else ["web"]
+
+
+def _workflow_graph(accumulator: dict[str, dict]) -> dict:
+    """Return the subagent workflow as nodes and edges for the frontend graph.
+
+    Mirrors ``ConfigAccumulator.get_workflow_graph`` so the workflow endpoint
+    can operate directly on the raw accumulator dict without constructing a
+    ``ConfigAccumulator`` instance.
+
+    Args:
+        accumulator: The full accumulator dict (one entry per block).
+
+    Returns:
+        Dict with ``nodes`` (list of ``{id, name, type}``) and
+        ``edges`` (list of ``{from, to, intent}``).
+    """
+    subagents = (
+        accumulator.get("agent_core", {})
+        .get("agent_workflow", {})
+        .get("subagents", [])
+    )
+    nodes = []
+    edges = []
+    for sa in subagents:
+        node_type = (
+            "start" if sa.get("is_start")
+            else ("end" if sa.get("is_terminal") else "normal")
+        )
+        nodes.append({"id": sa["id"], "name": sa.get("name", sa["id"]), "type": node_type})
+        for rule in sa.get("routing", []):
+            edges.append({
+                "from": sa["id"],
+                "to": rule.get("next_subagent_id", ""),
+                "intent": rule.get("intent", ""),
+            })
+    return {"nodes": nodes, "edges": edges}
+
+
+def _required_secrets_from_accumulator(accumulator: dict[str, dict]) -> list[dict]:
+    """Return API-key secrets required by configured tools (Action Gateway).
+
+    Scans the action_gateway block's ``tools`` list for non-empty
+    ``auth.secret_env`` fields. Each entry tells the deploy wizard which
+    password field to render.
+
+    Args:
+        accumulator: The full accumulator dict (one entry per block).
+
+    Returns:
+        List of ``{env_var, tool_id, description}`` dicts. Empty if no tools
+        declare a ``secret_env``.
+    """
+    result = []
+    for tool in accumulator.get("action_gateway", {}).get("tools", []):
+        secret_env = (tool.get("auth") or {}).get("secret_env", "")
+        if secret_env:
+            result.append({
+                "env_var": secret_env,
+                "tool_id": tool.get("id", ""),
+                "description": tool.get("description", ""),
+            })
+    return result
+
+
+def _channel_secrets_from_intake_and_accumulator(
+    intake: IntakeState | None,
+    accumulator: dict[str, dict],
+) -> list[dict]:
+    """Return credential descriptors for channels selected in the intake state.
+
+    Inspects ``intake.selected_channels`` and returns a structured list that
+    the deploy wizard renders as credential input fields. Web channel requires
+    Google OAuth client ID; voice channel requires Vobiz and Raya credentials
+    plus the public service URL. Recording config is read from the accumulator's
+    reach_layer block.
+
+    Args:
+        intake: The project's intake state. When ``None`` (legacy project
+            without intake_state.json), returns an empty list.
+        accumulator: The full accumulator dict (one entry per block).
+
+    Returns:
+        List of dicts, each with keys:
+            ``env_var``     — environment variable name injected into container
+            ``label``       — field label shown in the UI
+            ``description`` — hint text shown below the field
+            ``required``    — True for all current channel credentials
+            ``section``     — ``"web"`` or ``"voice"``
+            ``secret``      — ``True`` → SecretInput (masked); ``False`` → plain
+        Returns an empty list when intake is ``None`` or no credential-bearing
+        channel is selected.
+    """
+    if intake is None:
+        return []
+    selected = intake.selected_channels or []
+    result: list[dict] = []
+    if "web" in selected:
+        result.append({
+            "env_var": "GOOGLE_CLIENT_ID",
+            "label": "Google Client ID",
+            "description": (
+                "Google is the only supported auth provider. Get your Client ID from "
+                "the Google Cloud Console — create an OAuth 2.0 credential and add "
+                "your deployment URL as an authorised origin."
+            ),
+            "required": True,
+            "section": "web",
+            "secret": False,
+        })
+    if "voice" in selected:
+        recording_cfg = (
+            accumulator.get("reach_layer", {})
+            .get("reach_layer", {})
+            .get("channels", {})
+            .get("voice", {})
+            .get("recording", {})
+        )
+        recording_source = recording_cfg.get("source", "disabled")
+        if recording_source and recording_source != "disabled":
+            result.append({
+                "env_var": "RECORDING_CALLER_ID_HASH_SALT",
+                "label": "Recording Caller-ID Hash Salt",
+                "description": (
+                    "Secret salt used to hash caller phone numbers in recording metadata. "
+                    "Must be at least 32 characters (64 hex chars recommended). "
+                    "Auto-generated by the wizard if left blank."
+                ),
+                "required": True,
+                "section": "voice",
+                "secret": True,
+            })
+            store_backend = recording_cfg.get("store", {}).get("backend", "local")
+            if store_backend == "s3":
+                result.append({
+                    "env_var": "RECORDING_S3_KMS_KEY_ID",
+                    "label": "Recording S3 KMS Key ID",
+                    "description": (
+                        "Optional AWS KMS key ID used to encrypt recordings in S3. "
+                        "Leave blank to use the bucket's default encryption."
+                    ),
+                    "required": False,
+                    "section": "voice",
+                    "secret": True,
+                })
+        result.extend([
+            {
+                "env_var": "VOBIZ_AUTH_ID",
+                "label": "Vobiz Auth ID",
+                "description": "Your Vobiz account Auth ID. Found in the Vobiz dashboard under Account settings.",
+                "required": True,
+                "section": "voice",
+                "secret": True,
+            },
+            {
+                "env_var": "VOBIZ_AUTH_TOKEN",
+                "label": "Vobiz Auth Token",
+                "description": "Your Vobiz account Auth Token. Found in the Vobiz dashboard under Account settings.",
+                "required": True,
+                "section": "voice",
+                "secret": True,
+            },
+            {
+                "env_var": "RAYA_API_KEY",
+                "label": "Raya API Key",
+                "description": "API key for Raya STT/TTS. Found in your Raya dashboard.",
+                "required": True,
+                "section": "voice",
+                "secret": True,
+            },
+            {
+                "env_var": "PUBLIC_URL",
+                "label": "Voice Public URL",
+                "description": (
+                    "Public HTTPS URL of the voice service "
+                    "(e.g. https://voice.203-0-113-42.sslip.io). "
+                    "The voice server returns this to Vobiz so it knows where to open the audio WebSocket."
+                ),
+                "required": True,
+                "section": "voice",
+                "secret": False,
+            },
+            {
+                "env_var": "VOBIZ_FROM_NUMBER",
+                "label": "Vobiz From Number",
+                "description": (
+                    "Vobiz-assigned phone number used as caller ID on outbound calls "
+                    "(E.164 format, e.g. +919876543210). Required — the voice service will not start without it."
+                ),
+                "required": True,
+                "section": "voice",
+                "secret": False,
+            },
+        ])
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -456,26 +806,71 @@ def _get_engine(slug: str) -> ConversationEngine:
 
 @app.post("/api/projects")
 def create_project(body: CreateProjectRequest) -> dict:
-    """Create a new project and initialise its directory structure."""
-    slug = _slugify(body.name)
+    """Create a new project and initialise its directory structure.
+
+    Writes ``project.json``, empty config YAMLs, ``intake_state.json``
+    (with the 5 form fields + 7 binary flags defaulted to False),
+    ``current_phase.txt`` (set to ``"tier"``), and ``accumulator.json``
+    (empty per-block dicts).
+
+    Args:
+        body: CreateProjectRequest with at minimum ``name``. The new intake
+            fields (project_name, domain_description, selected_channels,
+            default_language, supported_languages) are optional and fall back
+            to the legacy ``name``/``description`` values when absent.
+
+    Returns:
+        The project metadata dict that was written to ``project.json``.
+    """
+    effective_name = body.effective_project_name()
+    slug = _slugify(effective_name)
     project_path = _get_project_path(slug)
     project_path.mkdir(parents=True, exist_ok=True)
     meta_dir = project_path / "_meta"
     meta_dir.mkdir(exist_ok=True)
     meta = {
         "slug": slug,
-        "name": body.name,
-        "description": body.description,
+        "name": effective_name,
+        "description": body.effective_domain_description(),
         "current_phase": "tier",
         "phases_completed": [],
         "agent_type": "",
         "phase_decisions": {},
     }
     (meta_dir / "project.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2))
-    # Initialise empty config files
-    acc = ConfigAccumulator()
-    render_all(project_path, acc)
-    _engines[slug] = ConversationEngine(project_path, _anthropic_client)
+
+    # Build IntakeState first so render_all (and future calls) get the
+    # source-of-truth for form fields and binary flags.
+    intake = IntakeState(
+        project_name=effective_name,
+        domain_description=body.effective_domain_description(),
+        selected_channels=body.selected_channels,
+        default_language=body.default_language,
+        supported_languages=body.supported_languages,
+        has_kb=False,
+        has_external_tools=False,
+        is_multi_turn=False,
+        needs_persistent_user_data=False,
+        is_companion_style=False,
+        needs_consent=False,
+        has_hitl=False,
+        completed=False,
+    )
+    intake.touch()
+    save_intake_state(meta_dir / "intake_state.json", intake)
+    logger.info(
+        "devkit.project.intake_state_saved",
+        extra={"operation": "api.create_project", "status": "success", "slug": slug},
+    )
+
+    # Write initial current_phase.
+    save_current_phase(project_path, "tier")
+
+    # Initialise empty accumulator + render placeholder YAMLs.
+    acc_dict = empty_accumulator()
+    save_accumulator(project_path, acc_dict)
+    render_all(project_path, acc_dict, intake)
+
     logger.info(
         "devkit.project.created",
         extra={"operation": "api.create_project", "status": "success", "slug": slug},
@@ -513,29 +908,116 @@ def list_projects() -> list[dict]:
 
 @app.get("/api/projects/{slug}")
 def get_project(slug: str) -> dict:
-    """Get project metadata and config statuses."""
-    meta = _load_project_meta(slug)
-    engine = _get_engine(slug)
-    meta["config_statuses"] = {block: engine.accumulator.get_status(block).value for block in BLOCKS}
+    """Get project metadata and config statuses.
 
-    # Azure Blob Storage — expose intent flag only; all details collected at deploy time
+    Loads all state per-request from disk (accumulator, field_status,
+    intake_state). Legacy projects without intake_state.json return partial
+    metadata without crashing.
+
+    Args:
+        slug: Project slug.
+
+    Returns:
+        Project metadata dict augmented with config_statuses, azure_storage,
+        required_secrets, channel_secrets, has_knowledge_base, and llm_provider.
+        ``azure_storage["needed"]`` reflects ``intake_state.uses_azure_blob``
+        — set during the knowledge phase chat when the operator confirms the
+        KB documents live in Azure Blob Storage. The deploy form uses this
+        flag to decide whether to surface AZURE_STORAGE_ACCOUNT /
+        AZURE_STORAGE_KEY / AZURE_CONTAINER_NAME inputs.
+
+    Raises:
+        HTTPException: 404 if the project does not exist.
+        HTTPException: 500 if any state file (accumulator.json, field_status.json,
+            or intake_state.json) contains corrupt or invalid data.
+    """
+    meta = _load_project_meta(slug)
+    project_path = _get_project_path(slug)
+    meta_dir = project_path / "_meta"
+
+    # Load per-request state from disk.
+    try:
+        accumulator = load_accumulator(meta_dir / "accumulator.json")
+    except ValueError as exc:
+        logger.error(
+            "devkit.project.state_corrupt",
+            extra={
+                "operation": "api.get_project",
+                "status": "failure",
+                "error": str(exc),
+                "slug": slug,
+            },
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Corrupt accumulator.json for '{slug}': {exc}",
+        )
+
+    try:
+        field_status = load_field_status(meta_dir / "field_status.json")
+    except ValueError as exc:
+        logger.error(
+            "devkit.project.state_corrupt",
+            extra={
+                "operation": "api.get_project",
+                "status": "failure",
+                "error": str(exc),
+                "slug": slug,
+            },
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Corrupt field_status.json for '{slug}': {exc}",
+        )
+
+    # Legacy projects may not have intake_state.json — degrade gracefully.
+    # A corrupt intake_state.json is treated as a real error (not a legacy project).
+    try:
+        intake = load_intake_state(meta_dir / "intake_state.json")
+    except FileNotFoundError:
+        intake = None
+    except ValueError as exc:
+        logger.error(
+            "devkit.project.state_corrupt",
+            extra={
+                "operation": "api.get_project",
+                "status": "failure",
+                "error": str(exc),
+                "slug": slug,
+            },
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Corrupt intake_state.json for '{slug}': {exc}",
+        )
+
+    meta["config_statuses"] = all_block_statuses(field_status)
+
+    # Azure Blob Storage: surface intake_state.uses_azure_blob so the
+    # deploy form knows whether to show Azure credential fields. The
+    # flag is captured during the knowledge phase chat via
+    # `update_intake(field="uses_azure_blob", value=...)`. Credentials
+    # themselves never travel through chat — only the boolean intent.
     meta["azure_storage"] = {
-        "needed": engine.accumulator.is_azure_needed(),
+        "needed": bool(intake and getattr(intake, "uses_azure_blob", False))
     }
 
-    # Required secrets — derived from tool auth configuration
-    meta["required_secrets"] = engine.accumulator.get_required_secrets()
-    meta["channel_secrets"] = engine.accumulator.get_required_channel_secrets()
+    meta["required_secrets"] = _required_secrets_from_accumulator(accumulator)
+    meta["channel_secrets"] = (
+        _channel_secrets_from_intake_and_accumulator(intake, accumulator)
+        if intake is not None
+        else []
+    )
 
-    # Knowledge base presence — used by the deploy wizard to skip the ingest step
-    meta["has_knowledge_base"] = engine.accumulator.has_knowledge_base()
+    # Knowledge base presence — used by the deploy wizard to skip the ingest step.
+    meta["has_knowledge_base"] = bool(intake and intake.has_kb)
 
-    # LLM provider chosen during the language phase. The deploy wizard's
-    # MandatoryInputsStep uses this to ask for the matching API key
-    # (ANTHROPIC_API_KEY vs OPENAI_API_KEY) instead of always prompting for
-    # Anthropic. Defaults to "anthropic" when the agent block hasn't been
-    # configured yet (matches the schema default).
-    agent_cfg = engine.accumulator.get_block("agent_core").get("agent", {}) or {}
+    # LLM provider chosen during the language phase. Defaults to "anthropic"
+    # when the agent block hasn't been configured yet.
+    agent_cfg = accumulator.get("agent_core", {}).get("agent", {}) or {}
     meta["llm_provider"] = agent_cfg.get("provider") or "anthropic"
 
     return meta
@@ -543,12 +1025,21 @@ def get_project(slug: str) -> dict:
 
 @app.delete("/api/projects/{slug}")
 def delete_project(slug: str) -> dict:
-    """Delete a project and all its files."""
+    """Delete a project directory and all its files.
+
+    Args:
+        slug: The project slug identifying the directory under CONFIGS_DIR.
+
+    Returns:
+        Dict with key ``deleted`` set to the slug of the removed project.
+
+    Raises:
+        HTTPException: 404 if the project directory does not exist.
+    """
     project_path = _get_project_path(slug)
     if not project_path.exists():
         raise HTTPException(status_code=404, detail=f"Project '{slug}' not found")
     shutil.rmtree(project_path)
-    _engines.pop(slug, None)
     logger.info(
         "devkit.project.deleted",
         extra={"operation": "api.delete_project", "status": "success", "slug": slug},
@@ -563,147 +1054,149 @@ def delete_project(slug: str) -> dict:
 
 @app.post("/api/projects/{slug}/chat")
 async def chat(slug: str, body: ChatRequest) -> dict:
-    """Send a user message and receive the agent response."""
-    engine = _get_engine(slug)
+    """Send a user message and receive the agent response.
+
+    Delegates to ``phase_driver.run_turn``. The phase_driver appends
+    user/assistant entries to ``_meta/history.jsonl`` and persists all state
+    (intake, accumulator, field_status, current_phase) on success.
+
+    Args:
+        slug: Project slug.
+        body: ChatRequest with the user message.
+
+    Returns:
+        Dict shaped to preserve the React UI contract: ``reply`` (assistant
+        text), ``phase`` (the phase after the turn), ``config_updates`` ([]),
+        ``checkpoint_created`` (None), ``graph`` ({}).
+
+    Raises:
+        HTTPException 404: If the project directory does not exist.
+        HTTPException 400: If the project predates the deterministic wizard
+            (no ``_meta/intake_state.json``).
+        HTTPException 500: If ``phase_driver.run_turn`` raises.
+    """
     start = time.time()
+    project_path = _get_project_path(slug)
+    if not project_path.exists():
+        raise HTTPException(status_code=404, detail=f"Project '{slug}' not found")
+    if not (project_path / "_meta" / "intake_state.json").exists():
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Project '{slug}' was created with an older version of the "
+                "dev-kit. Please create a new project to continue."
+            ),
+        )
     try:
-        result = await engine.chat(body.message)
-        logger.info(
-            "chat_turn",
-            extra={
-                "operation": "app.chat",
-                "status": "success",
-                "latency_ms": int((time.time() - start) * 1000),
-                "slug": slug,
-            },
-        )
-        return result
-    except ConversationError as exc:
-        logger.error(
-            "chat_turn_failed",
-            extra={
-                "operation": "app.chat",
-                "status": "failure",
-                "error": str(exc),
-                "latency_ms": int((time.time() - start) * 1000),
-                "slug": slug,
-            },
-            exc_info=True,
-        )
-        raise HTTPException(status_code=500, detail={"error": str(exc)}) from exc
+        # Serialise concurrent chat turns on the same slug. The
+        # alternative (two browser tabs, a stale-refresh retry, any
+        # parallel POST to this endpoint with the same slug) races on
+        # five ``_meta/*.json`` files plus the ``history.jsonl`` append
+        # because ``phase_driver.run_turn`` is a load-mutate-save cycle
+        # against shared disk state. The lock is per-slug so different
+        # projects still run in parallel.
+        slug_lock = await _acquire_slug_lock(slug)
+        async with slug_lock:
+            response_text = await asyncio.to_thread(
+                phase_driver.run_turn,
+                body.message,
+                slug,
+                projects_root=project_path.parent,
+                llm_call=_build_devkit_llm_call(),
+            )
     except Exception as exc:
-        logger.exception(
-            "chat_turn_unexpected",
+        # Inspect the Anthropic error type so we can return an
+        # operator-friendly message for the two failure modes the
+        # wizard cannot recover from on its own: an exhausted API
+        # credit balance and a missing/invalid API key. Both produce
+        # `anthropic.BadRequestError` and `anthropic.AuthenticationError`
+        # respectively; the raw message is unfriendly and the wizard's
+        # 500 surfaces as an empty chat reply in the UI, which looks
+        # like a wizard freeze. Surface them as a 402 / 401 with
+        # human-readable detail so the operator knows what to do.
+        msg = str(exc)
+        if "credit balance is too low" in msg or "credit_balance" in msg:
+            raise HTTPException(
+                status_code=402,
+                detail={
+                    "error": "anthropic_credit_exhausted",
+                    "message": (
+                        "The Anthropic API rejected the request because your "
+                        "account credit balance is too low. Top up at "
+                        "https://console.anthropic.com/settings/billing and "
+                        "try the same message again — the wizard's state is "
+                        "preserved."
+                    ),
+                },
+            ) from exc
+        if "authentication_error" in msg.lower() or "invalid x-api-key" in msg.lower():
+            raise HTTPException(
+                status_code=401,
+                detail={
+                    "error": "anthropic_auth_failed",
+                    "message": (
+                        "The Anthropic API rejected the request because the "
+                        "ANTHROPIC_API_KEY env var is missing, empty, or "
+                        "invalid. Set it and restart the dev-kit; the "
+                        "wizard's state is preserved."
+                    ),
+                },
+            ) from exc
+        logger.error(
+            "devkit.chat.failed",
             extra={
-                "operation": "app.chat",
+                "operation": "api.chat",
                 "status": "failure",
                 "error": str(exc),
                 "error_type": type(exc).__name__,
                 "latency_ms": int((time.time() - start) * 1000),
                 "slug": slug,
             },
+            exc_info=True,
         )
         raise HTTPException(status_code=500, detail={"error": str(exc)}) from exc
+
+    current_phase = phase_driver.load_current_phase(project_path)
+    logger.info(
+        "devkit.chat.success",
+        extra={
+            "operation": "api.chat",
+            "status": "success",
+            "latency_ms": int((time.time() - start) * 1000),
+            "slug": slug,
+            "current_phase": current_phase,
+        },
+    )
+    return {
+        "reply": response_text,
+        "phase": current_phase,
+        "config_updates": [],
+        "checkpoint_created": None,
+        "graph": {},
+    }
 
 
 @app.get("/api/projects/{slug}/history")
 def get_history(slug: str) -> list[dict]:
-    """Return the conversation history for the current phase."""
-    engine = _get_engine(slug)
-    result = []
-    for msg in engine._history:
-        content = msg.get("content", "")
-        if isinstance(content, str):
-            result.append({"role": msg["role"], "content": content})
-    return result
+    """Return the chat history for the project.
 
-
-# ---------------------------------------------------------------------------
-# Checkpoint routes
-# ---------------------------------------------------------------------------
-
-
-@app.get("/api/projects/{slug}/checkpoints")
-def get_checkpoints(slug: str) -> list[dict]:
-    """List all saved checkpoints for a project."""
-    project_path = _get_project_path(slug)
-    if not project_path.exists():
-        raise HTTPException(status_code=404, detail=f"Project '{slug}' not found")
-    return list_checkpoints(project_path)
-
-
-@app.post("/api/projects/{slug}/checkpoints/{phase}/restore")
-def restore_checkpoint_route(slug: str, phase: str) -> dict:
-    """Restore the project to a previous checkpoint."""
-    project_path = _get_project_path(slug)
-    try:
-        restored_acc, summary = restore_checkpoint(project_path, phase)
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail=f"Checkpoint '{phase}' not found")
-    engine = _get_engine(slug)
-    engine.accumulator = restored_acc
-    engine._tool_handler._acc = restored_acc
-    engine._state["phase"] = phase.split("_", 1)[-1] if "_" in phase else phase
-    engine._history = engine._load_history_from_checkpoints()
-    render_all(project_path, restored_acc)
-    engine._save_accumulator()
-    logger.info(
-        "devkit.conversation.checkpoint_restored",
-        extra={
-            "operation": "conversation.checkpoint_restore",
-            "status": "success",
-            "slug": slug,
-            "phase": phase,
-        },
-    )
-    return {"restored": phase, "summary": summary}
-
-
-@app.get("/api/projects/{slug}/checkpoints/{phase}/preview")
-def preview_checkpoint(slug: str, phase: str) -> list[dict]:
-    """Return what configs would look like after restoring a checkpoint, without restoring.
-
-    Loads the checkpoint accumulator from disk and returns a list of
-    ``{block, status, content}`` dicts — the same shape as
-    ``GET /api/projects/{slug}/configs`` — so the frontend can diff the
-    current state against the checkpoint before committing to a restore.
+    Reads ``_meta/history.jsonl`` directly.
 
     Args:
         slug: Project slug.
-        phase: Checkpoint phase directory name, e.g. ``01_overview``.
 
     Returns:
-        List of dicts with ``block``, ``status``, and ``content`` keys.
+        Ordered list of ``{role, content}`` dicts (oldest first). Empty if
+        no history has been recorded yet.
 
     Raises:
-        HTTPException: 404 if the checkpoint directory does not exist.
+        HTTPException 404: If the project directory does not exist.
     """
     project_path = _get_project_path(slug)
-    cp_dir = project_path / "_meta" / "checkpoints" / phase
-    if not cp_dir.exists():
-        raise HTTPException(status_code=404, detail=f"Checkpoint '{phase}' not found")
-
-    acc_file = cp_dir / "accumulator.json"
-    try:
-        acc = ConfigAccumulator.from_dict(json.loads(acc_file.read_text()))
-    except (FileNotFoundError, json.JSONDecodeError) as exc:
-        logger.error(
-            "checkpoint_preview_corrupt",
-            extra={"operation": "preview_checkpoint", "status": "failure", "error": str(exc), "latency_ms": 0},
-            exc_info=True,
-        )
-        raise HTTPException(status_code=404, detail=f"Checkpoint '{phase}' accumulator unreadable") from exc
-
-    result = []
-    for block in BLOCKS:
-        data = acc.get_block(block)
-        content = yaml.dump(data, allow_unicode=True, default_flow_style=False) if data else ""
-        result.append({
-            "block": block,
-            "status": acc.get_status(block).value,
-            "content": content,
-        })
-    return result
+    if not project_path.exists():
+        raise HTTPException(status_code=404, detail=f"Project '{slug}' not found")
+    entries = load_history(project_path)
+    return [{"role": e.role, "content": e.content} for e in entries]
 
 
 # ---------------------------------------------------------------------------
@@ -713,16 +1206,50 @@ def preview_checkpoint(slug: str, phase: str) -> list[dict]:
 
 @app.get("/api/projects/{slug}/configs")
 def get_configs(slug: str) -> list[dict]:
-    """Return all 7 config files with their status."""
-    engine = _get_engine(slug)
-    result = []
+    """Return all 7 config blocks with their completion status and on-disk YAML content.
+
+    Status is derived from ``field_status.json`` via ``all_block_statuses``; no
+    accumulator load is required for this endpoint.  Content is the raw
+    on-disk YAML text so the UI can display exactly what will be deployed.
+
+    Args:
+        slug: Project slug.
+
+    Returns:
+        List of ``{block, status, content}`` dicts, one per block.
+
+    Raises:
+        HTTPException: 404 if the project does not exist.
+        HTTPException: 500 if ``field_status.json`` contains corrupt data.
+    """
+    _load_project_meta(slug)  # raises 404 if project not found
     project_path = _get_project_path(slug)
+    meta_dir = project_path / "_meta"
+    try:
+        field_status = load_field_status(meta_dir / "field_status.json")
+    except ValueError as exc:
+        logger.error(
+            "devkit.project.state_corrupt",
+            extra={
+                "operation": "api.get_configs",
+                "status": "failure",
+                "error": str(exc),
+                "slug": slug,
+            },
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Corrupt field_status.json for '{slug}': {exc}",
+        )
+    statuses = all_block_statuses(field_status)
+    result = []
     for block in BLOCKS:
         config_file = project_path / f"{block}.yaml"
         content = config_file.read_text() if config_file.exists() else ""
         result.append({
             "block": block,
-            "status": engine.accumulator.get_status(block).value,
+            "status": statuses[block],
             "content": content,
         })
     return result
@@ -731,6 +1258,10 @@ def get_configs(slug: str) -> list[dict]:
 @app.get("/api/projects/{slug}/configs/export")
 def export_configs(slug: str):
     """Return all config YAML files for a project as a ZIP archive.
+
+    Reads on-disk YAML files directly — the on-disk files are the source of
+    truth that operators want to export and deploy, not the in-memory
+    accumulator dict which may differ from what was last rendered.
 
     Args:
         slug: Project identifier.
@@ -766,74 +1297,224 @@ def export_configs(slug: str):
 
 @app.get("/api/projects/{slug}/configs/{block}")
 def get_config(slug: str, block: str) -> dict:
-    """Return a single block config."""
+    """Return a single block's on-disk YAML content and completion status.
+
+    Args:
+        slug: Project slug.
+        block: Block name — must be one of the 7 standard DPG blocks.
+
+    Returns:
+        Dict with ``block``, ``status`` (``"complete"`` or ``"incomplete"``),
+        and ``content`` (raw YAML text, or ``""`` if the file does not exist).
+
+    Raises:
+        HTTPException: 400 if ``block`` is not a known block name.
+        HTTPException: 404 if the project does not exist.
+        HTTPException: 500 if ``field_status.json`` contains corrupt data.
+    """
     if block not in BLOCKS:
         raise HTTPException(status_code=400, detail=f"Unknown block: {block}")
+    _load_project_meta(slug)  # raises 404 if project not found
     project_path = _get_project_path(slug)
+    meta_dir = project_path / "_meta"
     config_file = project_path / f"{block}.yaml"
     content = config_file.read_text() if config_file.exists() else ""
-    engine = _get_engine(slug)
-    return {"block": block, "status": engine.accumulator.get_status(block).value, "content": content}
+    try:
+        field_status = load_field_status(meta_dir / "field_status.json")
+    except ValueError as exc:
+        logger.error(
+            "devkit.project.state_corrupt",
+            extra={
+                "operation": "api.get_config",
+                "status": "failure",
+                "error": str(exc),
+                "slug": slug,
+            },
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Corrupt field_status.json for '{slug}': {exc}",
+        )
+    status = block_completion_status(block, field_status)
+    return {"block": block, "status": status, "content": content}
 
 
 @app.put("/api/projects/{slug}/configs/{block}")
 def update_config_file(slug: str, block: str, body: UpdateConfigRequest) -> dict:
-    """Manually update a config file and reverse-sync the accumulator.
+    """Write operator-supplied YAML to disk and reverse-sync the accumulator.
 
-    Parses YAML before writing to prevent corrupting the stored file.
-    If schema validation fails, sets the block status to STALE.
+    Parses YAML before writing to reject malformed content early.  Does NOT
+    modify ``field_status.json`` — this is an out-of-band editor action, not
+    a wizard turn; field completion state is unchanged (Session 5, note #2).
+
+    Args:
+        slug: Project slug.
+        block: Block name — must be one of the 7 standard DPG blocks.
+        body: Request body containing the raw YAML string.
+
+    Returns:
+        Dict with ``block``, ``status`` (derived from field_status), and
+        ``validation_errors`` (list of strings from the mirror-schema check).
+
+    Raises:
+        HTTPException: 400 if ``block`` is unknown or if the YAML is malformed.
+        HTTPException: 404 if the project does not exist.
+        HTTPException: 500 if ``accumulator.json`` or ``field_status.json``
+            is corrupt.
     """
     if block not in BLOCKS:
         raise HTTPException(status_code=400, detail=f"Unknown block: {block}")
-    from dev_kit.agent.accumulator import ConfigStatus, DRAFT_BLOCKS
-    # Parse before writing — reject invalid YAML with 400
+    _load_project_meta(slug)  # raises 404 if project not found
+
+    # Parse before writing — reject invalid YAML with 400.
     try:
         parsed = yaml.safe_load(body.content) or {}
     except yaml.YAMLError as exc:
         raise HTTPException(status_code=400, detail=f"Invalid YAML: {exc}") from exc
 
     project_path = _get_project_path(slug)
+    meta_dir = project_path / "_meta"
     config_file = project_path / f"{block}.yaml"
+
+    # Write the raw YAML text to disk (preserves user formatting + comments).
     config_file.write_text(body.content)
 
-    engine = _get_engine(slug)
-    engine.accumulator._data[block] = parsed
+    # Load, update, and persist the accumulator.
+    try:
+        accumulator = load_accumulator(meta_dir / "accumulator.json")
+    except ValueError as exc:
+        logger.error(
+            "devkit.project.state_corrupt",
+            extra={"operation": "api.update_config_file", "status": "failure",
+                   "error": str(exc), "slug": slug},
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Corrupt accumulator.json for '{slug}': {exc}",
+        )
+    accumulator[block] = parsed
+    _save_accumulator_path(meta_dir / "accumulator.json", accumulator)
+
+    # Validate against the mirror schema (does NOT touch field_status).
     errors = validate_partial(block, parsed)
-    if errors:
-        engine.accumulator.set_status(block, ConfigStatus.STALE)
-    elif block in DRAFT_BLOCKS:
-        engine.accumulator.set_status(block, ConfigStatus.DRAFT)
-    else:
-        engine.accumulator.set_status(block, ConfigStatus.COMPLETE)
-    engine._save_accumulator()
-    return {"block": block, "status": engine.accumulator.get_status(block).value, "validation_errors": errors}
+
+    # Derive status from field_status only (not from validation result).
+    try:
+        field_status = load_field_status(meta_dir / "field_status.json")
+    except ValueError as exc:
+        logger.error(
+            "devkit.project.state_corrupt",
+            extra={
+                "operation": "api.update_config_file",
+                "status": "failure",
+                "error": str(exc),
+                "slug": slug,
+            },
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Corrupt field_status.json for '{slug}': {exc}",
+        )
+    status = block_completion_status(block, field_status)
+
+    return {"block": block, "status": status, "validation_errors": errors}
 
 
 @app.post("/api/projects/{slug}/configs/reload")
 def reload_configs(slug: str) -> dict[str, Any]:
-    """Evict the cached engine so the next request reloads all configs from disk.
+    """Repopulate the accumulator from on-disk YAML files.
 
-    Useful after the operator hand-edits a YAML file outside the UI (e.g. in
-    their editor or via git pull). The engine is recreated on the next request,
-    picking up the new on-disk state.
+    Reads each block's ``.yaml`` file from disk via ``load_block_from_file``
+    and writes a fresh ``accumulator.json``.  Useful after the operator
+    hand-edits YAML files outside the UI (e.g. via an editor or ``git pull``).
 
     Args:
         slug: Project slug.
 
     Returns:
-        Dict confirming the engine was evicted.
+        Dict with ``reloaded`` (``True``), ``slug``, and ``block_statuses``
+        (``{block_name: "complete"|"incomplete"}`` for all 7 blocks).
+
+    Raises:
+        HTTPException: 404 if the project does not exist.
+        HTTPException: 500 if ``field_status.json`` contains corrupt data.
     """
-    _engines.pop(slug, None)
-    return {"reloaded": True, "slug": slug}
+    _load_project_meta(slug)  # raises 404 if project not found
+    project_path = _get_project_path(slug)
+    meta_dir = project_path / "_meta"
+
+    # Rebuild the accumulator from on-disk YAML files.
+    accumulator = empty_accumulator()
+    for block in BLOCKS:
+        accumulator[block] = load_block_from_file(project_path, block)
+    _save_accumulator_path(meta_dir / "accumulator.json", accumulator)
+
+    try:
+        field_status = load_field_status(meta_dir / "field_status.json")
+    except ValueError as exc:
+        logger.error(
+            "devkit.project.state_corrupt",
+            extra={
+                "operation": "api.reload_configs",
+                "status": "failure",
+                "error": str(exc),
+                "slug": slug,
+            },
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Corrupt field_status.json for '{slug}': {exc}",
+        )
+    return {
+        "reloaded": True,
+        "slug": slug,
+        "block_statuses": all_block_statuses(field_status),
+    }
 
 
 @app.post("/api/projects/{slug}/configs/validate")
 def validate_all_configs(slug: str) -> dict[str, Any]:
-    """Run partial validation on all 7 configs and return results."""
-    engine = _get_engine(slug)
+    """Run partial mirror-schema validation on all 7 blocks.
+
+    Loads the accumulator from disk and runs ``validate_partial`` against each
+    block's dev-kit mirror schema.  Does not run the full runtime Pydantic
+    validation (use ``POST /deploy/validate`` for that).
+
+    Args:
+        slug: Project slug.
+
+    Returns:
+        Dict mapping each block name to ``{"valid": bool, "errors": list[str]}``.
+
+    Raises:
+        HTTPException: 404 if the project does not exist.
+        HTTPException: 500 if ``accumulator.json`` is corrupt.
+    """
+    _load_project_meta(slug)  # raises 404 if project not found
+    project_path = _get_project_path(slug)
+    meta_dir = project_path / "_meta"
+
+    try:
+        accumulator = load_accumulator(meta_dir / "accumulator.json")
+    except ValueError as exc:
+        logger.error(
+            "devkit.project.state_corrupt",
+            extra={"operation": "api.validate_all_configs", "status": "failure",
+                   "error": str(exc), "slug": slug},
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Corrupt accumulator.json for '{slug}': {exc}",
+        )
+
     results = {}
     for block in BLOCKS:
-        data = engine.accumulator.get_block(block)
+        data = accumulator.get(block, {})
         errors = validate_partial(block, data)
         results[block] = {"valid": len(errors) == 0, "errors": errors}
     return results
@@ -843,64 +1524,180 @@ def validate_all_configs(slug: str) -> dict[str, Any]:
 def pre_deploy_validate(slug: str) -> dict[str, Any]:
     """Run full merged-config validation and cross-block invariant checks.
 
-    Merges DPG defaults + domain config for each of the 7 blocks, runs the
-    full Pydantic model (not partial), then checks cross-block invariants
-    such as tool-name integrity and intent-filter coverage.
+    Validation strategy (two modes):
+
+    - **Docker (canonical):** Validates against the baked runtime
+      schemas at ``/app/dpg_runtime_schemas/<block>/config.py`` —
+      verbatim copies of each runtime block's ``MergedConfig``, baked
+      into the image at the same ``GIT_SHA`` as the runtime services.
+      A pass here means the runtime service will accept the same config
+      at boot; a failure surfaces exactly the runtime error.
+    - **Host (graceful fallback):** Validates against the per-block
+      mirror schemas at ``dev_kit/schemas/domain/<block>.py`` via
+      ``validate_full`` (strict — required-field errors not filtered).
+      The mirrors do not know about DPG framework defaults, so they
+      may over- or under-reject in places; the canonical answer is
+      always the Docker-mode gate above. Operators running the
+      wizard on the host should rebuild the dev-kit image to get
+      authoritative validation before deploy.
+
+    Cross-block invariants (tool-name integrity, intent-filter
+    coverage, etc.) run in both modes — they're enforced by
+    ``dev_kit.schemas.cross_block_validation``.
 
     Args:
         slug: Project slug.
 
     Returns:
-        Dict with ``valid`` bool, ``block_errors`` per-block Pydantic errors,
-        and ``invariant_errors`` list of cross-block rule violations.
+        Dict with ``valid`` bool, ``block_errors`` per-block error
+        list, ``invariant_errors`` list of cross-block rule violations,
+        ``merged_configs`` for display, and ``validator`` indicating
+        which gate ran (``"runtime_baked"`` or ``"host_mirror"``).
     """
     from dev_kit.loader import _load_and_merge
-    from dev_kit.schema import (
-        AgentCoreConfig, KnowledgeEngineConfig, TrustLayerConfig,
-        MemoryLayerConfig, ObservabilityLayerConfig, ActionGatewayConfig,
-        ReachLayerConfig,
-    )
+    from dev_kit.agent.renderer import RUNTIME_SCHEMAS, runtime_validate
+    from dev_kit.agent.errors import RuntimeValidationError
     from pydantic import ValidationError as _VE
 
-    _MODELS = {
-        "agent_core": AgentCoreConfig,
-        "knowledge_engine": KnowledgeEngineConfig,
-        "trust_layer": TrustLayerConfig,
-        "memory_layer": MemoryLayerConfig,
-        "observability_layer": ObservabilityLayerConfig,
-        "action_gateway": ActionGatewayConfig,
-        "reach_layer": ReachLayerConfig,
-    }
+    _BLOCKS = (
+        "agent_core", "knowledge_engine", "trust_layer", "memory_layer",
+        "observability_layer", "action_gateway", "reach_layer",
+    )
+    docker_mode = RUNTIME_SCHEMAS is not None
+
+    # Host fallback uses dev_kit/schema.py — a hand-maintained flat-file
+    # copy that models BOTH halves (framework defaults + domain values)
+    # of every block's merged config. The per-block mirror schemas at
+    # dev_kit/schemas/domain/<block>.py only cover the domain half by
+    # design, so they would over-reject the framework-default sections
+    # (server, ke_client, redis, otel, etc.) every merged config carries.
+    # Drift between dev_kit/schema.py and the actual runtime is what the
+    # sync rule discipline (.claude/rules/runtime-devkit-sync.md) prevents.
+    _HOST_MODELS: dict[str, Any] = {}
+    if not docker_mode:
+        from dev_kit.schema import (
+            ActionGatewayConfig,
+            AgentCoreConfig,
+            KnowledgeEngineConfig,
+            MemoryLayerConfig,
+            ObservabilityLayerConfig,
+            ReachLayerConfig,
+            TrustLayerConfig,
+        )
+        _HOST_MODELS = {
+            "agent_core": AgentCoreConfig,
+            "knowledge_engine": KnowledgeEngineConfig,
+            "trust_layer": TrustLayerConfig,
+            "memory_layer": MemoryLayerConfig,
+            "observability_layer": ObservabilityLayerConfig,
+            "action_gateway": ActionGatewayConfig,
+            "reach_layer": ReachLayerConfig,
+        }
 
     import copy as _copy
     block_errors: dict[str, list[str]] = {}
     merged: dict[str, dict] = {}
 
-    selected_channels = _get_engine(slug).accumulator.get_reach_channel_selection_or_default()
+    # Prefer IntakeState (new wizard); fall back to accumulator for projects that
+    # pre-date the deterministic wizard and don't have intake_state.json yet.
+    _intake_path = CONFIGS_DIR / slug / "_meta" / "intake_state.json"
+    _intake: IntakeState | None = None
+    try:
+        _intake = load_intake_state(_intake_path)
+        selected_channels = list(_intake.selected_channels)
+    except FileNotFoundError:
+        try:
+            legacy_acc = load_accumulator(CONFIGS_DIR / slug / "_meta" / "accumulator.json")
+        except ValueError as exc:
+            logger.error(
+                "devkit.deploy.accumulator_corrupt",
+                extra={
+                    "operation": "api.deploy_validate",
+                    "status": "failure",
+                    "error": str(exc),
+                    "slug": slug,
+                },
+                exc_info=True,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail=f"Corrupt accumulator.json for '{slug}': {exc}",
+            ) from exc
+        selected_channels = _reach_channels_from_accumulator(legacy_acc)
 
-    # 1. Full Pydantic validation per block using merged (dpg + domain) config.
-    for block, model_cls in _MODELS.items():
+    # Decide which blocks would actually be deployed. The compose
+    # generator drops ``knowledge_engine`` when ``has_kb=false`` and
+    # ``action_gateway`` when ``has_external_tools=false`` (see
+    # ``services_to_remove`` in the deploy/preview path). Validating
+    # the YAML for a block that will never be deployed produces noise
+    # — e.g. ``knowledge.blocks.static_knowledge_base.collection_name:
+    # Field required`` on a poem bot that never wired a KB. Mirror the
+    # selective-deploy logic here. The legacy accumulator-only branch
+    # has no intake flags to read; default to validating everything
+    # (safe conservative behaviour).
+    skipped_blocks: dict[str, str] = {}
+    if _intake is not None:
+        if not _intake.has_kb:
+            skipped_blocks["knowledge_engine"] = (
+                "has_kb=false — Knowledge Engine is not deployed for this project."
+            )
+        if not _intake.has_external_tools:
+            skipped_blocks["action_gateway"] = (
+                "has_external_tools=false — Action Gateway is not deployed for this project."
+            )
+
+    # 1. Per-block validation.
+    for block in _BLOCKS:
+        if block in skipped_blocks:
+            # Selective-deploy: this block's service is not in the
+            # compose generated for this project. The compose
+            # generator drops it; validating its YAML would surface
+            # spurious "required field" errors for sections the
+            # runtime never sees. Mark as no-errors + leave
+            # ``merged`` empty so it doesn't appear in display_merged.
+            block_errors[block] = []
+            merged[block] = {}
+            continue
         try:
             data = _load_and_merge(slug, block)
             merged[block] = data  # store original for display in merged_configs
             if block == "reach_layer":
                 # Deep-copy before patching so merged[block] retains the full
                 # config (shown to the user) while validation sees the patched copy.
-                # Null out channels that won't be deployed so Pydantic skips
+                # Null out channels that won't be deployed so the schema skips
                 # their required fields (e.g. voice raya.stt_language).
-                # ChannelsConfig already declares each channel as Optional.
                 data = _copy.deepcopy(data)
                 channels = (data.get("reach_layer") or {}).get("channels") or {}
                 for ch in ("voice", "cli", "web"):
                     if ch not in selected_channels and ch in channels:
                         channels[ch] = None
-            model_cls.model_validate(data)
-            block_errors[block] = []
-        except _VE as exc:
-            block_errors[block] = [
-                f"{'.'.join(str(loc) for loc in err['loc'])}: {err['msg']}"
-                for err in exc.errors()
-            ]
+
+            if docker_mode and block in RUNTIME_SCHEMAS:
+                try:
+                    runtime_validate(block, data)
+                    block_errors[block] = []
+                except RuntimeValidationError as exc:
+                    pe = exc.pydantic_error
+                    if hasattr(pe, "errors") and callable(pe.errors):
+                        block_errors[block] = [
+                            f"{'.'.join(str(loc) for loc in err['loc'])}: {err['msg']}"
+                            for err in pe.errors()
+                        ]
+                    else:
+                        block_errors[block] = [str(pe)]
+            else:
+                model_cls = _HOST_MODELS.get(block)
+                if model_cls is None:
+                    block_errors[block] = []
+                    continue
+                try:
+                    model_cls.model_validate(data)
+                    block_errors[block] = []
+                except _VE as exc:
+                    block_errors[block] = [
+                        f"{'.'.join(str(loc) for loc in err['loc'])}: {err['msg']}"
+                        for err in exc.errors()
+                    ]
         except FileNotFoundError:
             merged[block] = {}
             block_errors[block] = []
@@ -912,16 +1709,22 @@ def pre_deploy_validate(slug: str) -> dict[str, Any]:
     # the LLM tool loop (set_phase) and at this deploy-time safety net.
     from dev_kit.schemas.cross_block_validation import validate_cross_block
 
-    selected_channels = _get_engine(slug).accumulator.get_reach_channel_selection_or_default()
+    # Re-use the same selected_channels resolved above (IntakeState or accumulator fallback).
     invariant_errors: list[str] = validate_cross_block(merged, selected_channels)
 
     all_valid = all(len(errs) == 0 for errs in block_errors.values()) and not invariant_errors
 
     issue_count = sum(len(errs) for errs in block_errors.values()) + len(invariant_errors)
+    validator = "runtime_baked" if docker_mode else "host_mirror"
     if all_valid:
         logger.info(
             "devkit.deploy.validation_passed",
-            extra={"operation": "api.deploy_validate", "status": "success", "slug": slug},
+            extra={
+                "operation": "api.deploy_validate",
+                "status": "success",
+                "slug": slug,
+                "validator": validator,
+            },
         )
     else:
         logger.warning(
@@ -931,6 +1734,7 @@ def pre_deploy_validate(slug: str) -> dict[str, Any]:
                 "status": "failure",
                 "slug": slug,
                 "issues": issue_count,
+                "validator": validator,
             },
         )
 
@@ -953,6 +1757,14 @@ def pre_deploy_validate(slug: str) -> dict[str, Any]:
         "block_errors": block_errors,
         "invariant_errors": invariant_errors,
         "merged_configs": display_merged,
+        "validator": validator,
+        # Map of {block_name: human-readable reason}. Blocks listed
+        # here were skipped from validation because the selective-
+        # deploy logic (see ``services_to_remove`` in deploy/preview)
+        # drops them from the compose for this project. The frontend
+        # can render this as "Validation skipped — service not
+        # deployed" on the Config Review screen.
+        "skipped_blocks": skipped_blocks,
     }
 
 
@@ -963,9 +1775,229 @@ def pre_deploy_validate(slug: str) -> dict[str, Any]:
 
 @app.get("/api/projects/{slug}/workflow/graph")
 def get_workflow_graph(slug: str) -> dict:
-    """Return the subagent workflow as nodes and edges for the frontend graph."""
-    engine = _get_engine(slug)
-    return engine.accumulator.get_workflow_graph()
+    """Return the subagent workflow as nodes and edges for the frontend graph.
+
+    Reads the accumulator from disk and builds the workflow graph from the
+    ``agent_core.agent_workflow.subagents`` list.
+
+    Args:
+        slug: Project slug.
+
+    Returns:
+        Dict with ``nodes`` (list of ``{id, name, type}``) and
+        ``edges`` (list of ``{from, to, intent}``).
+
+    Raises:
+        HTTPException 404: If the project does not exist.
+        HTTPException 500: If ``accumulator.json`` is corrupt.
+    """
+    _load_project_meta(slug)  # raises 404 if project not found
+    meta_dir = _get_project_path(slug) / "_meta"
+    try:
+        accumulator = load_accumulator(meta_dir / "accumulator.json")
+    except ValueError as exc:
+        logger.error(
+            "devkit.workflow_graph.accumulator_corrupt",
+            extra={
+                "operation": "api.get_workflow_graph",
+                "status": "failure",
+                "error": str(exc),
+                "slug": slug,
+            },
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Corrupt accumulator.json for '{slug}': {exc}",
+        ) from exc
+    return _workflow_graph(accumulator)
+
+
+# ---------------------------------------------------------------------------
+# Deploy-fields routes (Task 11.2)
+# ---------------------------------------------------------------------------
+
+
+class DeploySettingsRequest(BaseModel):
+    """Request body for POST /api/projects/{slug}/deploy-settings."""
+
+    overrides: dict[str, Any] = {}
+
+
+@app.get("/api/projects/{slug}/deploy-fields")
+def get_deploy_fields(slug: str) -> dict:
+    """Return every field with category=='deploy' or deploy_overridable==True.
+
+    For each matching entry in AGGREGATED_FIELD_RULES, returns its path, the
+    rule's default, the current value from the accumulator (if any), and
+    display metadata.  The accumulator is consulted so that values already
+    captured during chat are pre-filled in the deploy form.
+
+    Args:
+        slug: Project slug.
+
+    Returns:
+        Dict with ``fields`` list. Each entry has keys:
+            ``path`` (dotted block-prefixed path),
+            ``default`` (rule default or None),
+            ``current_value`` (from accumulator or rule default),
+            ``description`` (human-readable description or ``""``),
+            ``advanced`` (bool).
+
+    Raises:
+        HTTPException: 404 if the project does not exist.
+        HTTPException: 500 if ``accumulator.json`` is corrupt.
+    """
+    from dev_kit.agent.field_rules import AGGREGATED_FIELD_RULES
+
+    _load_project_meta(slug)  # raises 404 if project not found
+    meta_dir = _get_project_path(slug) / "_meta"
+    try:
+        accumulator = load_accumulator(meta_dir / "accumulator.json")
+    except ValueError as exc:
+        logger.error(
+            "devkit.deploy_fields.accumulator_corrupt",
+            extra={
+                "operation": "api.get_deploy_fields",
+                "status": "failure",
+                "error": str(exc),
+                "slug": slug,
+            },
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Corrupt accumulator.json for '{slug}': {exc}",
+        ) from exc
+
+    fields = []
+    for path, rule in AGGREGATED_FIELD_RULES.items():
+        if rule.category != "deploy" and not rule.deploy_overridable:
+            continue
+        # Resolve current value from accumulator using the block-prefixed path.
+        # Path format: "<block>.<section>.<field>"
+        parts = path.split(".", 1)
+        block = parts[0]
+        field_path = parts[1] if len(parts) > 1 else ""
+        block_data = accumulator.get(block, {}) or {}
+        # Walk nested keys using dot notation.
+        current_val: Any = block_data
+        for key in field_path.split("."):
+            if isinstance(current_val, dict):
+                current_val = current_val.get(key)
+            else:
+                current_val = None
+                break
+        fields.append({
+            "path": path,
+            "default": rule.default,
+            "current_value": current_val if current_val is not None else rule.default,
+            "description": rule.description or "",
+            "advanced": rule.advanced,
+        })
+
+    logger.info(
+        "devkit.deploy_fields.listed",
+        extra={
+            "operation": "api.get_deploy_fields",
+            "status": "success",
+            "slug": slug,
+            "count": len(fields),
+        },
+    )
+    return {"fields": fields}
+
+
+@app.post("/api/projects/{slug}/deploy-settings")
+def save_deploy_settings(slug: str, body: DeploySettingsRequest) -> dict:
+    """Persist operator deploy-time overrides for a project.
+
+    Writes the overrides dict to ``<project_path>/_meta/deploy_settings.json``
+    so they can be applied at deploy time without altering the generated YAML
+    configs.
+
+    Args:
+        slug: Project slug.
+        body: DeploySettingsRequest with ``overrides`` mapping dotted field
+            paths to their operator-supplied values.
+
+    Returns:
+        Dict with ``status: "saved"`` and the number of overrides persisted.
+
+    Raises:
+        HTTPException: 404 if the project does not exist.
+    """
+    _load_project_meta(slug)  # raises 404 if project not found
+    project_path = _get_project_path(slug)
+    settings_path = project_path / "_meta" / "deploy_settings.json"
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    settings_path.write_text(
+        json.dumps(body.overrides, indent=2, ensure_ascii=False, sort_keys=True)
+    )
+    logger.info(
+        "devkit.deploy_settings.saved",
+        extra={
+            "operation": "api.save_deploy_settings",
+            "status": "success",
+            "slug": slug,
+            "override_count": len(body.overrides),
+        },
+    )
+    return {"status": "saved", "override_count": len(body.overrides)}
+
+
+# ---------------------------------------------------------------------------
+# Field-status route (Task 11.3)
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/projects/{slug}/field-status")
+def get_field_status(slug: str) -> dict:
+    """Return the contents of field_status.json for phase-progress display.
+
+    Reads ``<project_path>/_meta/field_status.json``.  Returns an empty dict
+    when the file is absent (project created but wizard not yet started).
+
+    Args:
+        slug: Project slug.
+
+    Returns:
+        Dict mapping dotted field paths to status strings
+        (``"pending"``, ``"answered"``, ``"needs_re_asking"``,
+        ``"not_applicable"``).
+
+    Raises:
+        HTTPException: 404 if the project does not exist.
+    """
+    _load_project_meta(slug)  # raises 404 if project not found
+    project_path = _get_project_path(slug)
+    try:
+        status = load_field_status(project_path / "_meta" / "field_status.json")
+    except ValueError as exc:
+        logger.error(
+            "devkit.project.state_corrupt",
+            extra={
+                "operation": "api.get_field_status",
+                "status": "failure",
+                "error": str(exc),
+                "slug": slug,
+            },
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Corrupt field_status.json for '{slug}': {exc}",
+        )
+    logger.info(
+        "devkit.field_status.read",
+        extra={
+            "operation": "api.get_field_status",
+            "status": "success",
+            "slug": slug,
+            "field_count": len(status),
+        },
+    )
+    return status
 
 
 # ---------------------------------------------------------------------------
@@ -1266,7 +2298,23 @@ async def get_deploy_preview(slug: str, body: dict) -> dict:
         # the preview matches exactly what _run_docker_deploy will deploy.
         # web is always deployed regardless of selection so the UI and ingest proxy
         # remain accessible; voice and cli are optional.
-        selected_channels = _get_engine(slug).accumulator.get_reach_channel_selection_or_default()
+        #
+        # Read IntakeState (new wizard). Projects created before the deterministic
+        # wizard don't have intake_state.json — raise 400 so the caller knows the
+        # project must be re-created rather than silently deploying a wrong compose.
+        _intake_path = CONFIGS_DIR / slug / "_meta" / "intake_state.json"
+        try:
+            _intake = load_intake_state(_intake_path)
+        except FileNotFoundError:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Project '{slug}' was created before the deterministic wizard "
+                    "and does not have an intake_state.json. "
+                    "Re-create the project through the new wizard to enable deployment."
+                ),
+            )
+        selected_channels = list(_intake.selected_channels)
         effective_channels = set(selected_channels) | {"web"}
         services_to_remove = {
             svc_name
@@ -1277,6 +2325,12 @@ async def get_deploy_preview(slug: str, body: dict) -> dict:
         # Remove it if voice is not selected.
         if "voice" not in effective_channels:
             services_to_remove.add("ngrok")
+        # Selective service inclusion driven by IntakeState (deterministic wizard).
+        # See docs/superpowers/specs/2026-05-13-devkit-deterministic-wizard-design.md §8.
+        if not _intake.has_kb:
+            services_to_remove.add("knowledge_engine")
+        if not _intake.has_external_tools:
+            services_to_remove.add("action_gateway")
         services_to_remove.add("dev_kit")
 
         import yaml as _yaml
@@ -1304,6 +2358,26 @@ async def get_deploy_preview(slug: str, body: dict) -> dict:
             if svc_name == "reach_layer_web":
                 web_mode = "full" if "web" in set(selected_channels) else "routing_only"
                 svc.setdefault("environment", []).append(f"REACH_LAYER_WEB_MODE={web_mode}")
+        # Strip depends_on references to removed services so docker compose doesn't
+        # complain about dangling dependencies. Both list-form and map-form supported.
+        for svc_name, svc in list(services.items()):
+            deps = svc.get("depends_on")
+            if not deps:
+                continue
+            if isinstance(deps, list):
+                filtered = [d for d in deps if d not in services_to_remove]
+                if filtered != deps:
+                    if filtered:
+                        svc["depends_on"] = filtered
+                    else:
+                        svc.pop("depends_on", None)
+            elif isinstance(deps, dict):
+                filtered_map = {k: v for k, v in deps.items() if k not in services_to_remove}
+                if filtered_map != deps:
+                    if filtered_map:
+                        svc["depends_on"] = filtered_map
+                    else:
+                        svc.pop("depends_on", None)
         # Mirror the deploy-time rewrite so the preview matches what the
         # actual deploy will write (and run) on the host.
         _rewrite_compose_bind_paths_to_host(services)
@@ -1543,12 +2617,32 @@ async def execute_deploy(slug: str, body: dict) -> dict:
         elif target == "docker":
             secrets["ke_devkit_callback_url"] = "http://host.docker.internal:8080"
 
-    # Mark all services as queued initially
+    # Load IntakeState once so we can filter the service list by the
+    # selective-deploy logic the compose generator uses (see
+    # ``services_to_remove`` further down in this function). Without
+    # this filter, ``knowledge_engine`` / ``action_gateway`` stay in
+    # ``state.services`` even when the compose drops them — the status
+    # endpoint then surfaces them as ``failed`` in the UI because the
+    # poll for an absent container falls through to the error path.
+    # Legacy projects without intake_state.json get the full unfiltered
+    # list (conservative — no flag info to drop from).
+    _deploy_intake_path = CONFIGS_DIR / slug / "_meta" / "intake_state.json"
+    try:
+        _deploy_intake = load_intake_state(_deploy_intake_path)
+    except FileNotFoundError:
+        _deploy_intake = None
+
+    # Mark all services as queued initially, filtered by selective-deploy.
     all_services = [
         "redis", "memgraph", "otel_collector", "jaeger", "prometheus", "loki", "grafana",
         "agent_core", "knowledge_engine", "memory_layer", "trust_layer",
         "action_gateway", "reach_layer", "observability_layer",
     ]
+    if _deploy_intake is not None:
+        if not _deploy_intake.has_kb:
+            all_services = [s for s in all_services if s != "knowledge_engine"]
+        if not _deploy_intake.has_external_tools:
+            all_services = [s for s in all_services if s != "action_gateway"]
     for svc in all_services:
         state.set_service(svc, "queued")
 
@@ -1557,8 +2651,25 @@ async def execute_deploy(slug: str, body: dict) -> dict:
         extra={"operation": "api.deploy_execute", "status": "start", "slug": slug, "target": target},
     )
     if target == "docker":
-        selected_channels = _get_engine(slug).accumulator.get_reach_channel_selection_or_default()
-        asyncio.create_task(_run_docker_deploy(slug, state, secrets, resources, selected_channels))
+        # Read IntakeState (new wizard). Projects created before the deterministic
+        # wizard don't have intake_state.json — raise 400 so the caller knows the
+        # project must be re-created rather than silently deploying a wrong compose.
+        _intake_path = CONFIGS_DIR / slug / "_meta" / "intake_state.json"
+        try:
+            _intake = load_intake_state(_intake_path)
+        except FileNotFoundError:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Project '{slug}' was created before the deterministic wizard "
+                    "and does not have an intake_state.json. "
+                    "Re-create the project through the new wizard to enable deployment."
+                ),
+            )
+        selected_channels = list(_intake.selected_channels)
+        asyncio.create_task(
+            _run_docker_deploy(slug, state, secrets, resources, selected_channels, _intake)
+        )
     else:
         kubeconfig_content = body.get("kubeconfig", "")
         namespace = body.get("namespace", "dpg")
@@ -1573,6 +2684,7 @@ async def _run_docker_deploy(
     secrets: dict,
     resources: dict,
     selected_channels: list[str] | None = None,
+    intake: "IntakeState | None" = None,
 ) -> None:
     """Background task: apply resources, resolve domain, and run docker compose up."""
     import tempfile
@@ -1623,6 +2735,12 @@ async def _run_docker_deploy(
         # Remove it if voice is not selected.
         if "voice" not in effective_channels:
             services_to_remove.add("ngrok")
+        # Selective service inclusion driven by IntakeState (deterministic wizard).
+        # See docs/superpowers/specs/2026-05-13-devkit-deterministic-wizard-design.md §8.
+        if intake is not None and not intake.has_kb:
+            services_to_remove.add("knowledge_engine")
+        if intake is not None and not intake.has_external_tools:
+            services_to_remove.add("action_gateway")
         # When deploying from the local dev-kit, exclude the Docker dev-kit service
         # to avoid port 8080 conflicts. The local process handles the UI + ingest proxy.
         services_to_remove.add("dev_kit")
@@ -1649,6 +2767,27 @@ async def _run_docker_deploy(
             if svc_name == "reach_layer_web":
                 web_mode = "full" if "web" in set(selected_channels) else "routing_only"
                 svc.setdefault("environment", []).append(f"REACH_LAYER_WEB_MODE={web_mode}")
+
+        # Strip depends_on references to removed services so docker compose doesn't
+        # complain about dangling dependencies. Both list-form and map-form supported.
+        for svc_name, svc in list(services.items()):
+            deps = svc.get("depends_on")
+            if not deps:
+                continue
+            if isinstance(deps, list):
+                filtered = [d for d in deps if d not in services_to_remove]
+                if filtered != deps:
+                    if filtered:
+                        svc["depends_on"] = filtered
+                    else:
+                        svc.pop("depends_on", None)
+            elif isinstance(deps, dict):
+                filtered_map = {k: v for k, v in deps.items() if k not in services_to_remove}
+                if filtered_map != deps:
+                    if filtered_map:
+                        svc["depends_on"] = filtered_map
+                    else:
+                        svc.pop("depends_on", None)
 
         _rewrite_compose_bind_paths_to_host(services)
         content = _yaml.dump(compose_doc, default_flow_style=False, sort_keys=False)
@@ -2701,6 +3840,38 @@ async def get_devkit_config():
             "poll_interval_seconds": _DEVKIT_CONFIG.polling.poll_interval_seconds,
             "poll_timeout_minutes": _DEVKIT_CONFIG.polling.poll_timeout_minutes,
         },
+    }
+
+
+@app.get("/api/enums")
+async def get_enums():
+    """Return the open enum values from `dev_kit/schemas/enums_config.yaml`.
+
+    Consumed by the React frontend so dropdowns (languages, providers,
+    models, voices) stay in sync with the source-of-truth YAML without
+    hardcoding the lists in JS.
+
+    Returns:
+        Dict with `providers`, `languages`, `anthropic_models`, `openai_models`,
+        `embedding_providers`, and `raya_voices` (list of {voice_id, language,
+        name} dicts).
+    """
+    from dev_kit.schemas.enums import (
+        ANTHROPIC_MODELS,
+        EMBEDDING_PROVIDERS,
+        LANGUAGES,
+        OPENAI_MODELS,
+        PROVIDERS,
+        RAYA_VOICES,
+    )
+
+    return {
+        "providers": list(PROVIDERS),
+        "languages": list(LANGUAGES),
+        "anthropic_models": list(ANTHROPIC_MODELS),
+        "openai_models": list(OPENAI_MODELS),
+        "embedding_providers": list(EMBEDDING_PROVIDERS),
+        "raya_voices": list(RAYA_VOICES),
     }
 
 

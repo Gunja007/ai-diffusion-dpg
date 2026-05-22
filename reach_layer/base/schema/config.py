@@ -76,6 +76,15 @@ class HttpClientConfig(BaseModel):
     timeout_s: float = Field(default=10.0, gt=0)
 
 
+class LearningClientConfig(BaseModel):
+    """Observability Layer learning-signal client — uses ms timeouts."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    endpoint: str
+    timeout_ms: int = Field(default=2000, gt=0)
+
+
 # ---------------------------------------------------------------------------
 # common
 # ---------------------------------------------------------------------------
@@ -94,6 +103,11 @@ class CommonConfig(BaseModel):
     memory_layer_client: HttpClientConfig = Field(
         default_factory=lambda: HttpClientConfig(
             endpoint="http://memory_layer:8002", timeout_s=10.0
+        )
+    )
+    learning_client: LearningClientConfig = Field(
+        default_factory=lambda: LearningClientConfig(
+            endpoint="http://observability_layer:8004", timeout_ms=2000
         )
     )
     observability: ObservabilityConfig = Field(default_factory=ObservabilityConfig)
@@ -344,13 +358,20 @@ class VoiceChannelConfig(BaseModel):
 
 
 class ChannelsConfig(BaseModel):
-    """All channel service configs."""
+    """All channel service configs.
+
+    Every channel is Optional so a deployment can omit any it doesn't
+    use. The dev-kit's pre-deploy validator sets the unselected channel
+    to ``None`` based on ``selected_channels``; with non-Optional
+    declarations the merged config would fail validation here even
+    though the runtime block for the missing channel was never started.
+    """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    cli: CliChannelConfig = Field(default_factory=CliChannelConfig)
-    web: WebChannelConfig = Field(default_factory=WebChannelConfig)
-    voice: VoiceChannelConfig = Field(default_factory=VoiceChannelConfig)
+    cli: Optional[CliChannelConfig] = None
+    web: Optional[WebChannelConfig] = None
+    voice: Optional[VoiceChannelConfig] = None
 
 
 class ReachLayerConfig(BaseModel):

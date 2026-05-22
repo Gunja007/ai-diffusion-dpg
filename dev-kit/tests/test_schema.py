@@ -138,9 +138,16 @@ class TestValidatePartialKeyCheck:
 
 
 class TestAgentConfig:
-    def test_required_models_must_be_present(self):
-        with pytest.raises(ValidationError):
-            AgentConfig()  # missing primary_model and fallback_model
+    def test_default_models_are_empty_strings(self):
+        # Runtime ``agent_core/src/schema/config.py:AgentConfig`` declares
+        # ``primary_model: str = ""`` and ``fallback_model: str = ""`` —
+        # not required at construction. The dev-kit flat-file copy
+        # previously over-required these; aligned with runtime so host
+        # validation accepts partial configs the runtime would accept.
+        cfg = AgentConfig()
+        assert cfg.primary_model == ""
+        assert cfg.fallback_model == ""
+        assert cfg.provider == "anthropic"
 
     def test_consent_fields_default_false_and_empty(self):
         cfg = AgentConfig(primary_model="claude-haiku-4-5-20251001", fallback_model="claude-haiku-4-5-20251001")
@@ -406,9 +413,16 @@ class TestAgentWorkflowConfig:
         assert wf.workflow_id == "test_flow"
         assert len(wf.subagents) == 2
 
-    def test_empty_subagents_rejected(self):
-        with pytest.raises(ValidationError):
-            AgentWorkflowConfig(workflow_id="x", version="1.0.0", subagents=[])
+    def test_empty_subagents_accepted(self):
+        # The runtime ``agent_core/src/schema/config.py:AgentWorkflowConfig``
+        # accepts ``subagents=[]`` so a partial config doesn't crash boot.
+        # The wizard's CROSS-block invariants catch the "must have at least
+        # one start subagent" rule via ``validate_cross_block``, not the
+        # per-block Pydantic shape. The old ``min_length=1`` here drifted
+        # from runtime and rejected legitimate partial drafts at host
+        # deploy review.
+        wf = AgentWorkflowConfig(workflow_id="x", version="1.0.0", subagents=[])
+        assert wf.subagents == []
 
     def test_workflow_id_required(self):
         data = self._make_minimal_workflow()

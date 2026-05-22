@@ -7,14 +7,45 @@ export default function ProjectList({ onOpen }) {
   const [projects, setProjects] = useState([])
   const [name, setName] = useState('')
   const [description, setDescription] = useState('')
+  const [selectedChannels, setSelectedChannels] = useState(['web'])
+  const [defaultLanguage, setDefaultLanguage] = useState('english')
+  const [supportedLanguages, setSupportedLanguages] = useState(['english'])
   const [creating, setCreating] = useState(false)
   const [error, setError] = useState(null)
   const [deletingSlug, setDeletingSlug] = useState(null)
   const [deleteModal, setDeleteModal] = useState(null)  // null | { slug, name }
+  // Language options sourced from /api/enums (dev_kit/schemas/enums_config.yaml).
+  // Falls back to a minimal local list so the form still renders if the API
+  // hasn't responded yet — the fallback gets replaced as soon as the fetch
+  // resolves and matches what the backend validators accept.
+  const [availableLanguages, setAvailableLanguages] = useState(['english'])
 
   useEffect(() => {
     api.listProjects().then(setProjects).catch(() => setProjects([]))
+    api.getEnums()
+      .then(d => {
+        if (Array.isArray(d?.languages) && d.languages.length > 0) {
+          setAvailableLanguages(d.languages)
+        }
+      })
+      .catch(() => { /* keep fallback */ })
   }, [])
+
+  // Toggle a language in `supported_languages`. Re-add `default_language`
+  // automatically if the user just unchecked it (it's always required).
+  function toggleSupportedLanguage(lang) {
+    setSupportedLanguages(prev => {
+      const next = prev.includes(lang) ? prev.filter(l => l !== lang) : prev.concat(lang)
+      return next.includes(defaultLanguage) ? next : next.concat(defaultLanguage)
+    })
+  }
+
+  // When the user changes the default language, make sure it's also in
+  // the supported list so the IntakeState invariant holds.
+  function handleDefaultLanguageChange(newDefault) {
+    setDefaultLanguage(newDefault)
+    setSupportedLanguages(prev => (prev.includes(newDefault) ? prev : prev.concat(newDefault)))
+  }
 
   async function handleCreate(e) {
     e.preventDefault()
@@ -22,10 +53,20 @@ export default function ProjectList({ onOpen }) {
     setCreating(true)
     setError(null)
     try {
-      const project = await api.createProject(name.trim(), description.trim())
+      const intakeFields = {
+        project_name: name.trim(),
+        domain_description: description.trim(),
+        selected_channels: selectedChannels,
+        default_language: defaultLanguage,
+        supported_languages: supportedLanguages,
+      }
+      const project = await api.createProject(name.trim(), description.trim(), intakeFields)
       setProjects(p => [...p, project])
       setName('')
       setDescription('')
+      setSelectedChannels(['web'])
+      setDefaultLanguage('english')
+      setSupportedLanguages(['english'])
       onOpen(project.slug)
     } catch (err) {
       setError(err.message)
@@ -90,6 +131,68 @@ export default function ProjectList({ onOpen }) {
             value={description}
             onChange={e => setDescription(e.target.value)}
           />
+          {/* New intake fields */}
+          <div className="flex flex-col gap-1">
+            <label className="text-xs text-gray-400">Channels</label>
+            <div className="flex gap-3">
+              {['web', 'voice'].map(ch => (
+                <label key={ch} className="flex items-center gap-1.5 text-sm cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={selectedChannels.includes(ch)}
+                    onChange={e => {
+                      if (e.target.checked) setSelectedChannels(selectedChannels.concat(ch))
+                      else setSelectedChannels(selectedChannels.filter(c => c !== ch))
+                    }}
+                    className="accent-blue-500"
+                  />
+                  {ch.charAt(0).toUpperCase() + ch.slice(1)}
+                </label>
+              ))}
+            </div>
+          </div>
+          <div className="flex flex-col gap-1">
+            <label className="text-xs text-gray-400">Default language</label>
+            <select
+              className="bg-gray-800 border border-gray-700 rounded-xl px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-blue-500"
+              value={defaultLanguage}
+              onChange={e => handleDefaultLanguageChange(e.target.value)}
+            >
+              {availableLanguages.map(lang => (
+                <option key={lang} value={lang}>{lang.charAt(0).toUpperCase() + lang.slice(1)}</option>
+              ))}
+            </select>
+          </div>
+          <div className="flex flex-col gap-1">
+            <label className="text-xs text-gray-400">
+              Supported languages{' '}
+              <span className="text-gray-500">(default language is always included)</span>
+            </label>
+            <div className="grid grid-cols-3 gap-x-3 gap-y-1.5 bg-gray-800/50 border border-gray-700 rounded-xl px-3 py-2.5">
+              {availableLanguages.map(lang => {
+                const checked = supportedLanguages.includes(lang)
+                const isDefault = lang === defaultLanguage
+                return (
+                  <label
+                    key={lang}
+                    className={`flex items-center gap-1.5 text-sm ${
+                      isDefault ? 'cursor-not-allowed opacity-60' : 'cursor-pointer'
+                    }`}
+                    title={isDefault ? 'Default language is always included' : ''}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={checked}
+                      disabled={isDefault}
+                      onChange={() => toggleSupportedLanguage(lang)}
+                      className="accent-blue-500"
+                    />
+                    {lang.charAt(0).toUpperCase() + lang.slice(1)}
+                  </label>
+                )
+              })}
+            </div>
+          </div>
           {error && (
             <p className="text-red-400 text-sm bg-red-950/40 border border-red-800 rounded-lg px-3 py-2">
               {error}
