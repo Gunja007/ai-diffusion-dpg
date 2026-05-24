@@ -182,6 +182,49 @@ def _render_body_template(template, values: dict):
     return template
 
 
+def _safe_response_text(response) -> str:
+    """Return ``response.text`` with a lossy fallback for undecodable bytes.
+
+    ``httpx.Response.text`` performs a charset decode and can raise
+    ``UnicodeDecodeError`` when the upstream sends bytes that don't match
+    its stated (or guessed) encoding. The adapter's no-raise contract
+    forbids letting that propagate out — so this helper guarantees a
+    ``str`` either way by falling back to ``content.decode(errors=...)``.
+    """
+    try:
+        return response.text or ""
+    except UnicodeDecodeError:
+        try:
+            return response.content.decode("utf-8", errors="replace")
+        except Exception:  # noqa: BLE001 — final fallback, never raise
+            return ""
+
+
+def _collect_template_placeholders(template) -> set[str]:
+    """Return the set of placeholder names referenced anywhere in a body template.
+
+    Walks the same dict/list/string structure as ``_render_body_template`` and
+    collects every ``{name}`` occurrence — both whole-value and embedded.
+    Used to detect when a template references session identifiers that the
+    caller did not supply, so the adapter can warn instead of silently
+    dropping the enclosing field.
+    """
+    found: set[str] = set()
+    if isinstance(template, dict):
+        for v in template.values():
+            found |= _collect_template_placeholders(v)
+    elif isinstance(template, list):
+        for item in template:
+            found |= _collect_template_placeholders(item)
+    elif isinstance(template, str):
+        whole = _WHOLE_PLACEHOLDER_RE.match(template)
+        if whole:
+            found.add(whole.group(1))
+        else:
+            found.update(_EMBEDDED_PLACEHOLDER_RE.findall(template))
+    return found
+
+
 def _apply_projection(result_dict: dict, projection: Optional[dict]):
     """Project a raw response dict into a slim LLM-visible shape.
 
@@ -267,11 +310,45 @@ class RestApiAdapter(ToolAdapter):
         secret_env = auth.get("secret_env")
         if secret_env:
             secret_val = os.environ.get(secret_env)
-            if secret_val is None:
+            # Treat unset AND empty-string env vars as missing — an exported
+            # but empty env var would otherwise silently produce a broken
+            # auth header at runtime that survives startup.
+            if not secret_val:
                 raise ValueError(
-                    f"Required auth env var '{secret_env}' is not set for adapter '{config.get('id')}'"
+                    f"Required auth env var '{secret_env}' is unset or empty "
+                    f"for adapter '{config.get('id')}'"
                 )
             self._auth_secret = secret_val
+
+        # extra_headers — generic block for additional static headers an
+        # upstream might require alongside the auth header (e.g. a tenant /
+        # organisation id). Each entry declares a header name + an env var
+        # whose value is sent as the header's value. Same env-var contract
+        # as auth.secret_env: missing/empty env at startup is a hard error.
+        # Collisions with the auth header are rejected at init (rather than
+        # silently shadowed at request time) so misconfigured YAML fails loud.
+        self._extra_headers: dict[str, str] = {}
+        for entry in config.get("extra_headers", []) or []:
+            header_name = entry.get("name", "").strip()
+            env_var = entry.get("secret_env", "").strip()
+            if not header_name or not env_var:
+                raise ValueError(
+                    f"extra_headers entry on adapter '{config.get('id')}' "
+                    f"requires both 'name' and 'secret_env'"
+                )
+            if self._auth_header and header_name.lower() == self._auth_header.lower():
+                raise ValueError(
+                    f"extra_headers entry '{header_name}' on adapter "
+                    f"'{config.get('id')}' collides with the auth header; "
+                    f"use auth.header / auth.secret_env instead"
+                )
+            header_val = os.environ.get(env_var)
+            if not header_val:
+                raise ValueError(
+                    f"Required extra_headers env var '{env_var}' is unset or empty "
+                    f"for adapter '{config.get('id')}'"
+                )
+            self._extra_headers[header_name] = header_val
 
         # Lazily-created HTTP client; replaced by patch.object in tests.
         self._http_client: httpx.AsyncClient = httpx.AsyncClient()
@@ -416,6 +493,11 @@ class RestApiAdapter(ToolAdapter):
             headers[self._auth_header] = self._auth_secret
         elif self._auth_type == "bearer" and self._auth_secret:
             headers["Authorization"] = f"Bearer {self._auth_secret}"
+        # Merge in extra static headers (e.g. tenant / org identifiers).
+        # extra_headers does NOT override auth (auth wins on key collision)
+        # so a misconfigured YAML can't accidentally clobber the auth header.
+        for h_name, h_val in self._extra_headers.items():
+            headers.setdefault(h_name, h_val)
 
         timeout_s = self._timeout_ms / 1000.0
 
@@ -460,7 +542,38 @@ class RestApiAdapter(ToolAdapter):
                 else:
                     body_template = endpoint.get("body_template")
                     if body_template is not None:
-                        rendered = _render_body_template(body_template, all_params)
+                        # Make session identifiers available to body
+                        # substitution alongside agent + static params,
+                        # mirroring how path templating already exposes them.
+                        # Lets a YAML write e.g. ``phoneNumber: "{user_id}"``
+                        # so the adapter injects the session identity
+                        # automatically and the LLM never has to know or
+                        # transcribe it (which it would otherwise emit as
+                        # a literal "{{session.user_id}}" placeholder).
+                        template_values = {
+                            "session_id": session_id or "",
+                            "user_id": user_id or "",
+                            **all_params,
+                        }
+                        # An empty session identity referenced by the template
+                        # silently drops the enclosing field — corrupting the
+                        # request body with no upward signal. Warn explicitly
+                        # so operators can distinguish "LLM omitted a field"
+                        # from "session lost identity mid-call".
+                        referenced = _collect_template_placeholders(body_template)
+                        for key in ("user_id", "session_id"):
+                            if key in referenced and not template_values[key]:
+                                logger.warning(
+                                    "body_template_missing_session_identity",
+                                    extra={
+                                        "operation": "RestApiAdapter.execute",
+                                        "status": "degraded",
+                                        "tool_name": tool_name,
+                                        "session_id": session_id,
+                                        "missing_placeholder": key,
+                                    },
+                                )
+                        rendered = _render_body_template(body_template, template_values)
                         body = {} if rendered is _DROP else rendered
                     else:
                         body = all_params
@@ -474,16 +587,17 @@ class RestApiAdapter(ToolAdapter):
                 http_span.set_attribute("http.status_code", response.status_code)
                 http_span.set_attribute("latency_ms", int((time.time() - http_start) * 1000))
 
+            debug_body = _safe_response_text(response)[:2000]
             logger.debug(
                 "rest_api_response tool=%s status=%s body=%s",
-                tool_name, response.status_code, response.text[:2000],
+                tool_name, response.status_code, debug_body,
                 extra={
                     "operation": "RestApiAdapter.execute",
                     "status": "received",
                     "tool_name": tool_name,
                     "session_id": session_id,
                     "status_code": response.status_code,
-                    "body": response.text[:2000],
+                    "body": debug_body,
                     "latency_ms": int((time.time() - http_start) * 1000),
                 },
             )
@@ -533,6 +647,28 @@ class RestApiAdapter(ToolAdapter):
 
         if response.is_error:
             error_msg = f"http_error: {response.status_code}"
+            # Capture the upstream body (capped) so the LLM can READ what
+            # actually went wrong — e.g. ``{"error":"INVALID_ITEM_STATE",
+            # "message":"Invalid item_state: must be >= 14"}`` — and re-ask
+            # the offending field instead of silently announcing success.
+            # Previously this body was logged only at DEBUG level and the
+            # tool_result content was an empty string, which Sonnet treats
+            # as a benign empty success.
+            #
+            # ``response.text`` can raise on undecodable bytes; the helper
+            # falls back to a lossy decode of the raw content so the
+            # adapter never breaks its no-raise contract on a weird
+            # upstream payload.
+            body_excerpt = _safe_response_text(response).strip()[: self._max_size_chars]
+            result_text = (
+                f"upstream returned HTTP {response.status_code}. "
+                f"response body: {body_excerpt}"
+            ) if body_excerpt else f"upstream returned HTTP {response.status_code} with empty body."
+            # NOTE: do NOT log the response body here — upstream 4xx bodies
+            # often echo submitted PII (phone numbers, age, names). The body
+            # still flows upward via ``result_text`` for the LLM and the
+            # Observability Layer's audit path; operator-visible logs must
+            # only carry the status code + error tag.
             logger.warning(
                 "rest_api_http_error",
                 extra={
@@ -542,6 +678,7 @@ class RestApiAdapter(ToolAdapter):
                     "tool_name": tool_name,
                     "session_id": session_id,
                     "latency_ms": latency_ms,
+                    "body_chars": len(body_excerpt),
                 },
             )
             return ToolResult(
@@ -550,6 +687,7 @@ class RestApiAdapter(ToolAdapter):
                 result={},
                 success=False,
                 error=error_msg,
+                result_text=result_text,
             )
 
         try:
