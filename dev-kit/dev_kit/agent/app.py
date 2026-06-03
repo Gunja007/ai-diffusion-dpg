@@ -72,13 +72,23 @@ _AUTOMATION = _DOCKER_AUTOMATION if _DOCKER_AUTOMATION.exists() else _REPO_ROOT 
 HELM_BASE = _AUTOMATION / "helm"
 COMPOSE_FILE = _AUTOMATION / "docker" / "docker-compose.dev.yml"
 
-_api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-if not _api_key:
+_anthropic_api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+_openai_api_key = os.environ.get("OPENAI_API_KEY", "")
+
+if not _anthropic_api_key and not _openai_api_key:
     raise EnvironmentError(
-        "ANTHROPIC_API_KEY environment variable is not set. "
-        "Set it before starting the server."
+        "Neither ANTHROPIC_API_KEY nor OPENAI_API_KEY environment variable is set. "
+        "Set at least one before starting the server."
     )
-_anthropic_client = anthropic.AsyncAnthropic(api_key=_api_key)
+
+_anthropic_client = None
+if _anthropic_api_key:
+    _anthropic_client = anthropic.AsyncAnthropic(api_key=_anthropic_api_key)
+
+_openai_client = None
+if _openai_api_key:
+    import openai
+    _openai_client = openai.AsyncOpenAI(api_key=_openai_api_key)
 
 logger = logging.getLogger(__name__)
 
@@ -506,73 +516,202 @@ def _load_project_meta(slug: str) -> dict:
 # Dev-kit LLM call builder (used by the migrated /chat endpoint)
 # ---------------------------------------------------------------------------
 
-_DEVKIT_MODEL = os.environ.get("DEVKIT_MODEL", "claude-haiku-4-5-20251001")
+_devkit_provider = os.environ.get("DEVKIT_PROVIDER", "").lower()
+if not _devkit_provider:
+    model_env = os.environ.get("DEVKIT_MODEL", "")
+    if model_env.startswith("gpt-") or model_env.startswith("o1-") or model_env.startswith("o3-"):
+        _devkit_provider = "openai"
+    elif model_env.startswith("claude-"):
+        _devkit_provider = "anthropic"
+    else:
+        if _openai_api_key and not _anthropic_api_key:
+            _devkit_provider = "openai"
+        else:
+            _devkit_provider = "anthropic"
+
+if _devkit_provider == "openai":
+    _DEVKIT_MODEL = os.environ.get("DEVKIT_MODEL", "gpt-4o-2024-08-06")
+else:
+    _DEVKIT_MODEL = os.environ.get("DEVKIT_MODEL", "claude-haiku-4-5-20251001")
+
 _DEVKIT_MAX_TOKENS = int(os.environ.get("DEVKIT_MAX_TOKENS", "4096"))
 
 
 def _build_devkit_llm_call():
     """Return a sync ``(system_prompt, messages) -> LLMResponse`` callable.
 
-    Each invocation builds a fresh sync Anthropic client (cheap), so the
+    Each invocation builds a fresh sync client (Anthropic or OpenAI), so the
     callable is safe to use under ``asyncio.to_thread`` from the chat handler.
-
-    The returned callable accepts the full Anthropic-format ``messages`` list
-    (text turns plus any ``tool_use``/``tool_result`` rounds for an in-turn
-    tool loop) and surfaces ``stop_reason`` and the model's raw content blocks
-    on the response so ``phase_driver.run_turn`` can echo them back on the
-    next loop iteration.
-
-    Returns:
-        A callable accepting ``(system_prompt, messages)`` and returning an
-        ``LLMResponse`` with text, tool_calls (each carrying the provider
-        ``tool_use_id``), raw_content, stop_reason, model, and token counts.
-
-    Raises:
-        anthropic.APIError: On Anthropic API failures (timeout, connection,
-            status error). Propagates from the inner ``_llm_call`` through
-            ``asyncio.to_thread`` to the chat handler's exception handler,
-            which logs and returns HTTP 500.
     """
     def _llm_call(system_prompt: str, messages: list[dict]) -> LLMResponse:
-        sync_client = anthropic.Anthropic()
-        response = sync_client.messages.create(
-            model=_DEVKIT_MODEL,
-            max_tokens=_DEVKIT_MAX_TOKENS,
-            system=system_prompt,
-            messages=messages,
-            tools=DEVKIT_TOOL_SCHEMAS,
-            timeout=30.0,
-        )
-        text_parts: list[str] = []
-        tool_calls: list[ToolCall] = []
-        raw_content: list[dict] = []
-        for block in response.content:
-            # Serialize each content block to the Anthropic message-format dict
-            # so phase_driver can echo it back verbatim as the assistant turn
-            # on the next tool-use loop iteration.
-            if hasattr(block, "model_dump"):
-                raw_content.append(block.model_dump())
-            block_type = getattr(block, "type", None)
-            if block_type == "text":
-                text_parts.append(block.text)
-            elif block_type == "tool_use":
-                tool_calls.append(
-                    ToolCall(
-                        name=block.name,
-                        args=dict(block.input),
-                        id=getattr(block, "id", None),
+        if _devkit_provider == "openai":
+            import openai
+            
+            # Map Anthropic messages format to OpenAI messages format
+            openai_messages = []
+            if system_prompt:
+                openai_messages.append({"role": "system", "content": system_prompt})
+            
+            for msg in messages:
+                role = msg.get("role")
+                content = msg.get("content")
+                if role == "user":
+                    if isinstance(content, str):
+                        openai_messages.append({"role": "user", "content": content})
+                    elif isinstance(content, list):
+                        # List of tool results
+                        for block in content:
+                            if block.get("type") == "tool_result":
+                                openai_messages.append({
+                                    "role": "tool",
+                                    "tool_call_id": block.get("tool_use_id"),
+                                    "content": block.get("content")
+                                })
+                elif role == "assistant":
+                    if isinstance(content, str):
+                        openai_messages.append({"role": "assistant", "content": content})
+                    elif isinstance(content, list):
+                        text_parts = []
+                        tool_calls = []
+                        for block in content:
+                            block_type = block.get("type")
+                            if block_type == "text":
+                                text_parts.append(block.get("text", ""))
+                            elif block_type == "tool_use":
+                                tool_calls.append({
+                                    "id": block.get("id"),
+                                    "type": "function",
+                                    "function": {
+                                        "name": block.get("name"),
+                                        "arguments": json.dumps(block.get("input", {}))
+                                    }
+                                })
+                        
+                        openai_msg = {"role": "assistant"}
+                        if text_parts:
+                            openai_msg["content"] = "\n".join(text_parts)
+                        else:
+                            openai_msg["content"] = None
+                        if tool_calls:
+                            openai_msg["tool_calls"] = tool_calls
+                        openai_messages.append(openai_msg)
+
+            # Map Anthropic tool schemas to OpenAI format
+            openai_tools = []
+            for tool in DEVKIT_TOOL_SCHEMAS:
+                openai_tools.append({
+                    "type": "function",
+                    "function": {
+                        "name": tool["name"],
+                        "description": tool["description"],
+                        "parameters": tool["input_schema"]
+                    }
+                })
+
+            sync_client = openai.OpenAI(api_key=_openai_api_key)
+            response = sync_client.chat.completions.create(
+                model=_DEVKIT_MODEL,
+                messages=openai_messages,
+                tools=openai_tools if openai_tools else None,
+                max_tokens=_DEVKIT_MAX_TOKENS,
+                timeout=30.0,
+            )
+            
+            choice = response.choices[0]
+            message = choice.message
+            
+            text_parts = []
+            if message.content:
+                text_parts.append(message.content)
+                
+            tool_calls = []
+            raw_content = []
+            
+            if message.content:
+                raw_content.append({"type": "text", "text": message.content})
+                
+            if message.tool_calls:
+                for tc in message.tool_calls:
+                    try:
+                        args = json.loads(tc.function.arguments)
+                    except Exception:
+                        args = {}
+                    
+                    tool_calls.append(
+                        ToolCall(
+                            name=tc.function.name,
+                            args=args,
+                            id=tc.id
+                        )
                     )
-                )
-        usage = getattr(response, "usage", None)
-        return LLMResponse(
-            text="\n".join(text_parts),
-            tool_calls=tool_calls,
-            model=getattr(response, "model", None),
-            input_tokens=getattr(usage, "input_tokens", None),
-            output_tokens=getattr(usage, "output_tokens", None),
-            stop_reason=getattr(response, "stop_reason", None),
-            raw_content=raw_content,
-        )
+                    raw_content.append({
+                        "type": "tool_use",
+                        "id": tc.id,
+                        "name": tc.function.name,
+                        "input": args
+                    })
+                    
+            openai_finish_reason = choice.finish_reason
+            if openai_finish_reason == "tool_calls":
+                stop_reason = "tool_use"
+            elif openai_finish_reason == "stop":
+                stop_reason = "end_turn"
+            elif openai_finish_reason == "length":
+                stop_reason = "max_tokens"
+            else:
+                stop_reason = openai_finish_reason or "end_turn"
+                
+            usage = getattr(response, "usage", None)
+            input_tokens = usage.prompt_tokens if usage else None
+            output_tokens = usage.completion_tokens if usage else None
+            
+            return LLMResponse(
+                text="\n".join(text_parts),
+                tool_calls=tool_calls,
+                model=response.model,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                stop_reason=stop_reason,
+                raw_content=raw_content
+            )
+
+        else:
+            sync_client = anthropic.Anthropic(api_key=_anthropic_api_key)
+            response = sync_client.messages.create(
+                model=_DEVKIT_MODEL,
+                max_tokens=_DEVKIT_MAX_TOKENS,
+                system=system_prompt,
+                messages=messages,
+                tools=DEVKIT_TOOL_SCHEMAS,
+                timeout=30.0,
+            )
+            text_parts = []
+            tool_calls = []
+            raw_content = []
+            for block in response.content:
+                if hasattr(block, "model_dump"):
+                    raw_content.append(block.model_dump())
+                block_type = getattr(block, "type", None)
+                if block_type == "text":
+                    text_parts.append(block.text)
+                elif block_type == "tool_use":
+                    tool_calls.append(
+                        ToolCall(
+                            name=block.name,
+                            args=dict(block.input),
+                            id=getattr(block, "id", None),
+                        )
+                    )
+            usage = getattr(response, "usage", None)
+            return LLMResponse(
+                text="\n".join(text_parts),
+                tool_calls=tool_calls,
+                model=getattr(response, "model", None),
+                input_tokens=getattr(usage, "input_tokens", None),
+                output_tokens=getattr(usage, "output_tokens", None),
+                stop_reason=getattr(response, "stop_reason", None),
+                raw_content=raw_content,
+            )
 
     return _llm_call
 
@@ -1115,29 +1254,33 @@ async def chat(slug: str, body: ChatRequest) -> dict:
         # like a wizard freeze. Surface them as a 402 / 401 with
         # human-readable detail so the operator knows what to do.
         msg = str(exc)
-        if "credit balance is too low" in msg or "credit_balance" in msg:
+        if "credit balance is too low" in msg or "credit_balance" in msg or "insufficient_quota" in msg:
             raise HTTPException(
                 status_code=402,
                 detail={
-                    "error": "anthropic_credit_exhausted",
+                    "error": "llm_credit_exhausted",
                     "message": (
-                        "The Anthropic API rejected the request because your "
-                        "account credit balance is too low. Top up at "
-                        "https://console.anthropic.com/settings/billing and "
+                        "The LLM API rejected the request because your "
+                        "account credit balance is too low. Top up your API account and "
                         "try the same message again — the wizard's state is "
                         "preserved."
                     ),
                 },
             ) from exc
-        if "authentication_error" in msg.lower() or "invalid x-api-key" in msg.lower():
+        if (
+            "authentication_error" in msg.lower()
+            or "invalid x-api-key" in msg.lower()
+            or "invalid_api_key" in msg.lower()
+            or "incorrect api key" in msg.lower()
+        ):
             raise HTTPException(
                 status_code=401,
                 detail={
-                    "error": "anthropic_auth_failed",
+                    "error": "llm_auth_failed",
                     "message": (
-                        "The Anthropic API rejected the request because the "
-                        "ANTHROPIC_API_KEY env var is missing, empty, or "
-                        "invalid. Set it and restart the dev-kit; the "
+                        "The LLM API rejected the request because the "
+                        "API key is missing, empty, or "
+                        "invalid. Set ANTHROPIC_API_KEY or OPENAI_API_KEY and restart the dev-kit; the "
                         "wizard's state is preserved."
                     ),
                 },
