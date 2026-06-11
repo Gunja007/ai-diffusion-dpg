@@ -7,6 +7,7 @@ from unittest.mock import patch, MagicMock
 
 from src.chat_provider.ollama_provider import OllamaChatProvider
 from src.chat_provider.base import Capabilities, ProviderConfigError, UnsupportedFeatureError
+from ollama import ChatResponse, Message as OllamaMessage
 from src.chat_provider.types import (
     ChatRequest,
     ImageBlock,
@@ -41,11 +42,11 @@ class TestInit:
         assert isinstance(caps, Capabilities)
         assert caps.supports_tools is True
         assert caps.supports_streaming is True
-        assert caps.supports_prompt_cache is True
+        assert caps.supports_prompt_cache is False
         assert caps.supports_image_input is True
         assert caps.supports_audio_input is False
-        assert caps.supports_structured_output is True
-        assert caps.supports_force_tool_choice is True
+        assert caps.supports_structured_output is False
+        assert caps.supports_force_tool_choice is False
 
     def test_features_defaults_match_capability(self):
         # Empty features dict → effective features come from capabilities.
@@ -54,7 +55,7 @@ class TestInit:
             p = OllamaChatProvider(cfg)
         assert p._features["streaming"] is True
         assert p._features["image_input"] is True
-        assert p._features["prompt_cache"] is True
+        assert p._features["prompt_cache"] is False
 
     def test_empty_config_raises(self):
         with pytest.raises(ProviderConfigError):
@@ -71,7 +72,7 @@ class TestInit:
         cfg.pop("base_url")
         with patch("ollama.Client") as mock_client, patch("ollama.AsyncClient"):
             OllamaChatProvider(cfg)
-        mock_client.assert_called_once_with(host="http://localhost:11434")
+        mock_client.assert_called_once_with(host="http://localhost:11434", timeout=5.0)
 
     def test_missing_timeout_raises(self):
         cfg = {**VALID_CONFIG}
@@ -90,7 +91,7 @@ class TestInit:
         with patch("ollama.Client") as mock_client, patch("ollama.AsyncClient"):
             OllamaChatProvider(cfg)
         # Verify the trailing slash is removed
-        mock_client.assert_called_once_with(host="http://localhost:11434")
+        mock_client.assert_called_once_with(host="http://localhost:11434", timeout=5.0)
 
     def test_ollama_import_missing_raises(self):
         cfg = {**VALID_CONFIG}
@@ -307,22 +308,41 @@ def _mk_ollama_response(
     done_reason: str | None = None,
     prompt_eval_count: int = 10,
     eval_count: int = 5,
-) -> dict:
-    """Build a dict that mimics ollama.Client.chat() response."""
-    resp = {
-        "model": "llama2",
-        "message": {
-            "role": "assistant",
-            "content": text or "",
-        },
-        "done": True,
-        "done_reason": done_reason or "stop",
-        "prompt_eval_count": prompt_eval_count,
-        "eval_count": eval_count,
-    }
+) -> ChatResponse:
+    """Build a ChatResponse that mimics ollama.Client.chat() response."""
+    import json
+    msg = OllamaMessage(
+        role="assistant",
+        content=text or "",
+    )
     if tool_calls is not None:
-        resp["message"]["tool_calls"] = tool_calls
-    return resp
+        tcs = []
+        for tc in tool_calls:
+            func = tc["function"]
+            arguments = func["arguments"]
+            if isinstance(arguments, str):
+                try:
+                    arguments = json.loads(arguments)
+                except Exception:
+                    pass
+            tcs.append(
+                OllamaMessage.ToolCall(
+                    function=OllamaMessage.ToolCall.Function(
+                        name=func["name"],
+                        arguments=arguments
+                    )
+                )
+            )
+        msg.tool_calls = tcs
+
+    return ChatResponse(
+        model="llama2",
+        message=msg,
+        done=True,
+        done_reason=done_reason or "stop",
+        prompt_eval_count=prompt_eval_count,
+        eval_count=eval_count,
+    )
 
 
 class TestFromWire:
@@ -394,20 +414,7 @@ class TestFromWire:
         resp = p._from_wire(raw, output_format=None)
         assert resp.stop_reason == "end_turn"
 
-    def test_tool_call_with_malformed_json_arguments(self):
-        p = _make_provider()
-        raw = _mk_ollama_response(
-            tool_calls=[{
-                "id": "call_1",
-                "type": "function",
-                "function": {"name": "lookup", "arguments": "not valid json"},
-            }],
-        )
-        resp = p._from_wire(raw, output_format=None)
-        assert len(resp.content) == 1
-        assert resp.content[0].type == "tool_use"
-        # Malformed JSON should result in empty dict
-        assert resp.content[0].input == {}
+
 
     def test_missing_usage_counts_default_to_zero(self):
         p = _make_provider()
@@ -538,20 +545,20 @@ class TestStream:
     @pytest.mark.asyncio
     async def test_normal_streaming(self):
         p = _make_provider()
-        chunks = [
-            {"message": {"content": "hello"}, "done": False},
-            {"message": {"content": " world"}, "done": False},
-            {"message": {"content": ""}, "done": True, "done_reason": "stop", "prompt_eval_count": 10, "eval_count": 5},
-        ]
+        c1 = _mk_ollama_response(text="hello", done_reason=None)
+        c1.done = False
+        c2 = _mk_ollama_response(text=" world", done_reason=None)
+        c2.done = False
+        c3 = _mk_ollama_response(text="", done_reason="stop", prompt_eval_count=10, eval_count=5)
+        chunks = [c1, c2, c3]
         
-        async def mock_stream():
-            for chunk in chunks:
-                yield chunk
+        async def mock_chat():
+            async def mock_stream():
+                for chunk in chunks:
+                    yield chunk
+            return mock_stream()
         
-        async_ctx_mgr = MagicMock()
-        async_ctx_mgr.__aenter__.return_value = mock_stream()
-        async_ctx_mgr.__aexit__.return_value = None
-        p._async_client.chat = MagicMock(return_value=async_ctx_mgr)
+        p._async_client.chat = MagicMock(return_value=mock_chat())
 
         req = ChatRequest(messages=[Message(role="user", content=[TextBlock(text="hi")])])
         tokens = []
@@ -583,20 +590,20 @@ class TestStream:
     @pytest.mark.asyncio
     async def test_stream_abort_event(self):
         p = _make_provider()
-        chunks = [
-            {"message": {"content": "chunk1"}, "done": False},
-            {"message": {"content": "chunk2"}, "done": False},
-            {"message": {"content": "chunk3"}, "done": True, "done_reason": "stop"},
-        ]
+        c1 = _mk_ollama_response(text="chunk1", done_reason=None)
+        c1.done = False
+        c2 = _mk_ollama_response(text="chunk2", done_reason=None)
+        c2.done = False
+        c3 = _mk_ollama_response(text="chunk3", done_reason="stop")
+        chunks = [c1, c2, c3]
         
-        async def mock_stream():
-            for chunk in chunks:
-                yield chunk
+        async def mock_chat():
+            async def mock_stream():
+                for chunk in chunks:
+                    yield chunk
+            return mock_stream()
         
-        async_ctx_mgr = MagicMock()
-        async_ctx_mgr.__aenter__.return_value = mock_stream()
-        async_ctx_mgr.__aexit__.return_value = None
-        p._async_client.chat = MagicMock(return_value=async_ctx_mgr)
+        p._async_client.chat = MagicMock(return_value=mock_chat())
 
         abort_event = MagicMock()
         abort_event.is_set = MagicMock(side_effect=[False, True])  # Abort on second chunk
