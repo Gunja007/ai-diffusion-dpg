@@ -114,11 +114,11 @@ class OllamaChatProvider(ChatProviderBase):
     capabilities = Capabilities(
         supports_tools=True,
         supports_streaming=True,
-        supports_prompt_cache=True,  # Some Ollama models may support caching
+        supports_prompt_cache=False,
         supports_image_input=True,   # Some Ollama models support vision
         supports_audio_input=False,
-        supports_structured_output=True,  # Some Ollama models may support JSON schema
-        supports_force_tool_choice=True,  # Some Ollama models may support tool_choice
+        supports_structured_output=False,
+        supports_force_tool_choice=False,
     )
 
     def __init__(self, config: dict) -> None:
@@ -191,10 +191,12 @@ class OllamaChatProvider(ChatProviderBase):
                 self._openai_client = openai.OpenAI(
                     base_url=self._base_url,
                     api_key=api_key,
+                    timeout=self._timeout_s,
                 )
                 self._openai_async_client = openai.AsyncOpenAI(
                     base_url=self._base_url,
                     api_key=api_key,
+                    timeout=self._timeout_s,
                 )
             except ImportError:
                 raise ProviderConfigError(
@@ -221,8 +223,8 @@ class OllamaChatProvider(ChatProviderBase):
             self._openai_async_client = None  # type: ignore[assignment]
             try:
                 import ollama
-                self._client = ollama.Client(host=self._base_url)
-                self._async_client = ollama.AsyncClient(host=self._base_url)
+                self._client = ollama.Client(host=self._base_url, timeout=self._timeout_s)
+                self._async_client = ollama.AsyncClient(host=self._base_url, timeout=self._timeout_s)
             except ImportError:
                 raise ProviderConfigError(
                     "ollama package is not installed. "
@@ -502,21 +504,20 @@ class OllamaChatProvider(ChatProviderBase):
                     else:
                         kwargs = self._to_wire(request)
                         kwargs["stream"] = True
-                        async with self._async_client.chat(**kwargs) as response:
-                            async for chunk in response:
-                                if abort_event is not None and abort_event.is_set():
-                                    return
+                        async for chunk in await self._async_client.chat(**kwargs):
+                            if abort_event is not None and abort_event.is_set():
+                                return
 
-                                if chunk.get("message", {}).get("content"):
-                                    yield chunk["message"]["content"]
+                            if getattr(chunk.message, "content", None):
+                                yield chunk.message.content
 
-                                if chunk.get("done_reason"):
-                                    stop_reason = chunk["done_reason"]
+                            if getattr(chunk, "done_reason", None):
+                                stop_reason = chunk.done_reason
 
-                                # Extract token usage from final chunk
-                                if chunk.get("done"):
-                                    input_tokens = _safe_int(chunk.get("prompt_eval_count", 0))
-                                    output_tokens = _safe_int(chunk.get("eval_count", 0))
+                            # Extract token usage from final chunk
+                            if getattr(chunk, "done", False):
+                                input_tokens = getattr(chunk, "prompt_eval_count", 0) or 0
+                                output_tokens = getattr(chunk, "eval_count", 0) or 0
 
                     span.set_attribute("gen_ai.usage.input_tokens", input_tokens)
                     span.set_attribute("gen_ai.usage.output_tokens", output_tokens)
@@ -871,7 +872,7 @@ class OllamaChatProvider(ChatProviderBase):
         """Translate an Ollama chat response into a neutral ChatResponse.
 
         Args:
-            raw: The raw Ollama chat response dict.
+            raw: The raw Ollama chat response object.
             output_format: If provided, parse message content as JSON for
                 structured output; mark stop_reason="error" if parsing fails.
 
@@ -881,38 +882,41 @@ class OllamaChatProvider(ChatProviderBase):
         content_blocks: list = []
 
         # Extract message content
-        msg = raw.get("message", {})
-        msg_content = msg.get("content", "")
+        msg = getattr(raw, "message", None)
+        msg_content = getattr(msg, "content", "") if msg else ""
         if msg_content:
             content_blocks.append(TextBlock(text=msg_content))
 
         # Extract tool calls if present
-        if msg.get("tool_calls"):
-            for tc in msg["tool_calls"]:
-                try:
-                    parsed_input = json.loads(tc.get("function", {}).get("arguments", "{}"))
-                except (json.JSONDecodeError, TypeError):
-                    parsed_input = {}
+        tool_calls = getattr(msg, "tool_calls", None) if msg else None
+        if tool_calls:
+            for tc in tool_calls:
+                func = getattr(tc, "function", None)
+                parsed_input = {}
+                tool_name = ""
+                if func:
+                    tool_name = getattr(func, "name", "")
+                    arguments = getattr(func, "arguments", {})
+                    if isinstance(arguments, dict):
+                        parsed_input = arguments
                 content_blocks.append(
                     ToolUseBlock(
-                        tool_use_id=tc.get("id", ""),
-                        tool_name=tc.get("function", {}).get("name", ""),
+                        tool_use_id=getattr(tc, "id", "") or "unknown",
+                        tool_name=tool_name,
                         input=parsed_input,
                     )
                 )
 
         # Map stop reason
-        stop_reason = raw.get("done_reason", "end_turn")
+        stop_reason = getattr(raw, "done_reason", "end_turn") or "end_turn"
         if stop_reason == "length":
             stop_reason = "max_tokens"
         elif stop_reason in ("stop", "", "tool_calls"):
-            # "tool_calls" from Ollama should map to "end_turn" in our domain,
-            # since tool_use is detected from message.tool_calls, not done_reason
-            stop_reason = "end_turn" if stop_reason in ("stop", "", "tool_calls") else stop_reason
+            stop_reason = "end_turn"
 
         # Extract token usage
-        input_tokens = _safe_int(raw.get("prompt_eval_count"))
-        output_tokens = _safe_int(raw.get("eval_count"))
+        input_tokens = _safe_int(getattr(raw, "prompt_eval_count", 0))
+        output_tokens = _safe_int(getattr(raw, "eval_count", 0))
 
         # Parse structured output if requested
         parsed_output = None
