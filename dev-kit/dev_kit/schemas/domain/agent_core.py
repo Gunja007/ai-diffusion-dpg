@@ -9,7 +9,7 @@ from typing import Optional, Any
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from dev_kit.schemas.enums import (
-    ANTHROPIC_MODELS, OPENAI_MODELS,
+    ANTHROPIC_MODELS, OPENAI_MODELS, OLLAMA_MODELS,
     ChatModelField, LanguageField, ProviderField,
     SpecialHandler, RoutingOperator, InternalRoute,
 )
@@ -81,6 +81,7 @@ class AgentSection(BaseModel):
     max_tool_rounds: int = Field(default=3, ge=1, le=20)
     ask_for_consent: bool = False
     consent_prompt: str = ""
+
     # Optional sub-blocks mirrored from runtime AgentConfig. KKB declares
     # termination_short_circuit; current_question and recent_tool_exchanges
     # are framework-defaulted but accepted here for round-trip parity.
@@ -109,7 +110,14 @@ class AgentSection(BaseModel):
     @model_validator(mode="after")
     def models_must_match_provider(self) -> "AgentSection":
         """Reject configs where primary or fallback model isn't in the chosen provider's model list."""
-        valid = ANTHROPIC_MODELS if self.provider == "anthropic" else OPENAI_MODELS
+        if self.provider == "anthropic":
+            valid = ANTHROPIC_MODELS
+        elif self.provider == "openai":
+            valid = OPENAI_MODELS
+        elif self.provider == "ollama":
+            valid = OLLAMA_MODELS
+        else:
+            valid = []
         if self.primary_model not in valid:
             raise ValueError(
                 f"primary_model {self.primary_model!r} is not valid for provider "
@@ -123,6 +131,8 @@ class AgentSection(BaseModel):
         return self
 
 
+
+
 # -- agent_core.preprocessing (language phase) -------------------------------
 
 def _validate_helper_provider_model(provider: Optional[str], model: str) -> None:
@@ -134,7 +144,16 @@ def _validate_helper_provider_model(provider: Optional[str], model: str) -> None
     if provider is None:
         # Still verify model is in the union of known models — caught by ChatModelField AfterValidator.
         return
-    valid = ANTHROPIC_MODELS if provider == "anthropic" else OPENAI_MODELS
+    
+    if provider == "anthropic":
+        valid = ANTHROPIC_MODELS
+    elif provider == "openai":
+        valid = OPENAI_MODELS1
+    elif provider == "ollama":
+        valid = OLLAMA_MODELS
+    else:
+        valid = []
+        
     if model not in valid:
         raise ValueError(
             f"model {model!r} is not valid for provider {provider!r}. Valid options: {valid}"

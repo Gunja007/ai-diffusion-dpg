@@ -66,6 +66,8 @@ services:
     environment:
       - ANTHROPIC_API_KEY                  # inherited from shell: export ANTHROPIC_API_KEY=sk-...
       - OPENAI_API_KEY                     # required when agent.provider=openai or any helper provider=openai
+      - OLLAMA_ENDPOINT                    # optional, for ollama provider
+      - OLLAMA_API_KEY=${OLLAMA_API_KEY:-}
       - CONFIG_FOLDER=/app/config
       - LOG_LEVEL=${LOG_LEVEL:-INFO}       # set to DEBUG for chat_provider/orchestrator tracing
     volumes:
@@ -98,9 +100,11 @@ services:
     container_name: dev_kit
     environment:
       - ANTHROPIC_API_KEY                  # inherited from shell: export ANTHROPIC_API_KEY=sk-...
+      - OPENAI_API_KEY                     # inherited from shell
+      - OLLAMA_ENDPOINT                    # inherited from shell
       - DEVKIT_LOG_LEVEL=${DEVKIT_LOG_LEVEL:-INFO}
       - REACH_LAYER_URL=${REACH_LAYER_URL:-http://host.docker.internal:8005}
-      - HOST_REPO_ROOT=${HOST_REPO_ROOT:-${PWD}}
+      - HOST_REPO_ROOT=${HOST_REPO_ROOT:-${PWD}/../..}
       - NGROK_AUTHTOKEN=${NGROK_AUTHTOKEN:-}
       - VOBIZ_AUTH_ID=${VOBIZ_AUTH_ID:-}
       - VOBIZ_AUTH_TOKEN=${VOBIZ_AUTH_TOKEN:-}
