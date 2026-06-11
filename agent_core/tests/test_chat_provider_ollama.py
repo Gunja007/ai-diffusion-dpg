@@ -66,11 +66,12 @@ class TestInit:
         with pytest.raises(ProviderConfigError, match="primary_model"):
             OllamaChatProvider(cfg)
 
-    def test_missing_base_url_raises(self):
+    def test_missing_base_url_uses_localhost_default(self):
         cfg = {**VALID_CONFIG}
         cfg.pop("base_url")
-        with pytest.raises(ProviderConfigError, match="base_url"):
+        with patch("ollama.Client") as mock_client, patch("ollama.AsyncClient"):
             OllamaChatProvider(cfg)
+        mock_client.assert_called_once_with(host="http://localhost:11434")
 
     def test_missing_timeout_raises(self):
         cfg = {**VALID_CONFIG}
@@ -89,7 +90,7 @@ class TestInit:
         with patch("ollama.Client") as mock_client, patch("ollama.AsyncClient"):
             OllamaChatProvider(cfg)
         # Verify the trailing slash is removed
-        mock_client.assert_called_once_with(base_url="http://localhost:11434")
+        mock_client.assert_called_once_with(host="http://localhost:11434")
 
     def test_ollama_import_missing_raises(self):
         cfg = {**VALID_CONFIG}
