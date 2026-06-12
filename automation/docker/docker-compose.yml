@@ -96,6 +96,7 @@ services:
     container_name: agent_core
     environment:
       - OPENAI_API_KEY
+      - GEMINI_API_KEY
       - ANTHROPIC_API_KEY                  # inherited from shell: export ANTHROPIC_API_KEY=sk-...
       - CONFIG_FOLDER=/app/config
       # LOG_LEVEL controls both Python logging.basicConfig and uvicorn's
@@ -144,10 +145,12 @@ services:
     image: sanketikahub/dpg-dev-kit:${GIT_SHA:-latest}
     container_name: dev_kit
     environment:
+      - OPENAI_API_KEY
+      - GEMINI_API_KEY
       - ANTHROPIC_API_KEY                  # inherited from shell: export ANTHROPIC_API_KEY=sk-...
       - DEVKIT_LOG_LEVEL=${DEVKIT_LOG_LEVEL:-INFO}
       - REACH_LAYER_URL=${REACH_LAYER_URL:-http://host.docker.internal:8005}
-      - HOST_REPO_ROOT=${HOST_REPO_ROOT:-${PWD}}
+      - HOST_REPO_ROOT=${HOST_REPO_ROOT:-${PWD}/../..}
       - NGROK_AUTHTOKEN=${NGROK_AUTHTOKEN:-}
       - VOBIZ_AUTH_ID=${VOBIZ_AUTH_ID:-}
       - VOBIZ_AUTH_TOKEN=${VOBIZ_AUTH_TOKEN:-}

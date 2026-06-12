@@ -16,6 +16,7 @@ dependencies = [
     "cryptography>=46.0.7",
     "python-multipart>=0.0.18",
     "openai>=2.40.0",
+    "google-genai>=1.0.0",
 ]
 
 [project.optional-dependencies]

@@ -30,6 +30,7 @@ export default function DeployWizard({ slug, onBack }) {
     secrets: {
       anthropic_api_key: '',
       openai_api_key: '',
+      gemini_api_key: '',
       namespace_prefix: 'dpg',
       memgraph_password: '',
       redis_password: '',
@@ -113,6 +114,11 @@ export default function DeployWizard({ slug, onBack }) {
       if (provider === 'openai') {
         if (!data.secrets?.openai_api_key?.trim()) {
           setValidationError('OpenAI API Key is required (the agent_core config selected provider=openai).')
+          return
+        }
+      } else if (provider === 'gemini') {
+        if (!data.secrets?.gemini_api_key?.trim()) {
+          setValidationError('Gemini API Key is required (the agent_core config selected provider=gemini).')
           return
         }
       } else {

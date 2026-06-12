@@ -143,35 +143,58 @@ export default function MandatoryInputsStep({ data, updateData, onUpdate, projec
           <span className="w-1.5 h-1.5 rounded-full bg-red-400" />
           Required
         </h3>
-        {(project?.llm_provider || 'anthropic') === 'openai' ? (
-          <div className="border border-gray-700 rounded-xl p-4 bg-gray-900">
-            <label className="block text-xs text-gray-300 mb-1">
-              OpenAI API Key <span className="text-red-400">*</span>
-            </label>
-            <SecretInput
-              existingValue={secrets.openai_api_key}
-              onUpdate={v => update('openai_api_key', v)}
-              placeholder="sk-..."
-            />
-            <p className="text-xs text-gray-500 mt-1">
-              Used by Agent Core for LLM calls. Selected provider: <span className="font-mono">openai</span>.
-            </p>
-          </div>
-        ) : (
-          <div className="border border-gray-700 rounded-xl p-4 bg-gray-900">
-            <label className="block text-xs text-gray-300 mb-1">
-              Anthropic API Key <span className="text-red-400">*</span>
-            </label>
-            <SecretInput
-              existingValue={secrets.anthropic_api_key}
-              onUpdate={v => update('anthropic_api_key', v)}
-              placeholder="sk-ant-..."
-            />
-            <p className="text-xs text-gray-500 mt-1">
-              Used by Agent Core for LLM calls. Selected provider: <span className="font-mono">anthropic</span>.
-            </p>
-          </div>
-        )}
+        {(() => {
+          const provider = project?.llm_provider || 'anthropic';
+          if (provider === 'openai') {
+            return (
+              <div className="border border-gray-700 rounded-xl p-4 bg-gray-900">
+                <label className="block text-xs text-gray-300 mb-1">
+                  OpenAI API Key <span className="text-red-400">*</span>
+                </label>
+                <SecretInput
+                  existingValue={secrets.openai_api_key}
+                  onUpdate={v => update('openai_api_key', v)}
+                  placeholder="sk-..."
+                />
+                <p className="text-xs text-gray-500 mt-1">
+                  Used by Agent Core for LLM calls. Selected provider: <span className="font-mono">openai</span>.
+                </p>
+              </div>
+            );
+          } else if (provider === 'gemini') {
+            return (
+              <div className="border border-gray-700 rounded-xl p-4 bg-gray-900">
+                <label className="block text-xs text-gray-300 mb-1">
+                  Gemini API Key <span className="text-red-400">*</span>
+                </label>
+                <SecretInput
+                  existingValue={secrets.gemini_api_key}
+                  onUpdate={v => update('gemini_api_key', v)}
+                  placeholder="AIza..."
+                />
+                <p className="text-xs text-gray-500 mt-1">
+                  Used by Agent Core for LLM calls. Selected provider: <span className="font-mono">gemini</span>.
+                </p>
+              </div>
+            );
+          } else {
+            return (
+              <div className="border border-gray-700 rounded-xl p-4 bg-gray-900">
+                <label className="block text-xs text-gray-300 mb-1">
+                  Anthropic API Key <span className="text-red-400">*</span>
+                </label>
+                <SecretInput
+                  existingValue={secrets.anthropic_api_key}
+                  onUpdate={v => update('anthropic_api_key', v)}
+                  placeholder="sk-ant-..."
+                />
+                <p className="text-xs text-gray-500 mt-1">
+                  Used by Agent Core for LLM calls. Selected provider: <span className="font-mono">anthropic</span>.
+                </p>
+              </div>
+            );
+          }
+        })()}
       </div>
 
       {/* Tool API keys — one field per REST tool that has auth configured */}

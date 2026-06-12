@@ -9,7 +9,7 @@ from typing import Optional, Any
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from dev_kit.schemas.enums import (
-    ANTHROPIC_MODELS, OPENAI_MODELS,
+    ANTHROPIC_MODELS, OPENAI_MODELS, GEMINI_MODELS,
     ChatModelField, LanguageField, ProviderField,
     SpecialHandler, RoutingOperator, InternalRoute,
 )
@@ -109,7 +109,12 @@ class AgentSection(BaseModel):
     @model_validator(mode="after")
     def models_must_match_provider(self) -> "AgentSection":
         """Reject configs where primary or fallback model isn't in the chosen provider's model list."""
-        valid = ANTHROPIC_MODELS if self.provider == "anthropic" else OPENAI_MODELS
+        if self.provider == "anthropic":
+            valid = ANTHROPIC_MODELS
+        elif self.provider == "openai":
+            valid = OPENAI_MODELS
+        else:
+            valid = GEMINI_MODELS
         if self.primary_model not in valid:
             raise ValueError(
                 f"primary_model {self.primary_model!r} is not valid for provider "
@@ -134,7 +139,12 @@ def _validate_helper_provider_model(provider: Optional[str], model: str) -> None
     if provider is None:
         # Still verify model is in the union of known models — caught by ChatModelField AfterValidator.
         return
-    valid = ANTHROPIC_MODELS if provider == "anthropic" else OPENAI_MODELS
+    if provider == "anthropic":
+        valid = ANTHROPIC_MODELS
+    elif provider == "openai":
+        valid = OPENAI_MODELS
+    else:
+        valid = GEMINI_MODELS
     if model not in valid:
         raise ValueError(
             f"model {model!r} is not valid for provider {provider!r}. Valid options: {valid}"

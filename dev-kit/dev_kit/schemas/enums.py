@@ -27,7 +27,8 @@ except yaml.YAMLError as e:
 PROVIDERS: list[str] = _CFG["providers"]
 ANTHROPIC_MODELS: list[str] = _CFG["anthropic_models"]
 OPENAI_MODELS: list[str] = _CFG["openai_models"]
-ALL_CHAT_MODELS: list[str] = ANTHROPIC_MODELS + OPENAI_MODELS
+GEMINI_MODELS: list[str] = _CFG["gemini_models"]
+ALL_CHAT_MODELS: list[str] = ANTHROPIC_MODELS + OPENAI_MODELS + GEMINI_MODELS
 
 LANGUAGES: list[str] = _CFG["languages"]
 

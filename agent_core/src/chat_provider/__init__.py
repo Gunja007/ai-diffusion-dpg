@@ -114,9 +114,18 @@ def build_chat_provider(agent_config: dict) -> ChatProviderBase:
         )
         return OpenAIChatProvider(agent_config)
 
+    if provider_name == "gemini":
+        from src.chat_provider.gemini_provider import GeminiChatProvider
+        _reconcile_features(
+            provider_name="gemini",
+            capabilities=GeminiChatProvider.capabilities,
+            features=features,
+        )
+        return GeminiChatProvider(agent_config)
+
     raise ProviderConfigError(
         f"Unknown provider '{provider_name}'. "
-        f"Known providers: 'anthropic', 'openai'."
+        f"Known providers: 'anthropic', 'openai', 'gemini'."
     )
 
 

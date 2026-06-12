@@ -23,6 +23,7 @@ from dev_kit.agent.phase_prompts._helpers import (
 from dev_kit.schemas.enums import (
     ANTHROPIC_MODELS,
     OPENAI_MODELS,
+    GEMINI_MODELS,
     PROVIDERS,
 )
 
@@ -141,10 +142,13 @@ the user has to read through.
     # suggestions, NOT enforced.
     _anthropic_list = "\n".join(f"  - {m}" for m in ANTHROPIC_MODELS)
     _openai_list = "\n".join(f"  - {m}" for m in OPENAI_MODELS)
+    _gemini_list = "\n".join(f"  - {m}" for m in GEMINI_MODELS)
     _suggested_anthropic_primary = ANTHROPIC_MODELS[1] if len(ANTHROPIC_MODELS) > 1 else ANTHROPIC_MODELS[0]
     _suggested_anthropic_fallback = ANTHROPIC_MODELS[0]
     _suggested_openai_primary = OPENAI_MODELS[-1] if len(OPENAI_MODELS) > 0 else ""
     _suggested_openai_fallback = OPENAI_MODELS[0] if len(OPENAI_MODELS) > 0 else ""
+    _suggested_gemini_primary = GEMINI_MODELS[1] if len(GEMINI_MODELS) > 1 else (GEMINI_MODELS[0] if GEMINI_MODELS else "")
+    _suggested_gemini_fallback = GEMINI_MODELS[0] if GEMINI_MODELS else ""
 
     return f"""{_phase_focus_header("language", pending_fields)}# Phase: Language
 
@@ -178,8 +182,8 @@ pre-existing API keys), so it must be asked rather than proposed. In
 your first reply for this phase, ask exactly this — and ONLY this — as
 the numbered question:
 
-  1. Which LLM provider would you like — `anthropic` (Claude models) or
-     `openai` (GPT models)?
+  1. Which LLM provider would you like — `anthropic` (Claude models),
+     `openai` (GPT models), or `gemini` (Gemini models)?
 
 Do NOT also suggest primary/fallback models in the same reply. The
 allowlist of models depends on the provider, so models are proposed in
@@ -205,11 +209,15 @@ Anthropic models (the only valid Anthropic IDs — pick two different ones):
 OpenAI models (the only valid OpenAI IDs — pick two different ones):
 {_openai_list}
 
+Gemini models (the only valid Gemini IDs — pick two different ones):
+{_gemini_list}
+
 **Suggested defaults** (use these as your first proposal; the user can
 override):
 
 - Anthropic → primary=`{_suggested_anthropic_primary}`, fallback=`{_suggested_anthropic_fallback}`
 - OpenAI → primary=`{_suggested_openai_primary}`, fallback=`{_suggested_openai_fallback}`
+- Gemini → primary=`{_suggested_gemini_primary}`, fallback=`{_suggested_gemini_fallback}`
 
 Reply pattern for Group 1B: bullet the proposed primary + fallback (and
 the proposed `consent_prompt` if `needs_consent=true` — a 1–2 sentence
