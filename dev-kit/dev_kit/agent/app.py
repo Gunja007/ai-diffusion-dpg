@@ -85,10 +85,7 @@ _anthropic_client = None
 if _anthropic_api_key:
     _anthropic_client = anthropic.AsyncAnthropic(api_key=_anthropic_api_key)
 
-_openai_client = None
-if _openai_api_key:
-    import openai
-    _openai_client = openai.AsyncOpenAI(api_key=_openai_api_key)
+
 
 logger = logging.getLogger(__name__)
 
@@ -519,7 +516,11 @@ def _load_project_meta(slug: str) -> dict:
 _devkit_provider = os.environ.get("DEVKIT_PROVIDER", "").lower()
 if not _devkit_provider:
     model_env = os.environ.get("DEVKIT_MODEL", "")
-    if model_env.startswith("gpt-") or model_env.startswith("o1-") or model_env.startswith("o3-"):
+    # NOTE: o1-/o3- reasoning models are excluded from auto-detection.
+    # They require max_completion_tokens (not max_tokens) and reject the
+    # system role — neither is handled by the dev-kit's OpenAI path.
+    # Users who need them must set DEVKIT_PROVIDER=openai explicitly.
+    if model_env.startswith("gpt-"):
         _devkit_provider = "openai"
     elif model_env.startswith("claude-"):
         _devkit_provider = "anthropic"
@@ -528,6 +529,23 @@ if not _devkit_provider:
             _devkit_provider = "openai"
         else:
             _devkit_provider = "anthropic"
+
+# Validate that the selected provider's API key is present. The earlier
+# guard (line 78) only checks that *some* key exists; this catches the
+# misconfiguration where e.g. DEVKIT_PROVIDER=openai but only
+# ANTHROPIC_API_KEY is set — which would silently 401 at runtime.
+if _devkit_provider == "openai" and not _openai_api_key:
+    raise EnvironmentError(
+        "DEVKIT_PROVIDER is 'openai' (or was auto-detected from DEVKIT_MODEL) "
+        "but OPENAI_API_KEY is not set. Set OPENAI_API_KEY before starting "
+        "the server."
+    )
+if _devkit_provider == "anthropic" and not _anthropic_api_key:
+    raise EnvironmentError(
+        "DEVKIT_PROVIDER is 'anthropic' (or was auto-detected from DEVKIT_MODEL) "
+        "but ANTHROPIC_API_KEY is not set. Set ANTHROPIC_API_KEY before starting "
+        "the server."
+    )
 
 if _devkit_provider == "openai":
     _DEVKIT_MODEL = os.environ.get("DEVKIT_MODEL", "gpt-4o-2024-08-06")
@@ -542,6 +560,30 @@ def _build_devkit_llm_call():
 
     Each invocation builds a fresh sync client (Anthropic or OpenAI), so the
     callable is safe to use under ``asyncio.to_thread`` from the chat handler.
+
+    Why this does NOT reuse ``agent_core.src.chat_provider.build_chat_provider``
+    / ``OpenAIChatProvider``:
+
+    1. **Import topology** — ``agent_core`` is not an installable dependency of
+       the dev-kit. The two packages live in separate directories with separate
+       ``pyproject.toml`` and venvs. ``build_chat_provider`` uses ``from
+       src.chat_provider.…`` imports that only resolve inside agent_core's
+       package root.
+    2. **Return-type mismatch** — ``build_chat_provider`` returns a
+       ``ChatProviderBase`` producing ``ChatResponse`` (neutral types).
+       ``phase_driver`` expects ``LLMResponse`` — a dev-kit-local dataclass
+       carrying ``raw_content`` in Anthropic message format so the driver can
+       replay it as history on subsequent turns.
+    3. **Message format coupling** — the dev-kit maintains conversation history
+       in Anthropic's ``{role, content: [{type, …}]}`` shape. Translating
+       to/from OpenAI wire format requires awareness of that shape; the
+       ``ChatProviderBase`` neutral types operate on a different abstraction
+       (``ChatRequest`` / ``Message`` / ``ToolUseBlock``), so the translation
+       code would be equally complex.
+
+    Consolidation would require making ``agent_core`` pip-installable from the
+    dev-kit or extracting a shared translation library — both are multi-PR
+    efforts tracked separately.
     """
     def _llm_call(system_prompt: str, messages: list[dict]) -> LLMResponse:
         if _devkit_provider == "openai":
@@ -562,10 +604,25 @@ def _build_devkit_llm_call():
                         # List of tool results
                         for block in content:
                             if block.get("type") == "tool_result":
+                                tool_call_id = block.get("tool_use_id")
+                                if not tool_call_id:
+                                    # Skip tool_result blocks with no
+                                    # tool_call_id — older history entries
+                                    # may lack this field and OpenAI will
+                                    # reject the message with a 400.
+                                    logger.warning(
+                                        "devkit.openai.skip_tool_result_no_id",
+                                        extra={
+                                            "operation": "_build_devkit_llm_call",
+                                            "status": "skipped",
+                                            "error": "tool_result block missing tool_use_id",
+                                        },
+                                    )
+                                    continue
                                 openai_messages.append({
                                     "role": "tool",
-                                    "tool_call_id": block.get("tool_use_id"),
-                                    "content": block.get("content")
+                                    "tool_call_id": tool_call_id,
+                                    "content": block.get("content") or ""
                                 })
                 elif role == "assistant":
                     if isinstance(content, str):
@@ -594,6 +651,21 @@ def _build_devkit_llm_call():
                             openai_msg["content"] = None
                         if tool_calls:
                             openai_msg["tool_calls"] = tool_calls
+
+                        # Guard: an assistant message with content=None AND
+                        # no tool_calls is invalid per the OpenAI API (400).
+                        # This can happen when Anthropic history has an
+                        # assistant turn with an empty content list. Skip it.
+                        if openai_msg["content"] is None and not tool_calls:
+                            logger.warning(
+                                "devkit.openai.skip_empty_assistant",
+                                extra={
+                                    "operation": "_build_devkit_llm_call",
+                                    "status": "skipped",
+                                    "error": "assistant message with content=None and no tool_calls",
+                                },
+                            )
+                            continue
                         openai_messages.append(openai_msg)
 
             # Map Anthropic tool schemas to OpenAI format
@@ -634,7 +706,15 @@ def _build_devkit_llm_call():
                 for tc in message.tool_calls:
                     try:
                         args = json.loads(tc.function.arguments)
-                    except Exception:
+                    except (json.JSONDecodeError, TypeError) as exc:
+                        logger.warning(
+                            "devkit.openai.tool_args_parse_failed",
+                            extra={
+                                "operation": "_build_devkit_llm_call",
+                                "status": "failure",
+                                "error": f"{type(exc).__name__}: {exc}",
+                            },
+                        )
                         args = {}
                     
                     tool_calls.append(
