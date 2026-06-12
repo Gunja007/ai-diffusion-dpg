@@ -32,6 +32,7 @@ export default function DeployWizard({ slug, onBack }) {
       openai_api_key: '',
       ollama_api_key: '',
       ollama_endpoint: '',
+      gemini_api_key: '',
       namespace_prefix: 'dpg',
       memgraph_password: '',
       redis_password: '',
@@ -121,6 +122,11 @@ export default function DeployWizard({ slug, onBack }) {
         // Ollama often runs locally and doesn't require an API key by default.
         // If a key is needed for a cloud provider (e.g. Groq), it can be entered,
         // but we don't strictly require it here.
+      } else if (provider === 'gemini') {
+        if (!data.secrets?.gemini_api_key?.trim()) {
+          setValidationError('Gemini API Key is required (the agent_core config selected provider=gemini).')
+          return
+        }
       } else {
         if (!data.secrets?.anthropic_api_key?.trim()) {
           setValidationError('Anthropic API Key is required (the agent_core config selected provider=anthropic).')

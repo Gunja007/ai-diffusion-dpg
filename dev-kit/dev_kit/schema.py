@@ -148,7 +148,7 @@ class AgentConfig(BaseModel):
     # switching away from ``anthropic`` requires the matching API key in
     # env (e.g. ``OPENAI_API_KEY``) and tightens the feature set the
     # chat_provider factory accepts.
-    provider: Literal["anthropic", "openai", "ollama"] = "anthropic"
+    provider: Literal["anthropic", "openai", "ollama", "gemini"] = "anthropic"
     features: FeaturesConfig = Field(
         default_factory=FeaturesConfig,
         description="Per-deployment chat-provider feature toggles (GH-289)",

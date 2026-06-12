@@ -53,6 +53,10 @@ The framework defaults (`dev-kit/dpg/`) provide safe starting values for every f
 
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...
+# or
+export OPENAI_API_KEY=sk-...
+# or
+export GEMINI_API_KEY=AIza...
 cd automation/docker
 docker compose -f docker-compose.dev.yml up -d                         # All services except reach_layer
 docker compose -f docker-compose.dev.yml run --rm reach_layer          # Interactive CLI session
@@ -81,7 +85,7 @@ Target: ≥ 70% line coverage on `agent_core/` and `knowledge_engine/`.
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) — single source of truth: block responsibilities, runtime sequence, design decisions, implementation status
 - [dev-kit/README.md](dev-kit/README.md) — configuration toolchain (Tier 1 agent + Tier 2 YAML) and how to add a new domain
-- `agent_core/` — orchestrator, multi-provider chat_provider (Anthropic + OpenAI), NLU, tool-use loop (818 tests)
+- `agent_core/` — orchestrator, multi-provider chat_provider (Anthropic + OpenAI + Gemini), NLU, tool-use loop (818 tests)
 - `knowledge_engine/` — RAG retrieval, glossary, ingestion ledger (192 tests)
 - `memory_layer/` — Redis session store + Memgraph context graph + SQLite audit (226 tests)
 - `trust_layer/` — ContentBlock, GuardrailsBlock, ConsentBlock, HiTLBlock (138 tests)

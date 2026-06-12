@@ -28,7 +28,7 @@ from dev_kit.schemas.domain.agent_core import (
     UserStateDefinition,
     UserStateModel,
 )
-from dev_kit.schemas.enums import ANTHROPIC_MODELS, OPENAI_MODELS
+from dev_kit.schemas.enums import ANTHROPIC_MODELS, OPENAI_MODELS, GEMINI_MODELS
 
 
 # -- FeaturesSection ---------------------------------------------------------
@@ -53,6 +53,8 @@ _OPENAI_PRIMARY = "gpt-4o-2024-08-06"
 _OPENAI_FALLBACK = "gpt-4.1-2025-04-14"
 _OLLAMA_PRIMARY = "llama3.1"
 _OLLAMA_FALLBACK = "llama3"
+_GEMINI_PRIMARY = "gemini-2.0-flash-exp"
+_GEMINI_FALLBACK = "gemini-1.5-flash-002"
 
 
 def test_agent_section_minimal():
@@ -123,6 +125,18 @@ def test_agent_section_ollama_pair_valid():
     """provider=ollama + 2 distinct ollama models → valid."""
     a = AgentSection(provider="ollama", primary_model=_OLLAMA_PRIMARY, fallback_model=_OLLAMA_FALLBACK)
     assert a.provider == "ollama"
+
+
+def test_agent_section_models_must_match_provider_gemini():
+    """provider=gemini + anthropic model → reject."""
+    with pytest.raises(ValidationError, match="not valid for provider"):
+        AgentSection(provider="gemini", primary_model=_ANTHROPIC_PRIMARY, fallback_model=_GEMINI_FALLBACK)
+
+
+def test_agent_section_gemini_pair_valid():
+    """provider=gemini + distinct gemini models → valid."""
+    a = AgentSection(provider="gemini", primary_model=_GEMINI_PRIMARY, fallback_model=_GEMINI_FALLBACK)
+    assert a.provider == "gemini"
 
 
 def test_agent_section_features_default():

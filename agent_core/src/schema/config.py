@@ -208,7 +208,7 @@ class AgentConfig(BaseModel):
 
     primary_model: str = ""
     fallback_model: str = ""
-    provider: Literal["anthropic", "openai", "ollama"] = "anthropic"
+    provider: Literal["anthropic", "openai", "ollama", "gemini"] = "anthropic"
     features: FeaturesConfig = Field(default_factory=FeaturesConfig)
     timeout_ms: int = Field(default=10000, gt=0)
 
@@ -408,7 +408,7 @@ class LanguageNormalisationConfig(BaseModel):
     # uses this provider for the language-norm helper instead of inheriting
     # agent.provider. Lets a deployment run primary chat on OpenAI while
     # keeping language norm on Anthropic (or vice versa). None → inherit.
-    provider: Literal["anthropic", "openai", "ollama"] | None = None
+    provider: Literal["anthropic", "openai", "ollama", "gemini"] | None = None
     model: str = ""
     default_language: str = ""
     supported_languages: list[str] = Field(default_factory=list)
@@ -423,7 +423,7 @@ class NLUProcessorConfig(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     # Per-helper provider override — see LanguageNormalisationConfig.provider.
-    provider: Literal["anthropic", "openai", "ollama"] | None = None
+    provider: Literal["anthropic", "openai", "ollama", "gemini"] | None = None
     model: str = ""
     confidence_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
     user_state_confidence_threshold: float = Field(default=0.4, ge=0.0, le=1.0)

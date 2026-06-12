@@ -9,7 +9,7 @@ from typing import Optional, Any
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from dev_kit.schemas.enums import (
-    ANTHROPIC_MODELS, OPENAI_MODELS, OLLAMA_MODELS,
+    ANTHROPIC_MODELS, OPENAI_MODELS, OLLAMA_MODELS, GEMINI_MODELS,
     ChatModelField, LanguageField, ProviderField,
     SpecialHandler, RoutingOperator, InternalRoute,
 )
@@ -117,7 +117,7 @@ class AgentSection(BaseModel):
         elif self.provider == "ollama":
             valid = OLLAMA_MODELS
         else:
-            valid = []
+            valid = GEMINI_MODELS
         if self.primary_model not in valid:
             raise ValueError(
                 f"primary_model {self.primary_model!r} is not valid for provider "
@@ -152,8 +152,8 @@ def _validate_helper_provider_model(provider: Optional[str], model: str) -> None
     elif provider == "ollama":
         valid = OLLAMA_MODELS
     else:
-        valid = []
-        
+        valid = GEMINI_MODELS
+
     if model not in valid:
         raise ValueError(
             f"model {model!r} is not valid for provider {provider!r}. Valid options: {valid}"
