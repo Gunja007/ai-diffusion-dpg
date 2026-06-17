@@ -4,12 +4,13 @@ Tests live in ``agent_core/tests/chat_provider/`` per project convention.
 Mock all external dependencies — no real API calls.
 """
 
+import asyncio
 import json
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from src.chat_provider.base import ProviderConfigError, ToolUseRequested
+from src.chat_provider.base import ProviderConfigError, ToolUseRequested, ProviderAPIError
 from src.chat_provider.gemini_provider import GeminiChatProvider, _is_transient_error
 from src.chat_provider.types import (
     ChatRequest,
@@ -355,3 +356,133 @@ def test_non_transient_error_auth():
 def test_non_transient_error_not_found():
     """404 model-not-found is NOT transient."""
     assert not _is_transient_error(Exception("404 Model not found: gemini-2.0-flash"))
+
+
+# ---------------------------------------------------------------------------
+# Streaming Tests
+# ---------------------------------------------------------------------------
+
+
+class _FakeGeminiChunk:
+    def __init__(
+        self,
+        text: str | None = None,
+        function_calls: list | None = None,
+        finish_reason: str | None = None,
+        usage: dict | None = None,
+    ) -> None:
+        self.text = text
+
+        if function_calls is not None:
+            self.function_calls = []
+            for fc in function_calls:
+                fc_mock = MagicMock()
+                fc_mock.id = fc.get("id")
+                fc_mock.name = fc.get("name")
+                fc_mock.args = fc.get("args")
+                self.function_calls.append(fc_mock)
+        else:
+            self.function_calls = None
+
+        if usage is not None:
+            u = MagicMock()
+            u.prompt_token_count = usage.get("prompt_token_count", 0)
+            u.candidates_token_count = usage.get("candidates_token_count", 0)
+            u.cached_content_token_count = usage.get("cached_content_token_count", 0)
+            self.usage_metadata = u
+        else:
+            self.usage_metadata = None
+
+        if finish_reason is not None:
+            fr = MagicMock()
+            fr.name = finish_reason
+            candidate = MagicMock()
+            candidate.finish_reason = fr
+            self.candidates = [candidate]
+        else:
+            self.candidates = None
+
+
+class _FakeAsyncStream:
+    def __init__(self, chunks: list[_FakeGeminiChunk]) -> None:
+        self._chunks = chunks
+
+    def __aiter__(self):
+        async def gen():
+            for c in self._chunks:
+                yield c
+        return gen()
+
+
+def _install_async_stream(provider: GeminiChatProvider, chunks: list) -> None:
+    async def _create(*args, **kwargs):
+        return _FakeAsyncStream(chunks)
+    provider._async_client.aio.models.generate_content_stream = _create
+
+
+class TestGeminiStream:
+    @pytest.mark.asyncio
+    async def test_stream_text_success(self, provider):
+        chunks = [
+            _FakeGeminiChunk(text="Hello "),
+            _FakeGeminiChunk(text="Gemini!"),
+            _FakeGeminiChunk(finish_reason="STOP", usage={"prompt_token_count": 10, "candidates_token_count": 5}),
+        ]
+        _install_async_stream(provider, chunks)
+
+        req = ChatRequest(messages=[Message(role="user", content=[TextBlock(text="Hi")])])
+        tokens = []
+        async for token in provider.stream(req):
+            tokens.append(token)
+        assert tokens == ["Hello ", "Gemini!"]
+
+    @pytest.mark.asyncio
+    async def test_stream_tool_use(self, provider):
+        chunks = [
+            _FakeGeminiChunk(text="Let me look that up. "),
+            _FakeGeminiChunk(function_calls=[{"id": "call_1", "name": "search", "args": {"q": "test"}}]),
+            _FakeGeminiChunk(finish_reason="STOP", usage={"prompt_token_count": 12, "candidates_token_count": 6}),
+        ]
+        _install_async_stream(provider, chunks)
+
+        req = ChatRequest(messages=[Message(role="user", content=[TextBlock(text="Search")])])
+        tokens = []
+        with pytest.raises(ToolUseRequested) as exc_info:
+            async for token in provider.stream(req):
+                tokens.append(token)
+        assert tokens == ["Let me look that up. "]
+        tool_calls = exc_info.value.tool_calls
+        assert len(tool_calls) == 1
+        assert tool_calls[0].tool_use_id == "call_1"
+        assert tool_calls[0].tool_name == "search"
+        assert tool_calls[0].input == {"q": "test"}
+
+    @pytest.mark.asyncio
+    async def test_stream_safety_error(self, provider):
+        chunks = [
+            _FakeGeminiChunk(text="Potentially unsafe "),
+            _FakeGeminiChunk(finish_reason="SAFETY"),
+        ]
+        _install_async_stream(provider, chunks)
+
+        req = ChatRequest(messages=[Message(role="user", content=[TextBlock(text="Hi")])])
+        tokens = []
+        with pytest.raises(ProviderAPIError, match="SAFETY"):
+            async for token in provider.stream(req):
+                tokens.append(token)
+        assert tokens == ["Potentially unsafe "]
+
+    @pytest.mark.asyncio
+    async def test_stream_recitation_error(self, provider):
+        chunks = [
+            _FakeGeminiChunk(text="Potentially copyrighted "),
+            _FakeGeminiChunk(finish_reason="RECITATION"),
+        ]
+        _install_async_stream(provider, chunks)
+
+        req = ChatRequest(messages=[Message(role="user", content=[TextBlock(text="Hi")])])
+        tokens = []
+        with pytest.raises(ProviderAPIError, match="RECITATION"):
+            async for token in provider.stream(req):
+                tokens.append(token)
+        assert tokens == ["Potentially copyrighted "]
