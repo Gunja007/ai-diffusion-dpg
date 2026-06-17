@@ -81,12 +81,6 @@ if not _anthropic_api_key and not _openai_api_key:
         "Set at least one before starting the server."
     )
 
-_anthropic_client = None
-if _anthropic_api_key:
-    _anthropic_client = anthropic.AsyncAnthropic(api_key=_anthropic_api_key)
-
-
-
 logger = logging.getLogger(__name__)
 
 
