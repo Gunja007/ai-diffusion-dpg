@@ -148,7 +148,7 @@ def _validate_helper_provider_model(provider: Optional[str], model: str) -> None
     if provider == "anthropic":
         valid = ANTHROPIC_MODELS
     elif provider == "openai":
-        valid = OPENAI_MODELS1
+        valid = OPENAI_MODELS
     elif provider == "ollama":
         valid = OLLAMA_MODELS
     else:
