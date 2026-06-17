@@ -116,7 +116,7 @@ export default function DeployWizard({ slug, onBack }) {
           setValidationError('OpenAI API Key is required (the agent_core config selected provider=openai).')
           return
         }
-      } else if (provider === 'gemini') {
+      } else if (provider === 'gemini' || provider === 'google') {
         if (!data.secrets?.gemini_api_key?.trim()) {
           setValidationError('Gemini API Key is required (the agent_core config selected provider=gemini).')
           return

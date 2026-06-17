@@ -9,7 +9,7 @@ from dev_kit.schemas.enums import (
     ReengagementChannel, RoutingOperator, SessionFieldType, SpecialHandler,
     StorageMode, ToolCategory, ToolType, TrustQueueBackend,
     # Config-driven values
-    ANTHROPIC_MODELS, OPENAI_MODELS, ALL_CHAT_MODELS, LANGUAGES,
+    ANTHROPIC_MODELS, OPENAI_MODELS, GEMINI_MODELS, ALL_CHAT_MODELS, LANGUAGES,
     PROVIDERS, RAYA_VOICES, RAYA_VOICE_IDS, RAYA_LANGUAGES,
     RAYA_VOICE_LANGUAGE, EMBEDDING_PROVIDERS,
     # Annotated field types
@@ -99,7 +99,7 @@ def test_openai_models_present():
     assert any(m.startswith("gpt-") for m in OPENAI_MODELS)
 
 def test_all_chat_models_is_union():
-    assert set(ALL_CHAT_MODELS) == set(ANTHROPIC_MODELS) | set(OPENAI_MODELS)
+    assert set(ALL_CHAT_MODELS) == set(ANTHROPIC_MODELS) | set(OPENAI_MODELS) | set(GEMINI_MODELS)
 
 def test_raya_voices_have_required_fields():
     for v in RAYA_VOICES:

@@ -51,8 +51,8 @@ _ANTHROPIC_PRIMARY = "claude-sonnet-4-6"
 _ANTHROPIC_FALLBACK = "claude-haiku-4-5-20251001"
 _OPENAI_PRIMARY = "gpt-4o-2024-08-06"
 _OPENAI_FALLBACK = "gpt-4.1-2025-04-14"
-_GEMINI_PRIMARY = "gemini-2.0-flash-exp"
-_GEMINI_FALLBACK = "gemini-1.5-flash-002"
+_GEMINI_PRIMARY = "gemini-3.5-flash"
+_GEMINI_FALLBACK = "gemini-3.5-flash-lite"
 
 
 def test_agent_section_minimal():
