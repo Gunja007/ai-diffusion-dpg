@@ -192,7 +192,10 @@ class GeminiChatProvider(ChatProviderBase):
                 "No Gemini API key found. Set GEMINI_API_KEY or GOOGLE_API_KEY "
                 "in the environment, or pass api_key in the config dict."
             )
-        self._client = genai.Client(api_key=api_key)
+        self._client = genai.Client(
+            api_key=api_key,
+            http_options={"timeout": self._timeout_s},
+        )
         self._async_client = genai.Client(
             api_key=api_key,
             http_options={"timeout": self._timeout_s},
