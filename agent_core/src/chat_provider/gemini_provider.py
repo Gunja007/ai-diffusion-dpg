@@ -31,6 +31,7 @@ from opentelemetry import trace as otel_trace
 from src.chat_provider.base import (
     Capabilities,
     ChatProviderBase,
+    ProviderAPIError,
     ProviderConfigError,
     UnsupportedFeatureError,
     ToolUseRequested,
@@ -527,6 +528,11 @@ class GeminiChatProvider(ChatProviderBase):
                     },
                 )
 
+                if mapped_stop_reason == "error":
+                    raise ProviderAPIError(
+                        f"Gemini stream stopped due to {stop_reason or 'safety/recitation block'}"
+                    )
+
                 if mapped_stop_reason == "tool_use" and tool_calls_buf:
                     raise ToolUseRequested(tool_calls_buf)
 
@@ -535,6 +541,8 @@ class GeminiChatProvider(ChatProviderBase):
             except _RetryableExhausted:
                 raise
             except ToolUseRequested:
+                raise
+            except ProviderAPIError:
                 raise
             except Exception as e:
                 last_error = e
