@@ -135,9 +135,8 @@ export default function MandatoryInputsStep({ data, updateData, onUpdate, projec
 
       {/* LLM Provider API Key — required field varies by chosen provider.
           Reads project.llm_provider (set during the language phase) to ask
-          for ANTHROPIC_API_KEY when provider=anthropic and OPENAI_API_KEY
-          when provider=openai. Falls back to anthropic when meta lacks the
-          field (legacy projects). */}
+          for the appropriate key based on provider. Falls back to anthropic 
+          when meta lacks the field (legacy projects). */}
       <div className="mb-8">
         <h3 className="text-sm font-medium text-gray-300 mb-3 flex items-center gap-2">
           <span className="w-1.5 h-1.5 rounded-full bg-red-400" />
@@ -155,6 +154,32 @@ export default function MandatoryInputsStep({ data, updateData, onUpdate, projec
             />
             <p className="text-xs text-gray-500 mt-1">
               Used by Agent Core for LLM calls. Selected provider: <span className="font-mono">openai</span>.
+            </p>
+          </div>
+        ) : (project?.llm_provider || 'anthropic') === 'ollama' ? (
+          <div className="border border-gray-700 rounded-xl p-4 bg-gray-900">
+            <label className="block text-xs text-gray-300 mb-1">
+              Ollama API Key <span className="text-gray-500 italic">(Optional for local)</span>
+            </label>
+            <SecretInput
+              existingValue={secrets.ollama_api_key}
+              onUpdate={v => update('ollama_api_key', v)}
+              placeholder="sk-..."
+            />
+            <p className="text-xs text-gray-500 mt-1 mb-4">
+              Used if your Ollama endpoint requires an API key (e.g. Groq, Together).
+            </p>
+            
+            <label className="block text-xs text-gray-300 mb-1">
+              Ollama Endpoint
+            </label>
+            <SecretInput
+              existingValue={secrets.ollama_endpoint}
+              onUpdate={v => update('ollama_endpoint', v)}
+              placeholder="http://localhost:11434"
+            />
+            <p className="text-xs text-gray-500 mt-1">
+              Used by Agent Core for LLM calls. Selected provider: <span className="font-mono">ollama</span>.
             </p>
           </div>
         ) : (

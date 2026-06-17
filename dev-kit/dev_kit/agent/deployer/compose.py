@@ -55,6 +55,10 @@ async def run_compose_up(
             env["ANTHROPIC_API_KEY"] = secrets["anthropic_api_key"]
         if secrets.get("openai_api_key"):
             env["OPENAI_API_KEY"] = secrets["openai_api_key"]
+        if secrets.get("ollama_api_key"):
+            env["OLLAMA_API_KEY"] = secrets["ollama_api_key"]
+        if secrets.get("ollama_endpoint"):
+            env["OLLAMA_ENDPOINT"] = secrets["ollama_endpoint"]
         if secrets.get("memgraph_password"):
             env["MEMGRAPH_PASSWORD"] = secrets["memgraph_password"]
         if secrets.get("redis_password"):

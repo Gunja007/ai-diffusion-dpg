@@ -11,6 +11,7 @@ requires-python = ">=3.11"
 dependencies = [
     "anthropic>=0.40.0", # SDK used exclusively in chat_provider/anthropic_provider.py
     "openai>=2.0.0", # SDK used exclusively in chat_provider/openai_provider.py
+    "ollama>=0.1.0", # SDK used exclusively in chat_provider/ollama_provider.py
                       # NOTE: must stay on v2 (same major as dev-kit's openai>=2.40.0).
                       # The two packages run in separate venvs today; if they are ever
                       # consolidated into a single lockfile, keep the pins compatible.

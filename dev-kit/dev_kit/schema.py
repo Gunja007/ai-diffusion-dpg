@@ -148,7 +148,7 @@ class AgentConfig(BaseModel):
     # switching away from ``anthropic`` requires the matching API key in
     # env (e.g. ``OPENAI_API_KEY``) and tightens the feature set the
     # chat_provider factory accepts.
-    provider: Literal["anthropic", "openai"] = "anthropic"
+    provider: Literal["anthropic", "openai", "ollama"] = "anthropic"
     features: FeaturesConfig = Field(
         default_factory=FeaturesConfig,
         description="Per-deployment chat-provider feature toggles (GH-289)",
@@ -272,7 +272,10 @@ class LanguageNormalisationConfig(BaseModel):
         default="",
         description="Optional Claude model ID override for language normalisation; falls back to agent.primary_model when empty",
     )
-    provider: str = Field(default="llm_native", description="Normalisation provider (llm_native)")
+    provider: Literal["anthropic", "openai", "ollama"] | None = Field(
+        default=None,
+        description="Per-helper provider override. Lets a deployment run primary chat on one provider while keeping language norm on another. None → inherit agent.provider.",
+    )
     default_language: str = Field(
         default="",
         description="Default language used when none is detected from user input, e.g. hindi",
@@ -287,6 +290,10 @@ class LanguageNormalisationConfig(BaseModel):
 
 
 class NLUProcessorConfig(BaseModel):
+    provider: Literal["anthropic", "openai", "ollama"] | None = Field(
+        default=None,
+        description="Per-helper provider override. Lets a deployment run primary chat on one provider while keeping NLU on another. None → inherit agent.provider.",
+    )
     model: str = Field(default="", description="Claude model ID for NLU classification. Empty = use agent.primary_model.")
     confidence_threshold: float = Field(default=0.5, description="Float 0-1. Intents below this are treated as unknown")
     user_state_confidence_threshold: float = Field(
