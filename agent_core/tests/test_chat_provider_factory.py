@@ -91,6 +91,18 @@ class TestGeminiBranch:
             p = build_chat_provider(cfg)
         assert type(p).__name__ == "GeminiChatProvider"
 
+    def test_returns_gemini_provider_with_google_alias(self, monkeypatch):
+        monkeypatch.setenv("GEMINI_API_KEY", "dummy")
+        cfg = {
+            "provider": "google",
+            "primary_model": "gemini-3.5-flash",
+            "timeout_ms": 5000,
+            "retry_attempts": 2,
+        }
+        with patch("src.chat_provider.gemini_provider.genai.Client"):
+            p = build_chat_provider(cfg)
+        assert type(p).__name__ == "GeminiChatProvider"
+
 
 class TestCapabilityReconciliation:
     def test_anthropic_features_prompt_cache_true_passes(self):

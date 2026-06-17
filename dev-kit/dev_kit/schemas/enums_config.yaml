@@ -5,6 +5,7 @@ providers:
   - openai
   - ollama
   - gemini
+  - google
 
 # Both providers' chat_provider implementations accept any string and pass it
 # to the API. The list below is "models we have tested or document as valid."

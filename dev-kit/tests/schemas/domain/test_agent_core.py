@@ -53,8 +53,8 @@ _OPENAI_PRIMARY = "gpt-4o-2024-08-06"
 _OPENAI_FALLBACK = "gpt-4.1-2025-04-14"
 _OLLAMA_PRIMARY = "llama3.1"
 _OLLAMA_FALLBACK = "llama3"
-_GEMINI_PRIMARY = "gemini-2.0-flash-exp"
-_GEMINI_FALLBACK = "gemini-1.5-flash-002"
+_GEMINI_PRIMARY = "gemini-3.5-flash"
+_GEMINI_FALLBACK = "gemini-3.5-flash-lite"
 
 
 def test_agent_section_minimal():

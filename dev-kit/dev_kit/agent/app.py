@@ -560,7 +560,7 @@ if _devkit_provider == "anthropic" and not _anthropic_api_key:
 
 if _devkit_provider == "openai":
     _DEVKIT_MODEL = os.environ.get("DEVKIT_MODEL", "gpt-4o-2024-08-06")
-elif _devkit_provider == "gemini":
+elif _devkit_provider == "gemini" or _devkit_provider == "google":  
     _DEVKIT_MODEL = os.environ.get("DEVKIT_MODEL", "gemini-2.0-flash")
 else:
     _DEVKIT_MODEL = os.environ.get("DEVKIT_MODEL", "claude-haiku-4-5-20251001")
@@ -768,7 +768,7 @@ def _build_devkit_llm_call():
                 raw_content=raw_content
             )
 
-        elif _devkit_provider == "gemini":
+        elif _devkit_provider == "gemini" or _devkit_provider == "google":
             from google import genai
             from google.genai import types
             

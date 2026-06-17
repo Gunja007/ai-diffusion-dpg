@@ -160,7 +160,7 @@ export default function MandatoryInputsStep({ data, updateData, onUpdate, projec
                 </p>
               </div>
             );
-          } else if (provider === 'gemini') {
+          } else if (provider === 'gemini' || provider === 'google') {
             return (
               <div className="border border-gray-700 rounded-xl p-4 bg-gray-900">
                 <label className="block text-xs text-gray-300 mb-1">
