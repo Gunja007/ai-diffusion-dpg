@@ -248,19 +248,16 @@ class TestToWire:
             messages=[Message(role="user", content=[TextBlock(text="describe"), img])]
         )
         wire = p._to_wire(req)
-        assert wire["messages"][0]["content"] == [
-            {"type": "text", "text": "describe"},
-            {"type": "image_url", "image_url": {"url": "https://x/y.png"}},
-        ]
+        assert wire["messages"][0]["content"] == "describe"
+        assert "images" not in wire["messages"][0]
 
     def test_image_base64_uses_data_url(self):
         p = _make_provider(features={"image_input": True})
         img = ImageBlock(source=ImageSource(kind="base64", media_type="image/png", data="ABC=="))
         req = ChatRequest(messages=[Message(role="user", content=[img])])
         wire = p._to_wire(req)
-        assert wire["messages"][0]["content"] == [
-            {"type": "image_url", "image_url": {"url": "data:image/png;base64,ABC=="}},
-        ]
+        assert wire["messages"][0]["content"] == ""
+        assert wire["messages"][0]["images"] == ["ABC=="]
 
     def test_image_input_disabled_in_features_ignored(self):
         p = _make_provider(features={"image_input": False})

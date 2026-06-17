@@ -703,7 +703,7 @@ class OllamaChatProvider(ChatProviderBase):
 
         # Conversation messages.
         for msg in request.messages:
-            wire_messages.extend(self._message_to_wire(msg))
+            wire_messages.extend(self._message_to_wire(msg, is_openai=False))
 
         wire: dict[str, Any] = {
             "model": self._active_model,
@@ -759,7 +759,7 @@ class OllamaChatProvider(ChatProviderBase):
             },
         }
 
-    def _message_to_wire(self, msg: Message) -> list[dict[str, Any]]:
+    def _message_to_wire(self, msg: Message, is_openai: bool = False) -> list[dict[str, Any]]:
         """Translate one neutral Message into one or more Ollama messages.
 
         Returns a list because a single user-role Message containing
@@ -767,6 +767,7 @@ class OllamaChatProvider(ChatProviderBase):
 
         Args:
             msg: The neutral Message to translate.
+            is_openai: If True, uses the OpenAI wire format.
 
         Returns:
             A list of Ollama message dicts.
@@ -778,7 +779,7 @@ class OllamaChatProvider(ChatProviderBase):
         out: list[dict[str, Any]] = []
 
         if non_tool_results:
-            out.append(self._build_primary_message(msg.role, non_tool_results))
+            out.append(self._build_primary_message(msg.role, non_tool_results, is_openai=is_openai))
 
         for tr in tool_results:
             content: str
@@ -794,12 +795,13 @@ class OllamaChatProvider(ChatProviderBase):
 
         return out
 
-    def _build_primary_message(self, role: str, blocks: list) -> dict[str, Any]:
+    def _build_primary_message(self, role: str, blocks: list, is_openai: bool = False) -> dict[str, Any]:
         """Build one Ollama message from a list of content blocks (sans tool_results).
 
         Args:
             role: The message role (e.g. "user", "assistant").
             blocks: Content blocks excluding ToolResultBlocks.
+            is_openai: If True, uses the OpenAI wire format.
 
         Returns:
             A single Ollama message dict.
@@ -810,31 +812,51 @@ class OllamaChatProvider(ChatProviderBase):
 
         msg: dict[str, Any] = {"role": role}
 
-        # Content: string if only TextBlocks, else parts array for mixed content
-        if image_blocks and self._features["image_input"]:
-            # Mixed content: use parts array
-            parts: list[dict[str, Any]] = []
-            for tb in text_blocks:
-                part: dict[str, Any] = {"type": "text", "text": tb.text}
-                if (
-                    tb.cache_hint
-                    and self._features["prompt_cache"]
-                    and len(tb.text) >= _CACHE_MIN_CHARS
-                ):
-                    part["cache_control"] = {"type": "ephemeral"}
-                parts.append(part)
-            for ib in image_blocks:
-                parts.append({"type": "image_url", "image_url": self._image_url(ib)})
-            msg["content"] = parts
-        elif text_blocks:
-            # Text only
-            if len(text_blocks) > 1:
-                # Multiple text blocks: concatenate them
-                msg["content"] = "\n\n".join(tb.text for tb in text_blocks)
+        if is_openai:
+            # Content: string if only TextBlocks, else parts array for mixed content
+            if image_blocks and self._features["image_input"]:
+                # Mixed content: use parts array
+                parts: list[dict[str, Any]] = []
+                for tb in text_blocks:
+                    part: dict[str, Any] = {"type": "text", "text": tb.text}
+                    if (
+                        tb.cache_hint
+                        and self._features["prompt_cache"]
+                        and len(tb.text) >= _CACHE_MIN_CHARS
+                    ):
+                        part["cache_control"] = {"type": "ephemeral"}
+                    parts.append(part)
+                for ib in image_blocks:
+                    parts.append({"type": "image_url", "image_url": self._image_url(ib)})
+                msg["content"] = parts
+            elif text_blocks:
+                # Text only
+                if len(text_blocks) > 1:
+                    # Multiple text blocks: concatenate them
+                    msg["content"] = "\n\n".join(tb.text for tb in text_blocks)
+                else:
+                    msg["content"] = text_blocks[0].text
             else:
-                msg["content"] = text_blocks[0].text
+                msg["content"] = None if tool_use_blocks else ""
         else:
-            msg["content"] = None if tool_use_blocks else ""
+            # Native Ollama path
+            text_content = ""
+            if text_blocks:
+                if len(text_blocks) > 1:
+                    text_content = "\n\n".join(tb.text for tb in text_blocks)
+                else:
+                    text_content = text_blocks[0].text
+            else:
+                text_content = None if tool_use_blocks else ""
+            msg["content"] = text_content
+
+            if image_blocks and self._features["image_input"]:
+                images = []
+                for ib in image_blocks:
+                    if ib.source.kind == "base64":
+                        images.append(ib.source.data)
+                if images:
+                    msg["images"] = images
 
         # Assistant tool_calls (prior-turn replays).
         if tool_use_blocks:
@@ -966,7 +988,7 @@ class OllamaChatProvider(ChatProviderBase):
 
         # Conversation messages.
         for msg in request.messages:
-            wire_messages.extend(self._message_to_wire(msg))
+            wire_messages.extend(self._message_to_wire(msg, is_openai=True))
 
         wire: dict[str, Any] = {
             "model": self._active_model,
