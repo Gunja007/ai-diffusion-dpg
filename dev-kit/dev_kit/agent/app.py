@@ -82,20 +82,6 @@ if not _anthropic_api_key and not _openai_api_key and not _gemini_api_key:
         "Set at least one before starting the server."
     )
 
-_anthropic_client = None
-if _anthropic_api_key:
-    _anthropic_client = anthropic.AsyncAnthropic(api_key=_anthropic_api_key)
-
-_openai_client = None
-if _openai_api_key:
-    import openai
-    _openai_client = openai.AsyncOpenAI(api_key=_openai_api_key)
-
-_gemini_client = None
-if _gemini_api_key:
-    from google import genai
-    _gemini_client = genai.Client(api_key=_gemini_api_key)
-
 logger = logging.getLogger(__name__)
 
 
