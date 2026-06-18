@@ -19,6 +19,7 @@ dependencies = [
                        # NOTE: agent_core also pins openai>=2.0.0. Both must stay
                        # on the same major version. Separate venvs today; reconcile
                        # pins before consolidating into a shared lockfile.
+    "google-genai>=1.0.0",
 ]
 
 [project.optional-dependencies]

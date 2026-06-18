@@ -4,6 +4,8 @@ providers:
   - anthropic
   - openai
   - ollama
+  - gemini
+  - google
 
 # Both providers' chat_provider implementations accept any string and pass it
 # to the API. The list below is "models we have tested or document as valid."
@@ -34,6 +36,11 @@ ollama_models:
   - deepseek-coder-v2
   - llava
   - llama3.3
+
+gemini_models:
+  - gemini-3.5-flash
+  - gemini-3.5-flash-lite
+  - gemini-3.1-pro
 
 languages:
   - english

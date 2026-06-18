@@ -96,6 +96,7 @@ services:
     container_name: agent_core
     environment:
       - OPENAI_API_KEY
+      - GEMINI_API_KEY
       - ANTHROPIC_API_KEY                  # inherited from shell: export ANTHROPIC_API_KEY=sk-...
       - OLLAMA_API_KEY
       - OLLAMA_ENDPOINT
@@ -146,8 +147,9 @@ services:
     image: sanketikahub/dpg-dev-kit:${GIT_SHA:-latest}
     container_name: dev_kit
     environment:
-      - ANTHROPIC_API_KEY 
       - OPENAI_API_KEY
+      - GEMINI_API_KEY
+      - ANTHROPIC_API_KEY
       - OLLAMA_API_KEY
       - OLLAMA_ENDPOINT
       - DEVKIT_LOG_LEVEL=${DEVKIT_LOG_LEVEL:-INFO}

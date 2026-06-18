@@ -59,6 +59,8 @@ async def run_compose_up(
             env["OLLAMA_API_KEY"] = secrets["ollama_api_key"]
         if secrets.get("ollama_endpoint"):
             env["OLLAMA_ENDPOINT"] = secrets["ollama_endpoint"]
+        if secrets.get("gemini_api_key"):
+            env["GEMINI_API_KEY"] = secrets["gemini_api_key"]
         if secrets.get("memgraph_password"):
             env["MEMGRAPH_PASSWORD"] = secrets["memgraph_password"]
         if secrets.get("redis_password"):

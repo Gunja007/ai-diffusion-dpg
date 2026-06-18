@@ -211,3 +211,95 @@ def test_json_loads_failure_fallback(setup_openai_provider):
             "name": "update_config",
             "input": {}
         }
+
+
+@pytest.fixture()
+def setup_gemini_provider(monkeypatch):
+    monkeypatch.setattr(app_mod, "_devkit_provider", "gemini")
+    monkeypatch.setattr(app_mod, "_gemini_api_key", "test-gemini-key")
+
+
+def test_gemini_devkit_llm_call_success(setup_gemini_provider):
+    messages = [
+        {"role": "user", "content": "Hello"},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "Sure, I can help."},
+                {
+                    "type": "tool_use",
+                    "id": "call-1",
+                    "name": "update_config",
+                    "input": {"path": "a.b", "value": "x"}
+                }
+            ]
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "call-1",
+                    "content": '{"status": "success"}'
+                }
+            ]
+        }
+    ]
+    
+    mock_part_text = mock.MagicMock()
+    mock_part_text.text = "Here is the result."
+    mock_part_text.function_call = None
+    
+    # Mock FinishReason enum
+    class FinishReasonMock:
+        STOP = "STOP"
+        MAX_TOKENS = "MAX_TOKENS"
+
+    mock_candidate = mock.MagicMock()
+    mock_candidate.content.parts = [mock_part_text]
+    mock_candidate.finish_reason = FinishReasonMock.STOP
+    
+    mock_response = mock.MagicMock()
+    mock_response.candidates = [mock_candidate]
+    mock_response.model_version = "gemini-2.5"
+    mock_response.usage_metadata.prompt_token_count = 10
+    mock_response.usage_metadata.candidates_token_count = 5
+    
+    with mock.patch("google.genai.Client") as mock_client_cls, \
+         mock.patch("google.genai.types.FinishReason", FinishReasonMock):
+        mock_client = mock_client_cls.return_value
+        mock_client.models.generate_content.return_value = mock_response
+        
+        llm_call = app_mod._build_devkit_llm_call()
+        res = llm_call("gemini system prompt", messages)
+        
+        mock_client_cls.assert_called_once_with(api_key="test-gemini-key", http_options={"timeout": 30.0})
+        mock_client.models.generate_content.assert_called_once()
+        
+        assert res.text == "Here is the result."
+        assert res.stop_reason == "end_turn"
+        assert res.input_tokens == 10
+        assert res.output_tokens == 5
+        assert res.model == "gemini-2.5"
+
+
+def test_gemini_devkit_llm_call_empty_candidates(setup_gemini_provider):
+    mock_response = mock.MagicMock()
+    mock_response.candidates = []
+    mock_response.model_version = "gemini-2.5"
+    mock_response.usage_metadata.prompt_token_count = 2
+    mock_response.usage_metadata.candidates_token_count = 0
+    
+    with mock.patch("google.genai.Client") as mock_client_cls:
+        mock_client = mock_client_cls.return_value
+        mock_client.models.generate_content.return_value = mock_response
+        
+        llm_call = app_mod._build_devkit_llm_call()
+        res = llm_call("gemini system prompt", [{"role": "user", "content": "hello"}])
+        
+        assert res.text == "[Response blocked by safety filters]"
+        assert res.stop_reason == "error"
+        assert res.tool_calls == []
+        assert res.input_tokens == 2
+        assert res.output_tokens == 0
+

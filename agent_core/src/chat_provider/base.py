@@ -187,6 +187,10 @@ class ChatProviderBase(ABC):
                     raise UnsupportedFeatureError(
                         f"{cls} does not support image input."
                     )
+                if getattr(block, "type", "") == "audio" and not caps.supports_audio_input:
+                    raise UnsupportedFeatureError(
+                        f"{cls} does not support audio input."
+                    )
                 if (
                     block.type == "text"
                     and block.cache_hint

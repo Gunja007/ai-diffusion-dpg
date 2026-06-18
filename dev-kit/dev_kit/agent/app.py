@@ -74,10 +74,11 @@ COMPOSE_FILE = _AUTOMATION / "docker" / "docker-compose.dev.yml"
 
 _anthropic_api_key = os.environ.get("ANTHROPIC_API_KEY", "")
 _openai_api_key = os.environ.get("OPENAI_API_KEY", "")
+_gemini_api_key = os.environ.get("GEMINI_API_KEY", "")
 
-if not _anthropic_api_key and not _openai_api_key:
+if not _anthropic_api_key and not _openai_api_key and not _gemini_api_key:
     raise EnvironmentError(
-        "Neither ANTHROPIC_API_KEY nor OPENAI_API_KEY environment variable is set. "
+        "Neither ANTHROPIC_API_KEY nor OPENAI_API_KEY nor GEMINI_API_KEY environment variable is set. "
         "Set at least one before starting the server."
     )
 
@@ -519,7 +520,9 @@ if not _devkit_provider:
     elif model_env.startswith("claude-"):
         _devkit_provider = "anthropic"
     else:
-        if _openai_api_key and not _anthropic_api_key:
+        if _gemini_api_key and not _anthropic_api_key and not _openai_api_key:
+            _devkit_provider = "gemini"
+        elif _openai_api_key and not _anthropic_api_key:
             _devkit_provider = "openai"
         else:
             _devkit_provider = "anthropic"
@@ -543,6 +546,8 @@ if _devkit_provider == "anthropic" and not _anthropic_api_key:
 
 if _devkit_provider == "openai":
     _DEVKIT_MODEL = os.environ.get("DEVKIT_MODEL", "gpt-4o-2024-08-06")
+elif _devkit_provider == "gemini" or _devkit_provider == "google":  
+    _DEVKIT_MODEL = os.environ.get("DEVKIT_MODEL", "gemini-2.0-flash")
 else:
     _DEVKIT_MODEL = os.environ.get("DEVKIT_MODEL", "claude-haiku-4-5-20251001")
 
@@ -743,6 +748,141 @@ def _build_devkit_llm_call():
                 text="\n".join(text_parts),
                 tool_calls=tool_calls,
                 model=response.model,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                stop_reason=stop_reason,
+                raw_content=raw_content
+            )
+
+        elif _devkit_provider == "gemini" or _devkit_provider == "google":
+            from google import genai
+            from google.genai import types
+            
+            gemini_messages = []
+            
+            tool_id_to_name = {}
+            for msg in messages:
+                content = msg.get("content")
+                if isinstance(content, list):
+                    for block in content:
+                        if block.get("type") == "tool_use":
+                            tool_id_to_name[block.get("id")] = block.get("name")
+            
+            for msg in messages:
+                role = msg.get("role")
+                content = msg.get("content")
+                gemini_role = "user" if role == "user" else "model"
+                parts = []
+                
+                if isinstance(content, str):
+                    parts.append(types.Part.from_text(text=content))
+                elif isinstance(content, list):
+                    for block in content:
+                        block_type = block.get("type")
+                        if block_type == "text":
+                            parts.append(types.Part.from_text(text=block.get("text", "")))
+                        elif block_type == "tool_use":
+                            parts.append(types.Part.from_function_call(
+                                name=block.get("name"),
+                                args=block.get("input", {})
+                            ))
+                        elif block_type == "tool_result":
+                            func_name = tool_id_to_name.get(block.get("tool_use_id"), "unknown_tool")
+                            parts.append(types.Part.from_function_response(
+                                name=func_name,
+                                response={"result": block.get("content")}
+                            ))
+                gemini_messages.append(types.Content(role=gemini_role, parts=parts))
+
+            gemini_tools = []
+            for tool in DEVKIT_TOOL_SCHEMAS:
+                gemini_tools.append(types.Tool(
+                    function_declarations=[
+                        types.FunctionDeclaration(
+                            name=tool["name"],
+                            description=tool["description"],
+                        )
+                    ]
+                ))
+
+            sync_client = genai.Client(api_key=_gemini_api_key, http_options={"timeout": 30.0})
+            
+            config_kwargs = {
+                "system_instruction": system_prompt if system_prompt else None,
+                "temperature": 0.0,
+                "max_output_tokens": _DEVKIT_MAX_TOKENS,
+            }
+            if gemini_tools:
+                config_kwargs["tools"] = gemini_tools
+
+            response = sync_client.models.generate_content(
+                model=_DEVKIT_MODEL,
+                contents=gemini_messages,
+                config=types.GenerateContentConfig(**config_kwargs)
+            )
+
+            # Check for empty candidates (e.g. safety or recitation block)
+            has_candidates = bool(response.candidates and len(response.candidates) > 0)
+            if not has_candidates:
+                logger.warning(
+                    "devkit.gemini.empty_candidates",
+                    extra={
+                        "operation": "_build_devkit_llm_call",
+                        "status": "failure",
+                        "error": "Response has no candidates — possibly safety-blocked or quota-exceeded",
+                    },
+                )
+                usage = getattr(response, "usage_metadata", None)
+                input_tokens = usage.prompt_token_count if usage else None
+                output_tokens = usage.candidates_token_count if usage else None
+                return LLMResponse(
+                    text="[Response blocked by safety filters]",
+                    tool_calls=[],
+                    model=getattr(response, "model_version", None),
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    stop_reason="error",
+                    raw_content=[]
+                )
+
+            text_parts = []
+            tool_calls = []
+            raw_content = []
+
+            if response.candidates[0].content and response.candidates[0].content.parts:
+                for part in response.candidates[0].content.parts:
+                    if part.text:
+                        text_parts.append(part.text)
+                        raw_content.append({"type": "text", "text": part.text})
+                    elif part.function_call:
+                        fc = part.function_call
+                        call_id = f"call_{len(tool_calls)}" # Gemini doesn't provide explicit IDs
+                        args = {k: v for k, v in fc.args.items()}
+                        tool_calls.append(ToolCall(name=fc.name, args=args, id=call_id))
+                        raw_content.append({
+                            "type": "tool_use",
+                            "id": call_id,
+                            "name": fc.name,
+                            "input": args
+                        })
+
+            gemini_finish_reason = response.candidates[0].finish_reason
+            stop_reason = "end_turn"
+            if gemini_finish_reason == types.FinishReason.STOP:
+                stop_reason = "end_turn"
+                if tool_calls:
+                    stop_reason = "tool_use"
+            elif gemini_finish_reason == types.FinishReason.MAX_TOKENS:
+                stop_reason = "max_tokens"
+
+            usage = getattr(response, "usage_metadata", None)
+            input_tokens = usage.prompt_token_count if usage else None
+            output_tokens = usage.candidates_token_count if usage else None
+
+            return LLMResponse(
+                text="\n".join(text_parts),
+                tool_calls=tool_calls,
+                model=response.model_version,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 stop_reason=stop_reason,
