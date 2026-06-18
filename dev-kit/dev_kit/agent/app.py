@@ -72,13 +72,14 @@ _AUTOMATION = _DOCKER_AUTOMATION if _DOCKER_AUTOMATION.exists() else _REPO_ROOT 
 HELM_BASE = _AUTOMATION / "helm"
 COMPOSE_FILE = _AUTOMATION / "docker" / "docker-compose.dev.yml"
 
-_api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-if not _api_key:
+_anthropic_api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+_openai_api_key = os.environ.get("OPENAI_API_KEY", "")
+
+if not _anthropic_api_key and not _openai_api_key:
     raise EnvironmentError(
-        "ANTHROPIC_API_KEY environment variable is not set. "
-        "Set it before starting the server."
+        "Neither ANTHROPIC_API_KEY nor OPENAI_API_KEY environment variable is set. "
+        "Set at least one before starting the server."
     )
-_anthropic_client = anthropic.AsyncAnthropic(api_key=_api_key)
 
 logger = logging.getLogger(__name__)
 
@@ -506,73 +507,285 @@ def _load_project_meta(slug: str) -> dict:
 # Dev-kit LLM call builder (used by the migrated /chat endpoint)
 # ---------------------------------------------------------------------------
 
-_DEVKIT_MODEL = os.environ.get("DEVKIT_MODEL", "claude-haiku-4-5-20251001")
+_devkit_provider = os.environ.get("DEVKIT_PROVIDER", "").lower()
+if not _devkit_provider:
+    model_env = os.environ.get("DEVKIT_MODEL", "")
+    # NOTE: o1-/o3- reasoning models are excluded from auto-detection.
+    # They require max_completion_tokens (not max_tokens) and reject the
+    # system role — neither is handled by the dev-kit's OpenAI path.
+    # Users who need them must set DEVKIT_PROVIDER=openai explicitly.
+    if model_env.startswith("gpt-"):
+        _devkit_provider = "openai"
+    elif model_env.startswith("claude-"):
+        _devkit_provider = "anthropic"
+    else:
+        if _openai_api_key and not _anthropic_api_key:
+            _devkit_provider = "openai"
+        else:
+            _devkit_provider = "anthropic"
+
+# Validate that the selected provider's API key is present. The earlier
+# guard (line 78) only checks that *some* key exists; this catches the
+# misconfiguration where e.g. DEVKIT_PROVIDER=openai but only
+# ANTHROPIC_API_KEY is set — which would silently 401 at runtime.
+if _devkit_provider == "openai" and not _openai_api_key:
+    raise EnvironmentError(
+        "DEVKIT_PROVIDER is 'openai' (or was auto-detected from DEVKIT_MODEL) "
+        "but OPENAI_API_KEY is not set. Set OPENAI_API_KEY before starting "
+        "the server."
+    )
+if _devkit_provider == "anthropic" and not _anthropic_api_key:
+    raise EnvironmentError(
+        "DEVKIT_PROVIDER is 'anthropic' (or was auto-detected from DEVKIT_MODEL) "
+        "but ANTHROPIC_API_KEY is not set. Set ANTHROPIC_API_KEY before starting "
+        "the server."
+    )
+
+if _devkit_provider == "openai":
+    _DEVKIT_MODEL = os.environ.get("DEVKIT_MODEL", "gpt-4o-2024-08-06")
+else:
+    _DEVKIT_MODEL = os.environ.get("DEVKIT_MODEL", "claude-haiku-4-5-20251001")
+
 _DEVKIT_MAX_TOKENS = int(os.environ.get("DEVKIT_MAX_TOKENS", "4096"))
 
 
 def _build_devkit_llm_call():
     """Return a sync ``(system_prompt, messages) -> LLMResponse`` callable.
 
-    Each invocation builds a fresh sync Anthropic client (cheap), so the
+    Each invocation builds a fresh sync client (Anthropic or OpenAI), so the
     callable is safe to use under ``asyncio.to_thread`` from the chat handler.
 
-    The returned callable accepts the full Anthropic-format ``messages`` list
-    (text turns plus any ``tool_use``/``tool_result`` rounds for an in-turn
-    tool loop) and surfaces ``stop_reason`` and the model's raw content blocks
-    on the response so ``phase_driver.run_turn`` can echo them back on the
-    next loop iteration.
+    Why this does NOT reuse ``agent_core.src.chat_provider.build_chat_provider``
+    / ``OpenAIChatProvider``:
 
-    Returns:
-        A callable accepting ``(system_prompt, messages)`` and returning an
-        ``LLMResponse`` with text, tool_calls (each carrying the provider
-        ``tool_use_id``), raw_content, stop_reason, model, and token counts.
+    1. **Import topology** — ``agent_core`` is not an installable dependency of
+       the dev-kit. The two packages live in separate directories with separate
+       ``pyproject.toml`` and venvs. ``build_chat_provider`` uses ``from
+       src.chat_provider.…`` imports that only resolve inside agent_core's
+       package root.
+    2. **Return-type mismatch** — ``build_chat_provider`` returns a
+       ``ChatProviderBase`` producing ``ChatResponse`` (neutral types).
+       ``phase_driver`` expects ``LLMResponse`` — a dev-kit-local dataclass
+       carrying ``raw_content`` in Anthropic message format so the driver can
+       replay it as history on subsequent turns.
+    3. **Message format coupling** — the dev-kit maintains conversation history
+       in Anthropic's ``{role, content: [{type, …}]}`` shape. Translating
+       to/from OpenAI wire format requires awareness of that shape; the
+       ``ChatProviderBase`` neutral types operate on a different abstraction
+       (``ChatRequest`` / ``Message`` / ``ToolUseBlock``), so the translation
+       code would be equally complex.
 
-    Raises:
-        anthropic.APIError: On Anthropic API failures (timeout, connection,
-            status error). Propagates from the inner ``_llm_call`` through
-            ``asyncio.to_thread`` to the chat handler's exception handler,
-            which logs and returns HTTP 500.
+    Consolidation would require making ``agent_core`` pip-installable from the
+    dev-kit or extracting a shared translation library — both are multi-PR
+    efforts tracked separately.
     """
     def _llm_call(system_prompt: str, messages: list[dict]) -> LLMResponse:
-        sync_client = anthropic.Anthropic()
-        response = sync_client.messages.create(
-            model=_DEVKIT_MODEL,
-            max_tokens=_DEVKIT_MAX_TOKENS,
-            system=system_prompt,
-            messages=messages,
-            tools=DEVKIT_TOOL_SCHEMAS,
-            timeout=30.0,
-        )
-        text_parts: list[str] = []
-        tool_calls: list[ToolCall] = []
-        raw_content: list[dict] = []
-        for block in response.content:
-            # Serialize each content block to the Anthropic message-format dict
-            # so phase_driver can echo it back verbatim as the assistant turn
-            # on the next tool-use loop iteration.
-            if hasattr(block, "model_dump"):
-                raw_content.append(block.model_dump())
-            block_type = getattr(block, "type", None)
-            if block_type == "text":
-                text_parts.append(block.text)
-            elif block_type == "tool_use":
-                tool_calls.append(
-                    ToolCall(
-                        name=block.name,
-                        args=dict(block.input),
-                        id=getattr(block, "id", None),
+        if _devkit_provider == "openai":
+            import openai
+            
+            # Map Anthropic messages format to OpenAI messages format
+            openai_messages = []
+            if system_prompt:
+                openai_messages.append({"role": "system", "content": system_prompt})
+            
+            for msg in messages:
+                role = msg.get("role")
+                content = msg.get("content")
+                if role == "user":
+                    if isinstance(content, str):
+                        openai_messages.append({"role": "user", "content": content})
+                    elif isinstance(content, list):
+                        # List of tool results
+                        for block in content:
+                            if block.get("type") == "tool_result":
+                                tool_call_id = block.get("tool_use_id")
+                                if not tool_call_id:
+                                    # Skip tool_result blocks with no
+                                    # tool_call_id — older history entries
+                                    # may lack this field and OpenAI will
+                                    # reject the message with a 400.
+                                    logger.warning(
+                                        "devkit.openai.skip_tool_result_no_id",
+                                        extra={
+                                            "operation": "_build_devkit_llm_call",
+                                            "status": "skipped",
+                                            "error": "tool_result block missing tool_use_id",
+                                        },
+                                    )
+                                    continue
+                                openai_messages.append({
+                                    "role": "tool",
+                                    "tool_call_id": tool_call_id,
+                                    "content": block.get("content") or ""
+                                })
+                elif role == "assistant":
+                    if isinstance(content, str):
+                        openai_messages.append({"role": "assistant", "content": content})
+                    elif isinstance(content, list):
+                        text_parts = []
+                        tool_calls = []
+                        for block in content:
+                            block_type = block.get("type")
+                            if block_type == "text":
+                                text_parts.append(block.get("text", ""))
+                            elif block_type == "tool_use":
+                                tool_calls.append({
+                                    "id": block.get("id"),
+                                    "type": "function",
+                                    "function": {
+                                        "name": block.get("name"),
+                                        "arguments": json.dumps(block.get("input", {}))
+                                    }
+                                })
+                        
+                        openai_msg = {"role": "assistant"}
+                        if text_parts:
+                            openai_msg["content"] = "\n".join(text_parts)
+                        else:
+                            openai_msg["content"] = None
+                        if tool_calls:
+                            openai_msg["tool_calls"] = tool_calls
+
+                        # Guard: an assistant message with content=None AND
+                        # no tool_calls is invalid per the OpenAI API (400).
+                        # This can happen when Anthropic history has an
+                        # assistant turn with an empty content list. Skip it.
+                        if openai_msg["content"] is None and not tool_calls:
+                            logger.warning(
+                                "devkit.openai.skip_empty_assistant",
+                                extra={
+                                    "operation": "_build_devkit_llm_call",
+                                    "status": "skipped",
+                                    "error": "assistant message with content=None and no tool_calls",
+                                },
+                            )
+                            continue
+                        openai_messages.append(openai_msg)
+
+            # Map Anthropic tool schemas to OpenAI format
+            openai_tools = []
+            for tool in DEVKIT_TOOL_SCHEMAS:
+                openai_tools.append({
+                    "type": "function",
+                    "function": {
+                        "name": tool["name"],
+                        "description": tool["description"],
+                        "parameters": tool["input_schema"]
+                    }
+                })
+
+            sync_client = openai.OpenAI(api_key=_openai_api_key)
+            response = sync_client.chat.completions.create(
+                model=_DEVKIT_MODEL,
+                messages=openai_messages,
+                tools=openai_tools if openai_tools else None,
+                max_tokens=_DEVKIT_MAX_TOKENS,
+                timeout=30.0,
+            )
+            
+            choice = response.choices[0]
+            message = choice.message
+            
+            text_parts = []
+            if message.content:
+                text_parts.append(message.content)
+                
+            tool_calls = []
+            raw_content = []
+            
+            if message.content:
+                raw_content.append({"type": "text", "text": message.content})
+                
+            if message.tool_calls:
+                for tc in message.tool_calls:
+                    try:
+                        args = json.loads(tc.function.arguments)
+                    except (json.JSONDecodeError, TypeError) as exc:
+                        logger.warning(
+                            "devkit.openai.tool_args_parse_failed",
+                            extra={
+                                "operation": "_build_devkit_llm_call",
+                                "status": "failure",
+                                "error": f"{type(exc).__name__}: {exc}",
+                            },
+                        )
+                        args = {}
+                    
+                    tool_calls.append(
+                        ToolCall(
+                            name=tc.function.name,
+                            args=args,
+                            id=tc.id
+                        )
                     )
-                )
-        usage = getattr(response, "usage", None)
-        return LLMResponse(
-            text="\n".join(text_parts),
-            tool_calls=tool_calls,
-            model=getattr(response, "model", None),
-            input_tokens=getattr(usage, "input_tokens", None),
-            output_tokens=getattr(usage, "output_tokens", None),
-            stop_reason=getattr(response, "stop_reason", None),
-            raw_content=raw_content,
-        )
+                    raw_content.append({
+                        "type": "tool_use",
+                        "id": tc.id,
+                        "name": tc.function.name,
+                        "input": args
+                    })
+                    
+            openai_finish_reason = choice.finish_reason
+            if openai_finish_reason == "tool_calls":
+                stop_reason = "tool_use"
+            elif openai_finish_reason == "stop":
+                stop_reason = "end_turn"
+            elif openai_finish_reason == "length":
+                stop_reason = "max_tokens"
+            else:
+                stop_reason = openai_finish_reason or "end_turn"
+                
+            usage = getattr(response, "usage", None)
+            input_tokens = usage.prompt_tokens if usage else None
+            output_tokens = usage.completion_tokens if usage else None
+            
+            return LLMResponse(
+                text="\n".join(text_parts),
+                tool_calls=tool_calls,
+                model=response.model,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                stop_reason=stop_reason,
+                raw_content=raw_content
+            )
+
+        else:
+            sync_client = anthropic.Anthropic(api_key=_anthropic_api_key)
+            response = sync_client.messages.create(
+                model=_DEVKIT_MODEL,
+                max_tokens=_DEVKIT_MAX_TOKENS,
+                system=system_prompt,
+                messages=messages,
+                tools=DEVKIT_TOOL_SCHEMAS,
+                timeout=30.0,
+            )
+            text_parts = []
+            tool_calls = []
+            raw_content = []
+            for block in response.content:
+                if hasattr(block, "model_dump"):
+                    raw_content.append(block.model_dump())
+                block_type = getattr(block, "type", None)
+                if block_type == "text":
+                    text_parts.append(block.text)
+                elif block_type == "tool_use":
+                    tool_calls.append(
+                        ToolCall(
+                            name=block.name,
+                            args=dict(block.input),
+                            id=getattr(block, "id", None),
+                        )
+                    )
+            usage = getattr(response, "usage", None)
+            return LLMResponse(
+                text="\n".join(text_parts),
+                tool_calls=tool_calls,
+                model=getattr(response, "model", None),
+                input_tokens=getattr(usage, "input_tokens", None),
+                output_tokens=getattr(usage, "output_tokens", None),
+                stop_reason=getattr(response, "stop_reason", None),
+                raw_content=raw_content,
+            )
 
     return _llm_call
 
@@ -1115,29 +1328,33 @@ async def chat(slug: str, body: ChatRequest) -> dict:
         # like a wizard freeze. Surface them as a 402 / 401 with
         # human-readable detail so the operator knows what to do.
         msg = str(exc)
-        if "credit balance is too low" in msg or "credit_balance" in msg:
+        if "credit balance is too low" in msg or "credit_balance" in msg or "insufficient_quota" in msg:
             raise HTTPException(
                 status_code=402,
                 detail={
-                    "error": "anthropic_credit_exhausted",
+                    "error": "llm_credit_exhausted",
                     "message": (
-                        "The Anthropic API rejected the request because your "
-                        "account credit balance is too low. Top up at "
-                        "https://console.anthropic.com/settings/billing and "
+                        "The LLM API rejected the request because your "
+                        "account credit balance is too low. Top up your API account and "
                         "try the same message again — the wizard's state is "
                         "preserved."
                     ),
                 },
             ) from exc
-        if "authentication_error" in msg.lower() or "invalid x-api-key" in msg.lower():
+        if (
+            "authentication_error" in msg.lower()
+            or "invalid x-api-key" in msg.lower()
+            or "invalid_api_key" in msg.lower()
+            or "incorrect api key" in msg.lower()
+        ):
             raise HTTPException(
                 status_code=401,
                 detail={
-                    "error": "anthropic_auth_failed",
+                    "error": "llm_auth_failed",
                     "message": (
-                        "The Anthropic API rejected the request because the "
-                        "ANTHROPIC_API_KEY env var is missing, empty, or "
-                        "invalid. Set it and restart the dev-kit; the "
+                        "The LLM API rejected the request because the "
+                        "API key is missing, empty, or "
+                        "invalid. Set ANTHROPIC_API_KEY or OPENAI_API_KEY and restart the dev-kit; the "
                         "wizard's state is preserved."
                     ),
                 },

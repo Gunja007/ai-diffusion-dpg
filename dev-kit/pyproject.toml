@@ -15,6 +15,10 @@ dependencies = [
     "httpx>=0.28.1",
     "cryptography>=46.0.7",
     "python-multipart>=0.0.18",
+    "openai>=2.40.0", # v2 SDK for OpenAI provider in app.py
+                       # NOTE: agent_core also pins openai>=2.0.0. Both must stay
+                       # on the same major version. Separate venvs today; reconcile
+                       # pins before consolidating into a shared lockfile.
 ]
 
 [project.optional-dependencies]

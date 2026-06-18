@@ -114,9 +114,18 @@ def build_chat_provider(agent_config: dict) -> ChatProviderBase:
         )
         return OpenAIChatProvider(agent_config)
 
+    if provider_name == "ollama":
+        from src.chat_provider.ollama_provider import OllamaChatProvider
+        _reconcile_features(
+            provider_name="ollama",
+            capabilities=OllamaChatProvider.capabilities,
+            features=features,
+        )
+        return OllamaChatProvider(agent_config)
+
     raise ProviderConfigError(
         f"Unknown provider '{provider_name}'. "
-        f"Known providers: 'anthropic', 'openai'."
+        f"Known providers: 'anthropic', 'openai', 'ollama'."
     )
 
 

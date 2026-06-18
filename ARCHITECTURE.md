@@ -180,7 +180,7 @@ not declare the block are unaffected.
 **Known gaps:**
 - HiTL escalation for output path not wired: `orchestrator.py` — when Trust output returns `action: "escalate"`, the escalation call is deferred.
 - `/internal/llm/call` proxy endpoint is implemented but not yet wired to downstream callers.
-- Anthropic and OpenAI providers are implemented (#287). AzureOpenAI and Ollama are planned follow-ups; both slot into `chat_provider/` without changing the orchestration layer.
+- Anthropic, OpenAI and Ollama providers are implemented. Ollama runs in dual-mode (local native vs cloud OpenAI-compatible). AzureOpenAI is a planned follow-up; it slots into `chat_provider/` without changing the orchestration layer.
 - Channel-aware prompt assembly not implemented — all channels receive the same system prompt (#97).
 
 ---
