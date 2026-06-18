@@ -805,7 +805,7 @@ def _build_devkit_llm_call():
                     ]
                 ))
 
-            sync_client = genai.Client(api_key=_gemini_api_key)
+            sync_client = genai.Client(api_key=_gemini_api_key, http_options={"timeout": 30.0})
             
             config_kwargs = {
                 "system_instruction": system_prompt if system_prompt else None,
@@ -821,25 +821,50 @@ def _build_devkit_llm_call():
                 config=types.GenerateContentConfig(**config_kwargs)
             )
 
+            # Check for empty candidates (e.g. safety or recitation block)
+            has_candidates = bool(response.candidates and len(response.candidates) > 0)
+            if not has_candidates:
+                logger.warning(
+                    "devkit.gemini.empty_candidates",
+                    extra={
+                        "operation": "_build_devkit_llm_call",
+                        "status": "failure",
+                        "error": "Response has no candidates — possibly safety-blocked or quota-exceeded",
+                    },
+                )
+                usage = getattr(response, "usage_metadata", None)
+                input_tokens = usage.prompt_token_count if usage else None
+                output_tokens = usage.candidates_token_count if usage else None
+                return LLMResponse(
+                    text="[Response blocked by safety filters]",
+                    tool_calls=[],
+                    model=getattr(response, "model_version", None),
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    stop_reason="error",
+                    raw_content=[]
+                )
+
             text_parts = []
             tool_calls = []
             raw_content = []
 
-            for part in response.candidates[0].content.parts:
-                if part.text:
-                    text_parts.append(part.text)
-                    raw_content.append({"type": "text", "text": part.text})
-                elif part.function_call:
-                    fc = part.function_call
-                    call_id = f"call_{len(tool_calls)}" # Gemini doesn't provide explicit IDs
-                    args = {k: v for k, v in fc.args.items()}
-                    tool_calls.append(ToolCall(name=fc.name, args=args, id=call_id))
-                    raw_content.append({
-                        "type": "tool_use",
-                        "id": call_id,
-                        "name": fc.name,
-                        "input": args
-                    })
+            if response.candidates[0].content and response.candidates[0].content.parts:
+                for part in response.candidates[0].content.parts:
+                    if part.text:
+                        text_parts.append(part.text)
+                        raw_content.append({"type": "text", "text": part.text})
+                    elif part.function_call:
+                        fc = part.function_call
+                        call_id = f"call_{len(tool_calls)}" # Gemini doesn't provide explicit IDs
+                        args = {k: v for k, v in fc.args.items()}
+                        tool_calls.append(ToolCall(name=fc.name, args=args, id=call_id))
+                        raw_content.append({
+                            "type": "tool_use",
+                            "id": call_id,
+                            "name": fc.name,
+                            "input": args
+                        })
 
             gemini_finish_reason = response.candidates[0].finish_reason
             stop_reason = "end_turn"
