@@ -95,6 +95,15 @@ export default function MandatoryInputsStep({ data, updateData, onUpdate, projec
     }
   }
 
+  function updateMultiple(fields) {
+    const updated = { ...secrets, ...fields }
+    if (onUpdate) {
+      onUpdate({ secrets: updated })
+    } else if (updateData) {
+      updateData('secrets', updated)
+    }
+  }
+
   function updateChannelSecret(envVar, value) {
     const updated = {
       ...secrets,
@@ -160,19 +169,19 @@ export default function MandatoryInputsStep({ data, updateData, onUpdate, projec
                 </p>
               </div>
             );
-          } else if (provider === 'gemini' || provider === 'google') {
+          } else if (provider === 'google' || provider === 'gemini') {
             return (
               <div className="border border-gray-700 rounded-xl p-4 bg-gray-900">
                 <label className="block text-xs text-gray-300 mb-1">
-                  Gemini API Key <span className="text-red-400">*</span>
+                  Google API Key <span className="text-red-400">*</span>
                 </label>
                 <SecretInput
-                  existingValue={secrets.gemini_api_key}
-                  onUpdate={v => update('gemini_api_key', v)}
+                  existingValue={secrets.google_api_key || secrets.gemini_api_key}
+                  onUpdate={v => updateMultiple({ google_api_key: v, gemini_api_key: v })}
                   placeholder="AIza..."
                 />
                 <p className="text-xs text-gray-500 mt-1">
-                  Used by Agent Core for LLM calls. Selected provider: <span className="font-mono">gemini</span>.
+                  Used by Agent Core for LLM calls. Selected provider: <span className="font-mono">google</span>.
                 </p>
               </div>
             );
