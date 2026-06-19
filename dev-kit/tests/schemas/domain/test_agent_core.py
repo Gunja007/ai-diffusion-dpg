@@ -127,16 +127,16 @@ def test_agent_section_ollama_pair_valid():
     assert a.provider == "ollama"
 
 
-def test_agent_section_models_must_match_provider_gemini():
-    """provider=gemini + anthropic model → reject."""
+def test_agent_section_models_must_match_provider_google():
+    """provider=google + anthropic model → reject."""
     with pytest.raises(ValidationError, match="not valid for provider"):
-        AgentSection(provider="gemini", primary_model=_ANTHROPIC_PRIMARY, fallback_model=_GEMINI_FALLBACK)
+        AgentSection(provider="google", primary_model=_ANTHROPIC_PRIMARY, fallback_model=_GEMINI_FALLBACK)
 
 
-def test_agent_section_gemini_pair_valid():
-    """provider=gemini + distinct gemini models → valid."""
-    a = AgentSection(provider="gemini", primary_model=_GEMINI_PRIMARY, fallback_model=_GEMINI_FALLBACK)
-    assert a.provider == "gemini"
+def test_agent_section_google_pair_valid():
+    """provider=google + distinct gemini models → valid."""
+    a = AgentSection(provider="google", primary_model=_GEMINI_PRIMARY, fallback_model=_GEMINI_FALLBACK)
+    assert a.provider == "google"
 
 
 def test_agent_section_features_default():
