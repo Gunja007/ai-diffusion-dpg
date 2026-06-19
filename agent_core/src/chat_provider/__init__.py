@@ -123,18 +123,18 @@ def build_chat_provider(agent_config: dict) -> ChatProviderBase:
         )
         return OllamaChatProvider(agent_config)
 
-    if provider_name in ("gemini", "google"):
-        from src.chat_provider.gemini_provider import GeminiChatProvider
+    if provider_name == "google":
+        from src.chat_provider.google_provider import GoogleChatProvider
         _reconcile_features(
             provider_name=provider_name,
-            capabilities=GeminiChatProvider.capabilities,
+            capabilities=GoogleChatProvider.capabilities,
             features=features,
         )
-        return GeminiChatProvider(agent_config)
+        return GoogleChatProvider(agent_config)
 
     raise ProviderConfigError(
         f"Unknown provider '{provider_name}'. "
-        f"Known providers: 'anthropic', 'openai', 'ollama', 'gemini', 'google'."
+        f"Known providers: 'anthropic', 'openai', 'ollama', 'google'."
     )
 
 

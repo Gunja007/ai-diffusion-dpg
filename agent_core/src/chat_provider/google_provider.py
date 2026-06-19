@@ -1,9 +1,9 @@
-"""GeminiChatProvider — only file in agent_core that imports ``google-genai``.
+"""GoogleChatProvider — only file in agent_core that imports ``google-genai``.
 
 Translates neutral chat_provider types to/from Google Gemini
 SDK shapes.  We use ``google-genai`` as it is the recommended SDK.
 
-Gemini supports structured output, tools, streaming, and image input.
+Google supports structured output, tools, streaming, and image input with Gemini models.
 Prompt caching is implemented via the ``CachedContent`` resource — the
 system prompt (when it carries a ``cache_hint`` and exceeds the minimum
 token threshold) is uploaded as a cache and referenced via
@@ -107,13 +107,13 @@ class _RetryableExhausted(Exception):
     """Internal: all retry attempts on transient errors were consumed."""
 
 
-class GeminiChatProvider(ChatProviderBase):
+class GoogleChatProvider(ChatProviderBase):
     """Google Gemini implementation of ChatProviderBase.
 
     Reads runtime config from a dict; nothing hardcoded.
 
     Required keys:
-        primary_model    (str) Gemini model id
+        primary_model    (str) Google Gemini model id
         timeout_ms       (int) per-request timeout in ms
         retry_attempts   (int) attempts before giving up (min 1)
 
@@ -142,18 +142,18 @@ class GeminiChatProvider(ChatProviderBase):
 
         Raises:
             ProviderConfigError: If required keys are missing or invalid, or
-                if no Gemini API key is available.
+                if no Google / Gemini API key is available.
         """
         if not config:
             raise ProviderConfigError(
-                "GeminiChatProvider requires a non-empty config dict"
+                "GoogleChatProvider requires a non-empty config dict"
             )
 
         primary_model = config.get("primary_model", "")
         if not primary_model:
             raise ProviderConfigError(
                 "agent.primary_model is not set. Ensure your domain config has "
-                "a valid Gemini model id (e.g. gemini-3.5-flash)."
+                "a valid Google Gemini model id (e.g. gemini-3.5-flash)."
             )
         if "timeout_ms" not in config:
             raise ProviderConfigError("agent.timeout_ms is required")
@@ -179,17 +179,17 @@ class GeminiChatProvider(ChatProviderBase):
 
         self._active_model: str = self._primary_model
 
-        # Explicitly read the API key — docker-compose sets GEMINI_API_KEY.
-        # The SDK also checks GOOGLE_API_KEY; we read both for robustness.
+        # Explicitly read the API key — docker-compose sets GEMINI_API_KEY / GOOGLE_API_KEY.
+        # We read both for robustness.
         api_key = (
             config.get("api_key")
-            or os.environ.get("GEMINI_API_KEY")
             or os.environ.get("GOOGLE_API_KEY")
+            or os.environ.get("GEMINI_API_KEY")
             or ""
         )
         if not api_key:
             raise ProviderConfigError(
-                "No Gemini API key found. Set GEMINI_API_KEY or GOOGLE_API_KEY "
+                "No Google API key found. Set GOOGLE_API_KEY or GEMINI_API_KEY "
                 "in the environment, or pass api_key in the config dict."
             )
         self._client = genai.Client(
@@ -210,7 +210,7 @@ class GeminiChatProvider(ChatProviderBase):
     # ------------------------------------------------------------------
 
     def call(self, request: ChatRequest) -> ChatResponse:
-        """Execute a single Gemini call with retries on transient failures.
+        """Execute a single Google call with retries on transient failures.
 
         Args:
             request: The chat request to send to the model.
@@ -238,7 +238,7 @@ class GeminiChatProvider(ChatProviderBase):
             )
 
     def _call_with_retry(self, request: ChatRequest) -> ChatResponse:
-        """Execute the Gemini API call with retry/backoff and OTel spans.
+        """Execute the Google API call with retry/backoff and OTel spans.
 
         Args:
             request: The chat request to execute.
@@ -264,7 +264,7 @@ class GeminiChatProvider(ChatProviderBase):
                 contents, config_kwargs = self._to_wire(request)
 
                 with tracer.start_as_current_span("llm.call") as span:
-                    span.set_attribute("gen_ai.system", "gemini")
+                    span.set_attribute("gen_ai.system", "google")
                     span.set_attribute("gen_ai.model", self._active_model)
                     span.set_attribute("llm.attempt", attempt + 1)
                     span.set_attribute("llm.call_kind", "sync")
@@ -287,12 +287,12 @@ class GeminiChatProvider(ChatProviderBase):
                     status="success",
                     latency_ms=latency_ms,
                     response=response,
-                    provider_system="gemini",
+                    provider_system="google",
                 )
                 logger.info(
-                    "chat_provider.gemini.call",
+                    "chat_provider.google.call",
                     extra={
-                        "operation": "chat_provider.gemini.call",
+                        "operation": "chat_provider.google.call",
                         "status": "success",
                         "model": self._active_model,
                         "attempt": attempt + 1,
@@ -310,9 +310,9 @@ class GeminiChatProvider(ChatProviderBase):
 
                 if _is_transient_error(e):
                     logger.warning(
-                        "chat_provider.gemini.retryable_error",
+                        "chat_provider.google.retryable_error",
                         extra={
-                            "operation": "chat_provider.gemini.call",
+                            "operation": "chat_provider.google.call",
                             "status": "failure",
                             "model": self._active_model,
                             "attempt": attempt + 1,
@@ -324,11 +324,11 @@ class GeminiChatProvider(ChatProviderBase):
 
                 # Non-retryable error — log and return error response.
                 logger.error(
-                    "chat_provider.gemini.api_error: %s — %s",
+                    "chat_provider.google.api_error: %s — %s",
                     type(e).__name__,
                     str(e),
                     extra={
-                        "operation": "chat_provider.gemini.call",
+                        "operation": "chat_provider.google.call",
                         "status": "failure",
                         "model": self._active_model,
                         "attempt": attempt + 1,
@@ -344,9 +344,9 @@ class GeminiChatProvider(ChatProviderBase):
                 )
 
         logger.error(
-            "chat_provider.gemini.exhausted",
+            "chat_provider.google.exhausted",
             extra={
-                "operation": "chat_provider.gemini.call",
+                "operation": "chat_provider.google.call",
                 "status": "failure",
                 "model": self._active_model,
                 "attempts": self._max_attempts,
@@ -363,7 +363,7 @@ class GeminiChatProvider(ChatProviderBase):
         *,
         abort_event: "asyncio.Event | None" = None,
     ) -> AsyncGenerator[str, None]:
-        """Stream raw text tokens from Gemini.
+        """Stream raw text tokens from Google.
 
         Same retry contract as call(); on exhausted retries the
         generator returns silently. Raises ToolUseRequested if the model
@@ -398,7 +398,7 @@ class GeminiChatProvider(ChatProviderBase):
         request: ChatRequest,
         abort_event: "asyncio.Event | None",
     ) -> AsyncGenerator[str, None]:
-        """Execute the streaming Gemini API call with retry/backoff and OTel spans.
+        """Execute the streaming Google API call with retry/backoff and OTel spans.
 
         Args:
             request: The chat request to stream.
@@ -434,7 +434,7 @@ class GeminiChatProvider(ChatProviderBase):
                 cache_read_tokens = 0
 
                 with tracer.start_as_current_span("llm.call") as span:
-                    span.set_attribute("gen_ai.system", "gemini")
+                    span.set_attribute("gen_ai.system", "google")
                     span.set_attribute("gen_ai.model", self._active_model)
                     span.set_attribute("llm.attempt", attempt + 1)
                     span.set_attribute("llm.call_kind", "stream")
@@ -514,12 +514,12 @@ class GeminiChatProvider(ChatProviderBase):
                     status="success",
                     latency_ms=latency_ms,
                     response=synth_resp,
-                    provider_system="gemini",
+                    provider_system="google",
                 )
                 logger.info(
-                    "chat_provider.gemini.stream",
+                    "chat_provider.google.stream",
                     extra={
-                        "operation": "chat_provider.gemini.stream",
+                        "operation": "chat_provider.google.stream",
                         "status": "success",
                         "model": self._active_model,
                         "attempt": attempt + 1,
@@ -533,7 +533,7 @@ class GeminiChatProvider(ChatProviderBase):
 
                 if mapped_stop_reason == "error":
                     raise ProviderAPIError(
-                        f"Gemini stream stopped due to {stop_reason or 'safety/recitation block'}"
+                        f"Google stream stopped due to {stop_reason or 'safety/recitation block'}"
                     )
 
                 if mapped_stop_reason == "tool_use" and tool_calls_buf:
@@ -553,9 +553,9 @@ class GeminiChatProvider(ChatProviderBase):
 
                 if _is_transient_error(e):
                     logger.warning(
-                        "chat_provider.gemini.stream_retryable_error",
+                        "chat_provider.google.stream_retryable_error",
                         extra={
-                            "operation": "chat_provider.gemini.stream",
+                            "operation": "chat_provider.google.stream",
                             "status": "failure",
                             "model": self._active_model,
                             "attempt": attempt + 1,
@@ -567,11 +567,11 @@ class GeminiChatProvider(ChatProviderBase):
 
                 # Non-retryable error — log and return silently.
                 logger.error(
-                    "chat_provider.gemini.stream_error: %s — %s",
+                    "chat_provider.google.stream_error: %s — %s",
                     type(e).__name__,
                     str(e),
                     extra={
-                        "operation": "chat_provider.gemini.stream",
+                        "operation": "chat_provider.google.stream",
                         "status": "failure",
                         "model": self._active_model,
                         "attempt": attempt + 1,
@@ -582,9 +582,9 @@ class GeminiChatProvider(ChatProviderBase):
                 return
 
         logger.error(
-            "chat_provider.gemini.stream_exhausted",
+            "chat_provider.google.stream_exhausted",
             extra={
-                "operation": "chat_provider.gemini.stream",
+                "operation": "chat_provider.google.stream",
                 "status": "failure",
                 "model": self._active_model,
                 "attempts": self._max_attempts,
@@ -604,11 +604,11 @@ class GeminiChatProvider(ChatProviderBase):
         return self._active_model
 
     # ------------------------------------------------------------------
-    # Wire translation — neutral types <-> Gemini SDK shapes
+    # Wire translation — neutral types <-> Google SDK shapes
     # ------------------------------------------------------------------
 
     def _to_wire(self, request: ChatRequest) -> tuple[list[types.Content], dict[str, Any]]:
-        """Translate a neutral ChatRequest into Gemini SDK shapes.
+        """Translate a neutral ChatRequest into Google SDK shapes.
 
         Returns a (contents, config_kwargs) tuple.  ``contents`` is the
         conversation history as ``types.Content`` objects; ``config_kwargs``
@@ -742,14 +742,14 @@ class GeminiChatProvider(ChatProviderBase):
         return contents, config_kwargs
 
     def _from_wire(self, raw: types.GenerateContentResponse, output_format: OutputFormat | None) -> ChatResponse:
-        """Translate a Gemini GenerateContentResponse into a neutral ChatResponse.
+        """Translate a Google GenerateContentResponse into a neutral ChatResponse.
 
         Guards against empty ``candidates`` (safety blocks, quota
         exhaustion, auth errors) which would otherwise raise an
         exception when accessing ``.text``.
 
         Args:
-            raw: The raw Gemini API response.
+            raw: The raw Google API response.
             output_format: The output format from the request, if any.
 
         Returns:
@@ -806,9 +806,9 @@ class GeminiChatProvider(ChatProviderBase):
         else:
             # No candidates — likely a safety block or server error.
             logger.warning(
-                "chat_provider.gemini.empty_candidates",
+                "chat_provider.google.empty_candidates",
                 extra={
-                    "operation": "chat_provider.gemini._from_wire",
+                    "operation": "chat_provider.google._from_wire",
                     "status": "failure",
                     "model": self._active_model,
                     "error": "Response has no candidates — possibly safety-blocked or quota-exceeded",
@@ -878,9 +878,9 @@ class GeminiChatProvider(ChatProviderBase):
             self._cache_name = cache.name
             self._cache_content_hash = content_hash
             logger.info(
-                "chat_provider.gemini.cache_created",
+                "chat_provider.google.cache_created",
                 extra={
-                    "operation": "chat_provider.gemini._get_or_create_cache",
+                    "operation": "chat_provider.google._get_or_create_cache",
                     "status": "success",
                     "model": self._active_model,
                     "cache_name": cache.name,
@@ -891,9 +891,9 @@ class GeminiChatProvider(ChatProviderBase):
         except Exception as e:
             # Caching is best-effort; fall back to inline system_instruction.
             logger.warning(
-                "chat_provider.gemini.cache_create_failed",
+                "chat_provider.google.cache_create_failed",
                 extra={
-                    "operation": "chat_provider.gemini._get_or_create_cache",
+                    "operation": "chat_provider.google._get_or_create_cache",
                     "status": "failure",
                     "model": self._active_model,
                     "error": str(e),
