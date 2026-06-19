@@ -78,30 +78,28 @@ class TestOpenAIBranch:
         assert type(p).__name__ == "OpenAIChatProvider"
 
 
-class TestGeminiBranch:
-    def test_returns_gemini_provider(self, monkeypatch):
-        monkeypatch.setenv("GEMINI_API_KEY", "dummy")
-        cfg = {
-            "provider": "gemini",
-            "primary_model": "gemini-3.5-flash",
-            "timeout_ms": 5000,
-            "retry_attempts": 2,
-        }
-        with patch("src.chat_provider.gemini_provider.genai.Client"):
-            p = build_chat_provider(cfg)
-        assert type(p).__name__ == "GeminiChatProvider"
-
-    def test_returns_gemini_provider_with_google_alias(self, monkeypatch):
-        monkeypatch.setenv("GEMINI_API_KEY", "dummy")
+class TestGoogleBranch:
+    def test_returns_google_provider(self, monkeypatch):
+        monkeypatch.setenv("GOOGLE_API_KEY", "dummy")
         cfg = {
             "provider": "google",
             "primary_model": "gemini-3.5-flash",
             "timeout_ms": 5000,
             "retry_attempts": 2,
         }
-        with patch("src.chat_provider.gemini_provider.genai.Client"):
+        with patch("src.chat_provider.google_provider.genai.Client"):
             p = build_chat_provider(cfg)
-        assert type(p).__name__ == "GeminiChatProvider"
+        assert type(p).__name__ == "GoogleChatProvider"
+
+    def test_gemini_provider_name_raises(self):
+        cfg = {
+            "provider": "gemini",
+            "primary_model": "gemini-3.5-flash",
+            "timeout_ms": 5000,
+            "retry_attempts": 2,
+        }
+        with pytest.raises(ProviderConfigError, match="provider"):
+            build_chat_provider(cfg)
 
 
 class TestCapabilityReconciliation:
@@ -162,14 +160,14 @@ class TestCapabilityReconciliation:
         with patch("anthropic.Anthropic"), patch("anthropic.AsyncAnthropic"):
             build_chat_provider(cfg)
 
-    def test_gemini_features_prompt_cache_true_passes(self, monkeypatch):
-        monkeypatch.setenv("GEMINI_API_KEY", "dummy")
+    def test_google_features_prompt_cache_true_passes(self, monkeypatch):
+        monkeypatch.setenv("GOOGLE_API_KEY", "dummy")
         cfg = {
-            "provider": "gemini",
+            "provider": "google",
             "primary_model": "gemini-3.5-flash",
             "timeout_ms": 5000,
             "retry_attempts": 2,
             "features": {"prompt_cache": True},
         }
-        with patch("src.chat_provider.gemini_provider.genai.Client"):
+        with patch("src.chat_provider.google_provider.genai.Client"):
             build_chat_provider(cfg)  # no exception
