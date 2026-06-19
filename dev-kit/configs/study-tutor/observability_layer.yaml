@@ -1,0 +1,43 @@
+observability:
+  outcomes:
+    lifecycle:
+    - state: started
+      trigger_tool: null
+    - state: introduction_completed
+      trigger_tool: null
+    - state: exploration_initiated
+      trigger_tool: null
+    - state: active_learning_entered
+      trigger_tool: null
+    - state: problem_resolved
+      trigger_tool: null
+    - state: feedback_given
+      trigger_tool: null
+    metrics:
+    - attributes:
+      - user_id
+      description: Number of sessions started.
+      instrument: counter
+      name: session_start_count
+      unit: '1'
+    - attributes:
+      - user_id
+      - intent_name
+      description: Number of low-confidence NLU detections.
+      instrument: counter
+      name: low_confidence_nlu
+      unit: '1'
+    - attributes:
+      - user_id
+      - state
+      description: Duration of each session.
+      instrument: histogram
+      name: session_duration
+      unit: ms
+    - attributes:
+      - user_id
+      description: Count of blocked messages due to safety or policy reasons.
+      instrument: counter
+      name: text_blocked_count
+      unit: '1'
+  domain: study_tutor

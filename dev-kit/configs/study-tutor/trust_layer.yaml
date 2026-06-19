@@ -1,0 +1,19 @@
+dignity_check:
+  enabled: true
+  questions:
+  - Does this blame the user?
+  - Does it over-promise?
+  - Does it push urgency?
+  - Does it reduce their agency?
+  - Does it sound like a script instead of a human call?
+trust:
+  input_rules:
+    blocked_input_message: I can't help with that request.
+    blocked_phrases: []
+  output_rules:
+    blocked_phrases: []
+    output_blocked_message: I'm sorry, I can't share that information.
+  policy_pack: ''
+  policy_packs: {}
+observability:
+  domain: study_tutor

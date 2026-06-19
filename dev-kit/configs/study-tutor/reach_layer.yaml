@@ -1,0 +1,26 @@
+reach_layer:
+  channels:
+    web:
+      ui:
+        agent_avatar: Friendly image of an AI tutor
+        app_icon: 🎓
+        app_name: StudyTutor
+        app_tagline: Your companion for mastering subjects with deep understanding.
+        delete_conversation_confirm: Are you sure you want to delete this conversation
+          history?
+        new_session_msg: Hello! I'm StudyTutor, your expert AI study tutor.
+        returning_user_msg: Welcome back! Ready to continue where you left off?
+        setup_heading: Welcome to StudyTutor!
+        setup_subtitle: Log in to start your personalized learning journey.
+        sign_out_confirm: Are you sure you want to sign out?
+        start_btn_label: Start Learning
+        switch_user_confirm: Would you like to switch users?
+        user_avatar: Default silhouette icon
+        user_id_hint: Your user ID is your unique identifier for personalized learning
+          experiences.
+        user_id_placeholder: Enter your user ID
+        storage_key: study_tutor_user_id
+        theme_storage_key: study_tutor_theme
+  common:
+    observability:
+      domain: study_tutor

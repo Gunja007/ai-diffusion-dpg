@@ -148,7 +148,7 @@ class AgentConfig(BaseModel):
     # switching away from ``anthropic`` requires the matching API key in
     # env (e.g. ``OPENAI_API_KEY``) and tightens the feature set the
     # chat_provider factory accepts.
-    provider: Literal["anthropic", "openai", "ollama", "gemini", "google"] = "anthropic"
+    provider: Literal["anthropic", "openai", "ollama", "google"] = "anthropic"
     features: FeaturesConfig = Field(
         default_factory=FeaturesConfig,
         description="Per-deployment chat-provider feature toggles (GH-289)",
@@ -272,7 +272,7 @@ class LanguageNormalisationConfig(BaseModel):
         default="",
         description="Optional Claude model ID override for language normalisation; falls back to agent.primary_model when empty",
     )
-    provider: Literal["anthropic", "openai", "ollama"] | None = Field(
+    provider: Literal["anthropic", "openai", "ollama", "google"] | None = Field(
         default=None,
         description="Per-helper provider override. Lets a deployment run primary chat on one provider while keeping language norm on another. None → inherit agent.provider.",
     )
@@ -290,7 +290,7 @@ class LanguageNormalisationConfig(BaseModel):
 
 
 class NLUProcessorConfig(BaseModel):
-    provider: Literal["anthropic", "openai", "ollama"] | None = Field(
+    provider: Literal["anthropic", "openai", "ollama", "google"] | None = Field(
         default=None,
         description="Per-helper provider override. Lets a deployment run primary chat on one provider while keeping NLU on another. None → inherit agent.provider.",
     )

@@ -4,7 +4,6 @@ providers:
   - anthropic
   - openai
   - ollama
-  - gemini
   - google
 
 # Both providers' chat_provider implementations accept any string and pass it

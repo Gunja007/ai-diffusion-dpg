@@ -116,8 +116,10 @@ class AgentSection(BaseModel):
             valid = OPENAI_MODELS
         elif self.provider == "ollama":
             valid = OLLAMA_MODELS
-        else:
+        elif self.provider == "google":
             valid = GEMINI_MODELS
+        else:
+            raise ValueError(f"Unknown provider {self.provider!r}")
         if self.primary_model not in valid:
             raise ValueError(
                 f"primary_model {self.primary_model!r} is not valid for provider "
@@ -151,8 +153,10 @@ def _validate_helper_provider_model(provider: Optional[str], model: str) -> None
         valid = OPENAI_MODELS
     elif provider == "ollama":
         valid = OLLAMA_MODELS
-    else:
+    elif provider == "google":
         valid = GEMINI_MODELS
+    else:
+        raise ValueError(f"Unknown provider {provider!r}")
 
     if model not in valid:
         raise ValueError(

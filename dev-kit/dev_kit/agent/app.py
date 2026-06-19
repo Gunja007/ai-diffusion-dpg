@@ -74,11 +74,11 @@ COMPOSE_FILE = _AUTOMATION / "docker" / "docker-compose.dev.yml"
 
 _anthropic_api_key = os.environ.get("ANTHROPIC_API_KEY", "")
 _openai_api_key = os.environ.get("OPENAI_API_KEY", "")
-_gemini_api_key = os.environ.get("GEMINI_API_KEY", "")
+_google_api_key = os.environ.get("GOOGLE_API_KEY", "") or os.environ.get("GEMINI_API_KEY", "")
 
-if not _anthropic_api_key and not _openai_api_key and not _gemini_api_key:
+if not _anthropic_api_key and not _openai_api_key and not _google_api_key:
     raise EnvironmentError(
-        "Neither ANTHROPIC_API_KEY nor OPENAI_API_KEY nor GEMINI_API_KEY environment variable is set. "
+        "Neither ANTHROPIC_API_KEY nor OPENAI_API_KEY nor GOOGLE_API_KEY environment variable is set. "
         "Set at least one before starting the server."
     )
 
@@ -509,6 +509,9 @@ def _load_project_meta(slug: str) -> dict:
 # ---------------------------------------------------------------------------
 
 _devkit_provider = os.environ.get("DEVKIT_PROVIDER", "").lower()
+if _devkit_provider == "gemini":
+    _devkit_provider = "google"
+
 if not _devkit_provider:
     model_env = os.environ.get("DEVKIT_MODEL", "")
     # NOTE: o1-/o3- reasoning models are excluded from auto-detection.
@@ -519,9 +522,11 @@ if not _devkit_provider:
         _devkit_provider = "openai"
     elif model_env.startswith("claude-"):
         _devkit_provider = "anthropic"
+    elif model_env.startswith("gemini-"):
+        _devkit_provider = "google"
     else:
-        if _gemini_api_key and not _anthropic_api_key and not _openai_api_key:
-            _devkit_provider = "gemini"
+        if _google_api_key and not _anthropic_api_key and not _openai_api_key:
+            _devkit_provider = "google"
         elif _openai_api_key and not _anthropic_api_key:
             _devkit_provider = "openai"
         else:
@@ -543,10 +548,16 @@ if _devkit_provider == "anthropic" and not _anthropic_api_key:
         "but ANTHROPIC_API_KEY is not set. Set ANTHROPIC_API_KEY before starting "
         "the server."
     )
+if _devkit_provider == "google" and not _google_api_key:
+    raise EnvironmentError(
+        "DEVKIT_PROVIDER is 'google' (or was auto-detected from DEVKIT_MODEL) "
+        "but GOOGLE_API_KEY/GEMINI_API_KEY is not set. Set GOOGLE_API_KEY before starting "
+        "the server."
+    )
 
 if _devkit_provider == "openai":
     _DEVKIT_MODEL = os.environ.get("DEVKIT_MODEL", "gpt-4o-2024-08-06")
-elif _devkit_provider == "gemini" or _devkit_provider == "google":  
+elif _devkit_provider == "google":  
     _DEVKIT_MODEL = os.environ.get("DEVKIT_MODEL", "gemini-2.0-flash")
 else:
     _DEVKIT_MODEL = os.environ.get("DEVKIT_MODEL", "claude-haiku-4-5-20251001")
@@ -754,7 +765,7 @@ def _build_devkit_llm_call():
                 raw_content=raw_content
             )
 
-        elif _devkit_provider == "gemini" or _devkit_provider == "google":
+        elif _devkit_provider == "google":
             from google import genai
             from google.genai import types
             
@@ -805,7 +816,7 @@ def _build_devkit_llm_call():
                     ]
                 ))
 
-            sync_client = genai.Client(api_key=_gemini_api_key, http_options={"timeout": 30.0})
+            sync_client = genai.Client(api_key=_google_api_key, http_options={"timeout": 30.0})
             
             config_kwargs = {
                 "system_instruction": system_prompt if system_prompt else None,
@@ -825,7 +836,7 @@ def _build_devkit_llm_call():
             has_candidates = bool(response.candidates and len(response.candidates) > 0)
             if not has_candidates:
                 logger.warning(
-                    "devkit.gemini.empty_candidates",
+                    "devkit.google.empty_candidates",
                     extra={
                         "operation": "_build_devkit_llm_call",
                         "status": "failure",

@@ -1,0 +1,33 @@
+state:
+  persistent:
+    graph:
+      subnodes: {}
+      user_node:
+        key: user_id
+        label: User
+    merge_on_session_end:
+    - session_field: tutor_name
+      target: preferred_tutor
+    - session_field: study_level
+      target: education_level
+  session:
+    schema:
+      date:
+        type: string
+      step:
+        default: initial
+        type: enum
+        values:
+        - initial
+        - subject_selected
+        - plan_discussion
+        - feedback
+      study_level:
+        type: string
+      subject:
+        type: string
+      tutor_name:
+        type: string
+    ttl_minutes: 60
+observability:
+  domain: study_tutor
