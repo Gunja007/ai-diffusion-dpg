@@ -24,7 +24,7 @@ from dev_kit.schemas.enums import (
     ANTHROPIC_MODELS,
     OPENAI_MODELS,
     OLLAMA_MODELS,
-    GEMINI_MODELS,
+    GOOGLE_MODELS,
     PROVIDERS,
 )
 
@@ -144,15 +144,15 @@ the user has to read through.
     _anthropic_list = "\n".join(f"  - {m}" for m in ANTHROPIC_MODELS)
     _openai_list = "\n".join(f"  - {m}" for m in OPENAI_MODELS)
     _ollama_list = "\n".join(f"  - {m}" for m in OLLAMA_MODELS)
-    _gemini_list = "\n".join(f"  - {m}" for m in GEMINI_MODELS)
+    _google_list = "\n".join(f"  - {m}" for m in GOOGLE_MODELS)
     _suggested_anthropic_primary = ANTHROPIC_MODELS[1] if len(ANTHROPIC_MODELS) > 1 else ANTHROPIC_MODELS[0]
     _suggested_anthropic_fallback = ANTHROPIC_MODELS[0]
     _suggested_openai_primary = OPENAI_MODELS[-1] if len(OPENAI_MODELS) > 0 else ""
     _suggested_openai_fallback = OPENAI_MODELS[0] if len(OPENAI_MODELS) > 0 else ""
     _suggested_ollama_primary = OLLAMA_MODELS[-1] if len(OLLAMA_MODELS) > 0 else ""
     _suggested_ollama_fallback = OLLAMA_MODELS[0] if len(OLLAMA_MODELS) > 0 else ""
-    _suggested_gemini_primary = GEMINI_MODELS[1] if len(GEMINI_MODELS) > 1 else (GEMINI_MODELS[0] if GEMINI_MODELS else "")
-    _suggested_gemini_fallback = GEMINI_MODELS[0] if GEMINI_MODELS else ""
+    _suggested_google_primary = GOOGLE_MODELS[1] if len(GOOGLE_MODELS) > 1 else (GOOGLE_MODELS[0] if GOOGLE_MODELS else "")
+    _suggested_google_fallback = GOOGLE_MODELS[0] if GOOGLE_MODELS else ""
 
     return f"""{_phase_focus_header("language", pending_fields)}# Phase: Language
 
@@ -186,8 +186,8 @@ pre-existing API keys), so it must be asked rather than proposed. In
 your first reply for this phase, ask exactly this — and ONLY this — as
 the numbered question:
 
-  1. Which LLM provider would you like — `anthropic` (Claude models) or,
-     `openai` (GPT models), or `ollama` (local models) or `gemini` (gemini models)?
+  1. Which LLM provider would you like — `anthropic` (Claude models),
+     `openai` (GPT models), `ollama` (local models), or `google` (Gemini models)?
 
 Do NOT also suggest primary/fallback models in the same reply. The
 allowlist of models depends on the provider, so models are proposed in
@@ -216,8 +216,8 @@ OpenAI models (the only valid OpenAI IDs — pick two different ones):
 Ollama models (the only valid Ollama IDs — pick two different ones):
 {_ollama_list}
 
-Gemini models (the only valid Gemini IDs — pick two different ones):
-{_gemini_list}
+Google models (the only valid Google/Gemini IDs — pick two different ones):
+{_google_list}
 
 **Suggested defaults** (use these as your first proposal; the user can
 override):
@@ -225,7 +225,7 @@ override):
 - Anthropic → primary=`{_suggested_anthropic_primary}`, fallback=`{_suggested_anthropic_fallback}`
 - OpenAI → primary=`{_suggested_openai_primary}`, fallback=`{_suggested_openai_fallback}`
 - Ollama → primary=`{_suggested_ollama_primary}`, fallback=`{_suggested_ollama_fallback}`
-- Gemini → primary=`{_suggested_gemini_primary}`, fallback=`{_suggested_gemini_fallback}`
+- Google → primary=`{_suggested_google_primary}`, fallback=`{_suggested_google_fallback}`
 
 Reply pattern for Group 1B: bullet the proposed primary + fallback (and
 the proposed `consent_prompt` if `needs_consent=true` — a 1–2 sentence
