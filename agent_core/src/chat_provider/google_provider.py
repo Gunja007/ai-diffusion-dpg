@@ -111,7 +111,10 @@ class _RetryableExhausted(Exception):
         self.error_type = error_type
         self.error_message = error_message
 
+<<<<<<< HEAD
 
+=======
+>>>>>>> 1b9c88c (refactor(agent_core): migrate gemini chat provider to google)
 class GoogleChatProvider(ChatProviderBase):
     """Google Gemini implementation of ChatProviderBase.
 
