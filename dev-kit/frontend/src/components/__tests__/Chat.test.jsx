@@ -8,6 +8,7 @@ vi.mock('../../api', () => ({
     getHistory: vi.fn().mockResolvedValue([]),
     getGraph: vi.fn().mockResolvedValue({ nodes: [], edges: [] }),
     getConfigs: vi.fn().mockResolvedValue([]),
+    getFieldStatus: vi.fn().mockResolvedValue({}),
     chat: vi.fn().mockResolvedValue({ reply: 'ok', phase: 'tools', graph: null }),
   },
 }))
