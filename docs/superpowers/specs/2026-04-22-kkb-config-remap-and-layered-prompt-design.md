@@ -34,7 +34,7 @@ GH #175 proposes measuring whether a single monolithic prompt beats the current 
 - Collapsing the subagent graph or dropping NLU / Language Normalisation. Tracked in GH #175.
 - A dev-kit classifier shim that routes free-form expert input to the correct block/section. Separate follow-up issue.
 - A multi-provider structured-prompt abstraction (Option 3 from the brainstorming). Framework is Anthropic-only today; XML delimiters are accepted for this PR.
-- Cross-provider caching strategy. `cache_control: ephemeral` is Anthropic-specific; porting to OpenAI / Gemini is out of scope.
+- Cross-provider caching strategy. `cache_control: ephemeral` is Anthropic-specific; porting to OpenAI / Google (Gemini) is out of scope.
 
 ## 4. Design — Part A: layered prompt structure
 
