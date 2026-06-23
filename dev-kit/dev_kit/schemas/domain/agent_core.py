@@ -378,6 +378,7 @@ class ChannelsSection(BaseModel):
     web: Optional[ChannelEntry] = None
     voice: Optional[ChannelEntry] = None
     cli: Optional[ChannelEntry] = None
+    mcp: Optional[ChannelEntry] = None
 
 
 # -- agent_core.connectors (knowledge, tools phases) -------------------------

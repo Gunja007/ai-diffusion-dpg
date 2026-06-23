@@ -325,6 +325,15 @@ FIELD_RULES: dict[str, FieldRule] = {
         applies_if='"voice" in selected_channels',
         description="Voice recording configuration (advanced deploy form).",
     ),
+
+    # ── Deploy: mcp ───────────────────────────────────────────────────────────
+
+    "channels.mcp.port": FieldRule(
+        category="deploy",
+        applies_if='"mcp" in selected_channels',
+        description="Port the MCP channel service binds to. Default: 8007.",
+        pydantic_class="McpChannelSection",
+    ),
 }
 
 register_block_rules("reach_layer", FIELD_RULES)

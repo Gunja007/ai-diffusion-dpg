@@ -53,6 +53,8 @@ EXPECTED_PATHS = {
     "channels.voice.vobiz",
     "channels.voice.vad",
     "channels.voice.recording",
+    # MCP deploy
+    "channels.mcp.port",
 }
 
 

@@ -353,6 +353,21 @@ class VoiceChannelConfig(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# MCP channel (GH-338)
+# ---------------------------------------------------------------------------
+
+
+class McpChannelConfig(BaseModel):
+    """MCP channel service config."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    enabled: bool = True
+    assembly_mode: AssemblyMode = AssemblyMode.session
+    port: int = Field(default=8007, gt=0, lt=65536)
+
+
+# ---------------------------------------------------------------------------
 # Channels container + top-level
 # ---------------------------------------------------------------------------
 
@@ -372,6 +387,7 @@ class ChannelsConfig(BaseModel):
     cli: Optional[CliChannelConfig] = None
     web: Optional[WebChannelConfig] = None
     voice: Optional[VoiceChannelConfig] = None
+    mcp: Optional[McpChannelConfig] = None
 
 
 class ReachLayerConfig(BaseModel):

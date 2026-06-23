@@ -96,3 +96,12 @@ observability:
     collector_endpoint: "http://otelcol:4317"
     sample_rate: 1.0
     export_interval_ms: 5000
+
+channels:
+  mcp:
+    system_prompt_suffix: ""
+    turn_assembler:
+      silence_trigger:
+        silence_ms: 400      # session mode: 400ms of silence triggers a turn
+      max_wait_ceiling:
+        max_wait_ms: 8000    # session mode: absolute max wait

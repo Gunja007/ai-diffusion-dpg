@@ -35,6 +35,9 @@ EXPECTED_PATHS = {
     "channels.web.system_prompt_suffix",
     "channels.web.turn_assembler.silence_trigger.silence_ms",
     "channels.web.turn_assembler.max_wait_ceiling.max_wait_ms",
+    "channels.mcp.system_prompt_suffix",
+    "channels.mcp.turn_assembler.silence_trigger.silence_ms",
+    "channels.mcp.turn_assembler.max_wait_ceiling.max_wait_ms",
     # Gated chat (catalogue §4)
     "agent.consent_prompt",
     "conversation.termination_message",
