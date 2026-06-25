@@ -91,10 +91,11 @@ class TestGoogleBranch:
             p = build_chat_provider(cfg)
         assert type(p).__name__ == "GoogleChatProvider"
 
-    def test_returns_google_provider_with_gemini_alias(self, monkeypatch):
+    def test_returns_google_provider_with_gemini_api_key(self, monkeypatch):
+        monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
         monkeypatch.setenv("GEMINI_API_KEY", "dummy")
         cfg = {
-            "provider": "gemini",
+            "provider": "google",
             "primary_model": "gemini-3.5-flash",
             "timeout_ms": 5000,
             "retry_attempts": 2,

@@ -123,7 +123,7 @@ export default function DeployWizard({ slug, onBack }) {
         // Ollama often runs locally and doesn't require an API key by default.
         // If a key is needed for a cloud provider (e.g. Groq), it can be entered,
         // but we don't strictly require it here.
-      } else if (provider === 'gemini' || provider === 'google') {
+      } else if (provider === 'google') {
         if (!data.secrets?.google_api_key?.trim() && !data.secrets?.gemini_api_key?.trim()) {
           setValidationError('Google API Key is required (the agent_core config selected provider=google).')
           return

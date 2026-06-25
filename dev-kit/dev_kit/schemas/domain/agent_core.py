@@ -119,7 +119,7 @@ class AgentSection(BaseModel):
         elif self.provider == "google":
             valid = GOOGLE_MODELS
         else:
-            valid = GOOGLE_MODELS
+            valid = []
         if self.primary_model not in valid:
             raise ValueError(
                 f"primary_model {self.primary_model!r} is not valid for provider "
@@ -156,7 +156,7 @@ def _validate_helper_provider_model(provider: Optional[str], model: str) -> None
     elif provider == "google":
         valid = GOOGLE_MODELS
     else:
-        valid = GOOGLE_MODELS
+        valid = []
 
     if model not in valid:
         raise ValueError(

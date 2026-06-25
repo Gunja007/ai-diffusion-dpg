@@ -123,10 +123,10 @@ def build_chat_provider(agent_config: dict) -> ChatProviderBase:
         )
         return OllamaChatProvider(agent_config)
 
-    if provider_name in ("gemini", "google"):
+    if provider_name == "google":
         from src.chat_provider.google_provider import GoogleChatProvider
         _reconcile_features(
-            provider_name=provider_name,
+            provider_name="google",
             capabilities=GoogleChatProvider.capabilities,
             features=features,
         )

@@ -69,7 +69,7 @@ services:
       - OLLAMA_ENDPOINT                    # optional, for ollama provider
       - OLLAMA_API_KEY=${OLLAMA_API_KEY:-}
       - GOOGLE_API_KEY                     # required when agent.provider=google
-      - GEMINI_API_KEY                     # required when agent.provider=gemini
+      - GEMINI_API_KEY                     # compatibility fallback API key for google provider
       - CONFIG_FOLDER=/app/config
       - LOG_LEVEL=${LOG_LEVEL:-INFO}       # set to DEBUG for chat_provider/orchestrator tracing
     volumes:
