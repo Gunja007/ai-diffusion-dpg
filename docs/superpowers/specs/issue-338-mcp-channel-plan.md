@@ -211,31 +211,57 @@ The MCP server module owns the protocol handshake and session lifecycle, analogo
 
 **MCP tool response shape (mandatory — `finished` must be wired):**
 
-The issue's tool contract specifies the response as `{reply, session_id, finished}`. The `finished` field must be wired directly from `DoneEvent.session_ended`:
+The issue's tool contract specifies the response as `{reply, session_id, finished, error_type, error_message}`. The `finished` field must be wired directly from `DoneEvent.session_ended`. Try-except blocks catch errors from `submit_input` and timeouts/stream failures are bounded by `asyncio.wait_for`:
 
 ```python
 async def _handle_call_tool(
     mcp_reach: McpReachLayer,
     session_id: str,
     text: str,
-) -> dict:
-    """Submit a tool call to Agent Core, aggregate the SSE stream."""
-    await mcp_reach.submit_input(session_id, text, user_id=None)
+    tool_timeout_s: float = 30.0,
+    fire_session_start: bool = True,
+) -> dict[str, Any]:
+    """Submit a tool call to Agent Core and aggregate the SSE stream."""
+    if fire_session_start:
+        await mcp_reach.on_session_start(session_id, "")
+
+    try:
+        await mcp_reach.submit_input(session_id, text, user_id=None)
+    except httpx.TimeoutException:
+        return {"reply": "", "session_id": session_id, "finished": True, "error_type": "timeout", "error_message": "Agent Core did not respond in time."}
+    except httpx.HTTPStatusError as exc:
+        return {"reply": "", "session_id": session_id, "finished": True, "error_type": "upstream_error", "error_message": f"Agent Core returned {exc.response.status_code}."}
+    except Exception:
+        return {"reply": "", "session_id": session_id, "finished": True, "error_type": "internal_error", "error_message": "Unexpected error submitting to Agent Core."}
 
     parts: list[str] = []
     finished: bool = False
-    async for event in mcp_reach.subscribe_events(session_id):
-        if isinstance(event, SentenceEvent):
-            parts.append(event.text)
-        elif isinstance(event, DoneEvent):
-            # Wire session_ended → finished so callers can detect conversation end.
-            finished = event.session_ended
-            break
+
+    async def _aggregate() -> None:
+        nonlocal finished
+        async for event in mcp_reach.subscribe_events(session_id):
+            if isinstance(event, SentenceEvent):
+                parts.append(event.text)
+            elif isinstance(event, DoneEvent):
+                finished = event.session_ended
+                break
+
+    try:
+        await asyncio.wait_for(_aggregate(), timeout=tool_timeout_s)
+    except asyncio.TimeoutError:
+        return {"reply": " ".join(parts).strip(), "session_id": session_id, "finished": True, "error_type": "stream_timeout", "error_message": f"Agent Core stream did not complete within {tool_timeout_s}s."}
+    except Exception:
+        return {"reply": " ".join(parts).strip(), "session_id": session_id, "finished": True, "error_type": "stream_error", "error_message": "Error reading Agent Core response stream."}
+
+    if finished:
+        await mcp_reach.on_session_end(session_id)
 
     return {
         "reply": " ".join(parts).strip(),
         "session_id": session_id,
         "finished": finished,
+        "error_type": None,
+        "error_message": None,
     }
 ```
 
@@ -266,7 +292,7 @@ Mirrors `reach_layer/cli/pyproject.toml`. Dependencies:
 #### [NEW] `reach_layer/mcp/Dockerfile`
 
 Mirrors `reach_layer/cli/Dockerfile` and `reach_layer/web/Dockerfile`:
-- Base image: `python:3.12-slim`
+- Base image: `python:3.14-slim`
 - Copy `reach_layer/base/` → install `reach_layer_base` package
 - Copy `reach_layer/mcp/` → install
 - `CMD ["python", "main.py"]`
@@ -286,8 +312,10 @@ Per `testing-requirements.md`, required test cases:
 | `test_init_raises_on_none_config` | `config=None` → `ValueError` (from base) |
 | `test_init_calls_super_with_mcp_channel_name` | `self.channel_name == "mcp"` |
 | `test_init_assembly_mode_is_session` | `self.assembly_mode == "session"` (not `direct`) |
-| `test_on_session_start_logs` | `on_session_start` does not raise and emits a structured log |
-| `test_on_session_end_logs` | `on_session_end` does not raise and emits a structured log |
+| `test_on_session_start_logs` | `on_session_start` does not raise and emits a structured log on valid ID |
+| `test_on_session_start_invalid` | `on_session_start` skips when session_id is empty/whitespace |
+| `test_on_session_end_logs` | `on_session_end` does not raise and emits a structured log on valid ID |
+| `test_on_session_end_invalid` | `on_session_end` skips when session_id is empty/whitespace |
 | `test_run_loop_is_noop` | `run_loop()` returns without raising |
 | `test_abc_contract_enforced` | Instantiating an incomplete subclass (missing abstract methods) raises `TypeError` |
 
@@ -300,6 +328,13 @@ Per `testing-requirements.md`, required test cases:
 | `test_handle_call_tool_finished_true_when_session_ended` | `finished=True` when `DoneEvent.session_ended=True` |
 | `test_handle_call_tool_empty_reply_on_no_sentences` | `DoneEvent` with no preceding `SentenceEvent` → `reply=""`, not an error |
 | `test_handle_call_tool_does_not_call_parse_sse_event_directly` | `ReachLayerBase._parse_sse_event` is never called by `_handle_call_tool` |
+| `test_fire_session_start_false_skips_hook` | `fire_session_start=False` bypasses the `on_session_start` hook |
+| `test_submit_input_timeout_returns_error_response` | `submit_input` timeout maps to `error_type='timeout'` |
+| `test_submit_input_http_error_returns_error_response` | `submit_input` status error maps to `error_type='upstream_error'` |
+| `test_submit_input_unexpected_error_returns_error_response` | `submit_input` generic exception maps to `error_type='internal_error'` |
+| `test_subscribe_events_timeout_returns_partial_reply` | Stream timeout aggregates partial reply and maps to `error_type='stream_timeout'` |
+| `test_on_session_start_fires_only_on_first_call` | `on_session_start` fires exactly once per multi-turn session |
+| `test_on_session_start_fires_again_after_session_ends` | Reconnect using same session ID re-fires `on_session_start` |
 
 ---
 
@@ -536,6 +571,13 @@ Add the `reach_layer_mcp` service block (after `reach_layer_voice`):
 # Reach Layer — MCP channel (port 8007) — GH-338
 # MCP server: receives Model Context Protocol tool calls from MCP hosts
 # (Claude Desktop, Cursor, etc.) and routes them to Agent Core.
+#
+# Port 8007 is intentionally NOT host-published until Scope 3 auth
+# (issue #338) lands. The service is reachable within dpg_net by
+# co-deployed MCP clients. For local development/testing, add:
+#   ports:
+#     - "8007:8007"
+# before running docker compose.
 # ---------------------------------------------------------------------------
 reach_layer_mcp:
   image: sanketikahub/dpg-reach-layer-mcp:latest
@@ -543,8 +585,6 @@ reach_layer_mcp:
   container_name: reach_layer_mcp
   environment:
     - CONFIG_FOLDER=/app/config
-  ports:
-    - "8007:8007"
   volumes:
     - ../../dev-kit/dpg/reach_layer.yaml:/app/config/dpg.yaml:ro
     - ../../dev-kit/configs/${DOMAIN:-kkb}/reach_layer.yaml:/app/config/domain.yaml:ro
