@@ -1,23 +1,25 @@
 """Tests for McpReachLayer and the MCP server.
 
 Covers constructor behavior, lifecycle logs, run_loop no-op,
-and _handle_call_tool SSE stream aggregation and finished flag mapping.
+and _handle_call_tool SSE stream aggregation and finished flag mapping,
+error handling (submit_input failures), stream timeout, and session-start
+guard (fires once per session, resets after session ends).
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
-from pydantic import ValidationError
-
 from reach_layer_base import DoneEvent, SentenceEvent, TextChannelBase
 from src.mcp_reach import McpReachLayer
-from src.server import _handle_call_tool
+from src.server import _handle_call_tool, create_app
 
 
-def _make_config(port: int | None = None) -> dict:
+def _make_config(port: int | None = None, tool_timeout_s: float | None = None) -> dict:
     """Helper to generate a base configuration dict."""
     cfg = {
         "agent_core_client": {
@@ -34,7 +36,23 @@ def _make_config(port: int | None = None) -> dict:
     }
     if port is not None:
         cfg["reach_layer"]["channels"]["mcp"]["port"] = port
+    if tool_timeout_s is not None:
+        cfg["reach_layer"]["channels"]["mcp"]["tool_timeout_s"] = tool_timeout_s
     return cfg
+
+
+def _make_mock_reach(session_ended: bool = False) -> MagicMock:
+    """Helper to create a fully mocked McpReachLayer with a completing stream."""
+    mock_reach = MagicMock(spec=McpReachLayer)
+    mock_reach.on_session_start = AsyncMock()
+    mock_reach.on_session_end = AsyncMock()
+    mock_reach.submit_input = AsyncMock()
+
+    async def _ok_subscribe(session_id: str, user_id: str | None = None):
+        yield DoneEvent(turn_status="completed", session_ended=session_ended)
+
+    mock_reach.subscribe_events = _ok_subscribe
+    return mock_reach
 
 
 # ---------------------------------------------------------------------------
@@ -136,7 +154,7 @@ class TestMcpReachLayer:
 
 
 # ---------------------------------------------------------------------------
-# server._handle_call_tool unit tests
+# server._handle_call_tool — normal / edge path tests
 # ---------------------------------------------------------------------------
 
 class TestHandleCallTool:
@@ -161,6 +179,8 @@ class TestHandleCallTool:
         assert result["reply"] == "Hello world."
         assert result["session_id"] == "s-1"
         assert result["finished"] is False
+        assert result["error_type"] is None
+        assert result["error_message"] is None
         mock_reach.on_session_start.assert_awaited_once_with("s-1", "")
         mock_reach.on_session_end.assert_not_awaited()
 
@@ -233,3 +253,164 @@ class TestHandleCallTool:
         with patch("reach_layer_base.ReachLayerBase._parse_sse_event") as mock_parse:
             await _handle_call_tool(mock_reach, "s-1", "msg")
             mock_parse.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_fire_session_start_false_skips_hook(self) -> None:
+        """Verify fire_session_start=False bypasses on_session_start."""
+        mock_reach = MagicMock(spec=McpReachLayer)
+        mock_reach.on_session_start = AsyncMock()
+        mock_reach.on_session_end = AsyncMock()
+        mock_reach.submit_input = AsyncMock()
+
+        async def fake_subscribe(session_id: str, user_id: str | None = None):
+            yield DoneEvent(turn_status="completed", session_ended=False)
+
+        mock_reach.subscribe_events = fake_subscribe
+
+        await _handle_call_tool(mock_reach, "s-1", "hi", fire_session_start=False)
+        mock_reach.on_session_start.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# server._handle_call_tool — failure path tests
+# ---------------------------------------------------------------------------
+
+class TestHandleCallToolFailures:
+    """Failure-path tests for _handle_call_tool: submit_input errors and stream timeout."""
+
+    @pytest.mark.asyncio
+    async def test_submit_input_timeout_returns_error_response(self) -> None:
+        """submit_input raising TimeoutException → error_type='timeout', finished=True."""
+        mock_reach = MagicMock(spec=McpReachLayer)
+        mock_reach.on_session_start = AsyncMock()
+        mock_reach.submit_input = AsyncMock(
+            side_effect=httpx.TimeoutException("connect timed out")
+        )
+
+        result = await _handle_call_tool(mock_reach, "s-err", "hi")
+
+        assert result["reply"] == ""
+        assert result["session_id"] == "s-err"
+        assert result["finished"] is True
+        assert result["error_type"] == "timeout"
+        assert result["error_message"] == "Agent Core did not respond in time."
+
+    @pytest.mark.asyncio
+    async def test_submit_input_http_error_returns_error_response(self) -> None:
+        """submit_input raising HTTPStatusError → error_type='upstream_error', finished=True."""
+        mock_reach = MagicMock(spec=McpReachLayer)
+        mock_reach.on_session_start = AsyncMock()
+
+        mock_response = MagicMock()
+        mock_response.status_code = 503
+        http_error = httpx.HTTPStatusError(
+            "503", request=MagicMock(), response=mock_response
+        )
+        mock_reach.submit_input = AsyncMock(side_effect=http_error)
+
+        result = await _handle_call_tool(mock_reach, "s-err", "hi")
+
+        assert result["reply"] == ""
+        assert result["finished"] is True
+        assert result["error_type"] == "upstream_error"
+        assert "503" in result["error_message"]
+
+    @pytest.mark.asyncio
+    async def test_submit_input_unexpected_error_returns_error_response(self) -> None:
+        """submit_input raising unexpected RuntimeError → error_type='internal_error'."""
+        mock_reach = MagicMock(spec=McpReachLayer)
+        mock_reach.on_session_start = AsyncMock()
+        mock_reach.submit_input = AsyncMock(side_effect=RuntimeError("boom"))
+
+        result = await _handle_call_tool(mock_reach, "s-err", "hi")
+
+        assert result["reply"] == ""
+        assert result["finished"] is True
+        assert result["error_type"] == "internal_error"
+        assert result["error_message"] == "Unexpected error submitting to Agent Core."
+
+    @pytest.mark.asyncio
+    async def test_subscribe_events_timeout_returns_partial_reply(self) -> None:
+        """subscribe_events stalling past timeout → error_type='stream_timeout', partial reply."""
+        mock_reach = MagicMock(spec=McpReachLayer)
+        mock_reach.on_session_start = AsyncMock()
+        mock_reach.submit_input = AsyncMock()
+
+        async def stalling_subscribe(session_id: str, user_id: str | None = None):
+            yield SentenceEvent(text="Hello", sentence_index=0, turn_id="t1")
+            await asyncio.sleep(10)  # stall — will be cancelled by wait_for
+            yield DoneEvent(turn_status="completed", session_ended=False)
+
+        mock_reach.subscribe_events = stalling_subscribe
+
+        result = await _handle_call_tool(
+            mock_reach, "s-stall", "hi", tool_timeout_s=0.05
+        )
+
+        assert result["error_type"] == "stream_timeout"
+        assert result["reply"] == "Hello"    # partial sentences already received
+        assert result["finished"] is True
+
+    @pytest.mark.asyncio
+    async def test_on_session_start_fires_only_on_first_call(self) -> None:
+        """create_app active-session guard: on_session_start fires exactly once per session."""
+        layer = McpReachLayer(_make_config())
+        layer.on_session_start = AsyncMock()
+        layer.on_session_end = AsyncMock()
+        layer.submit_input = AsyncMock()
+
+        async def fake_subscribe(session_id: str, user_id: str | None = None):
+            yield DoneEvent(turn_status="completed", session_ended=False)
+
+        layer.subscribe_events = fake_subscribe
+
+        app = create_app(layer, _make_config())
+
+        from httpx import AsyncClient, ASGITransport
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            await client.post("/call_tool", json={"session_id": "multi-1", "text": "turn 1"})
+            await client.post("/call_tool", json={"session_id": "multi-1", "text": "turn 2"})
+
+        # on_session_start must have fired exactly once for session "multi-1"
+        layer.on_session_start.assert_awaited_once_with("multi-1", "")
+
+    @pytest.mark.asyncio
+    async def test_on_session_start_fires_again_after_session_ends(self) -> None:
+        """After session_ended=True, a new call with same session_id re-fires on_session_start."""
+        layer = McpReachLayer(_make_config())
+        layer.on_session_start = AsyncMock()
+        layer.on_session_end = AsyncMock()
+        layer.submit_input = AsyncMock()
+
+        call_count = 0
+
+        async def fake_subscribe(session_id: str, user_id: str | None = None):
+            nonlocal call_count
+            call_count += 1
+            # First call ends the session; second call is a fresh reconnect.
+            yield DoneEvent(
+                turn_status="completed",
+                session_ended=(call_count == 1),
+            )
+
+        layer.subscribe_events = fake_subscribe
+
+        app = create_app(layer, _make_config())
+
+        from httpx import AsyncClient, ASGITransport
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            resp1 = await client.post(
+                "/call_tool", json={"session_id": "reuse-1", "text": "first"}
+            )
+            assert resp1.json()["finished"] is True
+
+            # Same session_id — should trigger on_session_start again
+            await client.post(
+                "/call_tool", json={"session_id": "reuse-1", "text": "reconnect"}
+            )
+
+        assert layer.on_session_start.await_count == 2

@@ -396,6 +396,13 @@ services:
   # Reach Layer — MCP channel (port 8007) — GH-338
   # MCP server: receives Model Context Protocol tool calls from MCP hosts
   # (Claude Desktop, Cursor, etc.) and routes them to Agent Core.
+  #
+  # Port 8007 is intentionally NOT host-published until Scope 3 auth
+  # (issue #338) lands. The service is reachable within dpg_net by
+  # co-deployed MCP clients. For local development/testing, add:
+  #   ports:
+  #     - "8007:8007"
+  # before running docker compose.
   # ---------------------------------------------------------------------------
   reach_layer_mcp:
     image: sanketikahub/dpg-reach-layer-mcp:latest
@@ -403,8 +410,6 @@ services:
     container_name: reach_layer_mcp
     environment:
       - CONFIG_FOLDER=/app/config
-    ports:
-      - "8007:8007"
     volumes:
       - ../../dev-kit/dpg/reach_layer.yaml:/app/config/dpg.yaml:ro
       - ../../dev-kit/configs/${DOMAIN:-kkb}/reach_layer.yaml:/app/config/domain.yaml:ro

@@ -6,7 +6,6 @@ MCP channel adapter implementation extending TextChannelBase.
 from __future__ import annotations
 
 import logging
-from typing import Optional
 
 from reach_layer_base import TextChannelBase
 
