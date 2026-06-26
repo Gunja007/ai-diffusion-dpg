@@ -60,6 +60,18 @@ class ProviderConfigError(ChatProviderError):
 class ProviderAPIError(ChatProviderError):
     """Non-retryable provider-side error (auth failure, persistent 4xx/5xx)."""
 
+    def __init__(self, message: str, error_type: str | None = None, error_message: str | None = None) -> None:
+        """Initialise ProviderAPIError.
+
+        Args:
+            message: The raw error message string.
+            error_type: The categorized error type (e.g. rate_limit, timeout, safety_blocked).
+            error_message: The detailed, original error message string.
+        """
+        super().__init__(message)
+        self.error_type = error_type
+        self.error_message = error_message
+
 
 class ToolUseRequested(Exception):
     """Streaming-only signal: model emitted tool_use blocks; caller executes and resumes.
@@ -72,6 +84,20 @@ class ToolUseRequested(Exception):
         self.tool_calls = tool_calls
         names = ", ".join(tc.tool_name for tc in tool_calls)
         super().__init__(f"LLM requested tool use: {names}")
+
+
+
+SAFE_MESSAGES: dict[str, str] = {
+    "rate_limit": "We're receiving too many requests right now. Please wait a moment and try again.",
+    "timeout": "We're having trouble connecting to the AI service right now. Please try again shortly.",
+    "safety_blocked": "The request was blocked by the safety filters.",
+    "recitation_blocked": "The request was blocked because it contained copyrighted or repetitive content.",
+    "api_error": "We're having trouble connecting to the AI service right now. Please try again shortly.",
+    "internal_server_error": "An unexpected server error occurred. Please try again shortly.",
+    "empty_response": "We're having trouble connecting to the AI service right now. Please try again shortly.",
+}
+
+DEFAULT_SAFE_MESSAGE = "We're having trouble connecting to the AI service right now. Please try again shortly."
 
 
 # ---------------------------------------------------------------------------

@@ -27,6 +27,7 @@ from pydantic import BaseModel, Field
 
 from src.orchestrator import AgentCore
 from src.models import DoneEvent, SegmentInput, TurnInput, TurnResult
+from src.chat_provider.base import SAFE_MESSAGES, DEFAULT_SAFE_MESSAGE
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +56,8 @@ class ProcessTurnResponse(BaseModel):
     was_tool_used: bool
     model_used: str
     latency_ms: int
+    error_type: str | None = None
+    error_message: str | None = None
 
 
 class SegmentInputRequest(BaseModel):
@@ -158,6 +161,10 @@ def create_orchestration_app(
                 },
             )
 
+            safe_err_msg = None
+            if result.error_type:
+                safe_err_msg = SAFE_MESSAGES.get(result.error_type, DEFAULT_SAFE_MESSAGE)
+
             return ProcessTurnResponse(
                 session_id=result.session_id,
                 response_text=result.response_text,
@@ -165,12 +172,15 @@ def create_orchestration_app(
                 was_tool_used=result.was_tool_used,
                 model_used=result.model_used,
                 latency_ms=result.latency_ms,
+                error_type=result.error_type,
+                error_message=safe_err_msg or result.error_message,
             )
 
         except Exception as e:
             latency_ms = int((time.time() - start) * 1000)
             logger.error(
                 "orchestration_server.process_turn_error",
+                exc_info=True,
                 extra={
                     "operation": "orchestration_server.process_turn",
                     "status": "failure",
@@ -180,13 +190,20 @@ def create_orchestration_app(
                 },
             )
             # Return a safe structured error response rather than crashing
+            error_type = getattr(e, "error_type", None)
+            if error_type is None:
+                from src.chat_provider.base import ProviderAPIError
+                error_type = "api_error" if isinstance(e, ProviderAPIError) else "internal_server_error"
+            error_message = SAFE_MESSAGES.get(error_type, DEFAULT_SAFE_MESSAGE)
             return ProcessTurnResponse(
                 session_id=session_id,
-                response_text="I'm having trouble processing your request right now. Please try again.",
+                response_text="We're having trouble connecting to the AI service right now. Please try again shortly.",
                 was_escalated=False,
                 was_tool_used=False,
                 model_used="",
                 latency_ms=latency_ms,
+                error_type=error_type,
+                error_message=error_message,
             )
 
     @app.post("/stream_turn")
@@ -229,6 +246,7 @@ def create_orchestration_app(
             except Exception as e:
                 logger.error(
                     "orchestration_server.stream_turn_error",
+                    exc_info=True,
                     extra={
                         "operation": "orchestration_server.stream_turn",
                         "status": "failure",
@@ -237,9 +255,16 @@ def create_orchestration_app(
                         "latency_ms": int((time.time() - start) * 1000),
                     },
                 )
+                from src.chat_provider.base import ProviderAPIError
+                error_type = getattr(e, "error_type", None)
+                if error_type is None:
+                    error_type = "api_error" if isinstance(e, ProviderAPIError) else "internal_server_error"
+                error_message = SAFE_MESSAGES.get(error_type, DEFAULT_SAFE_MESSAGE)
                 yield DoneEvent(
                     turn_status="abandoned",
                     latency_ms=int((time.time() - start) * 1000),
+                    error_type=error_type,
+                    error_message=error_message,
                 ).to_sse()
             finally:
                 logger.info(
