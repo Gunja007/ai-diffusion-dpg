@@ -68,7 +68,8 @@ services:
       - OPENAI_API_KEY                     # required when agent.provider=openai or any helper provider=openai
       - OLLAMA_ENDPOINT                    # optional, for ollama provider
       - OLLAMA_API_KEY=${OLLAMA_API_KEY:-}
-      - GEMINI_API_KEY                     # required when agent.provider=gemini
+      - GOOGLE_API_KEY                     # required when agent.provider=google
+      - GEMINI_API_KEY                     # compatibility fallback API key for google provider
       - CONFIG_FOLDER=/app/config
       - LOG_LEVEL=${LOG_LEVEL:-INFO}       # set to DEBUG for chat_provider/orchestrator tracing
     volumes:
@@ -103,6 +104,7 @@ services:
       - ANTHROPIC_API_KEY                  # inherited from shell: export ANTHROPIC_API_KEY=sk-...
       - OPENAI_API_KEY
       - OLLAMA_ENDPOINT
+      - GOOGLE_API_KEY
       - GEMINI_API_KEY
       - DEVKIT_LOG_LEVEL=${DEVKIT_LOG_LEVEL:-INFO}
       - REACH_LAYER_URL=${REACH_LAYER_URL:-http://host.docker.internal:8005}

@@ -74,11 +74,11 @@ COMPOSE_FILE = _AUTOMATION / "docker" / "docker-compose.dev.yml"
 
 _anthropic_api_key = os.environ.get("ANTHROPIC_API_KEY", "")
 _openai_api_key = os.environ.get("OPENAI_API_KEY", "")
-_gemini_api_key = os.environ.get("GEMINI_API_KEY", "")
+_google_api_key = os.environ.get("GOOGLE_API_KEY", "") or os.environ.get("GEMINI_API_KEY", "")
 
-if not _anthropic_api_key and not _openai_api_key and not _gemini_api_key:
+if not _anthropic_api_key and not _openai_api_key and not _google_api_key:
     raise EnvironmentError(
-        "Neither ANTHROPIC_API_KEY nor OPENAI_API_KEY nor GEMINI_API_KEY environment variable is set. "
+        "Neither ANTHROPIC_API_KEY nor OPENAI_API_KEY nor GOOGLE_API_KEY environment variable is set. "
         "Set at least one before starting the server."
     )
 
@@ -520,8 +520,8 @@ if not _devkit_provider:
     elif model_env.startswith("claude-"):
         _devkit_provider = "anthropic"
     else:
-        if _gemini_api_key and not _anthropic_api_key and not _openai_api_key:
-            _devkit_provider = "gemini"
+        if _google_api_key and not _anthropic_api_key and not _openai_api_key:
+            _devkit_provider = "google"
         elif _openai_api_key and not _anthropic_api_key:
             _devkit_provider = "openai"
         else:
@@ -531,22 +531,16 @@ if not _devkit_provider:
 # guard (line 78) only checks that *some* key exists; this catches the
 # misconfiguration where e.g. DEVKIT_PROVIDER=openai but only
 # ANTHROPIC_API_KEY is set — which would silently 401 at runtime.
-if _devkit_provider == "openai" and not _openai_api_key:
+if _devkit_provider == "google" and not _google_api_key:
     raise EnvironmentError(
-        "DEVKIT_PROVIDER is 'openai' (or was auto-detected from DEVKIT_MODEL) "
-        "but OPENAI_API_KEY is not set. Set OPENAI_API_KEY before starting "
-        "the server."
-    )
-if _devkit_provider == "anthropic" and not _anthropic_api_key:
-    raise EnvironmentError(
-        "DEVKIT_PROVIDER is 'anthropic' (or was auto-detected from DEVKIT_MODEL) "
-        "but ANTHROPIC_API_KEY is not set. Set ANTHROPIC_API_KEY before starting "
+        "DEVKIT_PROVIDER is 'google' (or was auto-detected from DEVKIT_MODEL) "
+        "but GOOGLE_API_KEY (or GEMINI_API_KEY) is not set. Set GOOGLE_API_KEY before starting "
         "the server."
     )
 
 if _devkit_provider == "openai":
     _DEVKIT_MODEL = os.environ.get("DEVKIT_MODEL", "gpt-4o-2024-08-06")
-elif _devkit_provider == "gemini" or _devkit_provider == "google":  
+elif _devkit_provider == "google":  
     _DEVKIT_MODEL = os.environ.get("DEVKIT_MODEL", "gemini-2.0-flash")
 else:
     _DEVKIT_MODEL = os.environ.get("DEVKIT_MODEL", "claude-haiku-4-5-20251001")
@@ -754,11 +748,11 @@ def _build_devkit_llm_call():
                 raw_content=raw_content
             )
 
-        elif _devkit_provider == "gemini" or _devkit_provider == "google":
+        elif _devkit_provider == "google":
             from google import genai
             from google.genai import types
             
-            gemini_messages = []
+            google_messages = []
             
             tool_id_to_name = {}
             for msg in messages:
@@ -771,7 +765,7 @@ def _build_devkit_llm_call():
             for msg in messages:
                 role = msg.get("role")
                 content = msg.get("content")
-                gemini_role = "user" if role == "user" else "model"
+                google_role = "user" if role == "user" else "model"
                 parts = []
                 
                 if isinstance(content, str):
@@ -792,11 +786,11 @@ def _build_devkit_llm_call():
                                 name=func_name,
                                 response={"result": block.get("content")}
                             ))
-                gemini_messages.append(types.Content(role=gemini_role, parts=parts))
+                google_messages.append(types.Content(role=google_role, parts=parts))
 
-            gemini_tools = []
+            google_tools = []
             for tool in DEVKIT_TOOL_SCHEMAS:
-                gemini_tools.append(types.Tool(
+                google_tools.append(types.Tool(
                     function_declarations=[
                         types.FunctionDeclaration(
                             name=tool["name"],
@@ -805,19 +799,19 @@ def _build_devkit_llm_call():
                     ]
                 ))
 
-            sync_client = genai.Client(api_key=_gemini_api_key, http_options={"timeout": 30.0})
+            sync_client = genai.Client(api_key=_google_api_key, http_options={"timeout": 30.0})
             
             config_kwargs = {
                 "system_instruction": system_prompt if system_prompt else None,
                 "temperature": 0.0,
                 "max_output_tokens": _DEVKIT_MAX_TOKENS,
             }
-            if gemini_tools:
-                config_kwargs["tools"] = gemini_tools
+            if google_tools:
+                config_kwargs["tools"] = google_tools
 
             response = sync_client.models.generate_content(
                 model=_DEVKIT_MODEL,
-                contents=gemini_messages,
+                contents=google_messages,
                 config=types.GenerateContentConfig(**config_kwargs)
             )
 
@@ -825,7 +819,7 @@ def _build_devkit_llm_call():
             has_candidates = bool(response.candidates and len(response.candidates) > 0)
             if not has_candidates:
                 logger.warning(
-                    "devkit.gemini.empty_candidates",
+                    "devkit.google.empty_candidates",
                     extra={
                         "operation": "_build_devkit_llm_call",
                         "status": "failure",

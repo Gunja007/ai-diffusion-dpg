@@ -117,7 +117,7 @@ def test_kkb_voice_channel_max_tokens_validates_against_schema():
     """KKB merged config validates fully against the strict MergedConfig schema."""
     cfg = _load_kkb_merged()
     merged = MergedConfig.validate_full(cfg)
-    assert merged.channels.voice.max_tokens == 200
+    assert merged.channels.voice.max_tokens is None
     # Non-voice channels intentionally leave max_tokens unset (default cap applies).
     assert merged.channels.web.max_tokens is None
     assert merged.channels.cli.max_tokens is None

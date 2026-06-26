@@ -440,7 +440,7 @@ Tracked separately, *not* done in this redesign:
 
 - AzureOpenAI provider — config + auth differences over OpenAI; ~1 day.
 - Ollama provider — capability flags off, `base_url` override; ~1 day.
-- Google Gemini provider.
+- Google provider.
 - Cross-provider fallback / routing.
 - Image generation, TTS, ASR, Realtime — separate base classes.
 - OpenAI prompt-caching wiring (when added, flip `OpenAIChatProvider.capabilities.supports_prompt_cache=True` and a small `_to_wire` change).

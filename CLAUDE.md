@@ -15,7 +15,7 @@ export ANTHROPIC_API_KEY=sk-ant-...
 # or
 export OPENAI_API_KEY=sk-...
 # or
-export GEMINI_API_KEY=AIza...
+export GOOGLE_API_KEY=AIza...
 cd automation/docker
 docker compose -f docker-compose.dev.yml up -d                    # all services except reach_layer
 docker compose -f docker-compose.dev.yml run --rm reach_layer     # interactive CLI session
@@ -53,7 +53,7 @@ The framework assembles AI-powered voice/chat systems from **7 standardised DPG 
 
 ### Block responsibilities
 
-**Agent Core** — turn-time orchestrator and sole LLM caller. Runs Language Normalisation and NLU internally, then builds the system prompt (`manager_agent.build_system_prompt()` — subagent prompt + Trust constraints + required disclosures; KE chunks enter via the `knowledge_retrieval` tool result, not via KE-side prompt assembly). Owns the tool execution loop (LLM → tool → LLM) and retry. Knowledge Engine is called only when the LLM invokes the `knowledge_retrieval` internal tool (subagents that do not include `knowledge_retrieval` in their tool list never trigger a KE call). Stateless between turns — any instance can handle any session. All LLM calls go through `agent_core/src/chat_provider/`. The package owns provider selection (Anthropic + OpenAI + Gemini today; Azure/Ollama as follow-ups), neutral typing, retry/timeout, and OTel telemetry; the concrete provider files (`anthropic_provider.py`, `openai_provider.py`, `gemini_provider.py`) are the only places that import their respective SDKs. Also exposes `POST /internal/llm/call` as a future LLM proxy (implemented, not yet wired).
+**Agent Core** — turn-time orchestrator and sole LLM caller. Runs Language Normalisation and NLU internally, then builds the system prompt (`manager_agent.build_system_prompt()` — subagent prompt + Trust constraints + required disclosures; KE chunks enter via the `knowledge_retrieval` tool result, not via KE-side prompt assembly). Owns the tool execution loop (LLM → tool → LLM) and retry. Knowledge Engine is called only when the LLM invokes the `knowledge_retrieval` internal tool (subagents that do not include `knowledge_retrieval` in their tool list never trigger a KE call). Stateless between turns — any instance can handle any session. All LLM calls go through `agent_core/src/chat_provider/`. The package owns provider selection (Anthropic + OpenAI + Google today; Azure/Ollama as follow-ups), neutral typing, retry/timeout, and OTel telemetry; the concrete provider files (`anthropic_provider.py`, `openai_provider.py`, `google_provider.py`) are the only places that import their respective SDKs. Also exposes `POST /internal/llm/call` as a future LLM proxy (implemented, not yet wired).
 
 **Knowledge Engine** — returns ranked retrieval chunks (does **not** assemble the final LLM prompt — Agent Core does). Receives NLU results and session state from Agent Core in the request body. Stateless on the retrieval path. Internal components: Glossary & Domain Vocabulary, Static Knowledge Base (ChromaDB semantic RAG), Multimodal Input Handler, and an SQLite **ingestion ledger** that tracks per-document state (queued / ingested / failed / `refreshed_at`) for documents fed by `scripts/ingest.py` or by Reach Layer's document-upload endpoint.
 

@@ -1,4 +1,4 @@
-"""Tests for GeminiChatProvider — init, config validation, wire translation.
+"""Tests for GoogleChatProvider — init, config validation, wire translation.
 
 Tests live in ``agent_core/tests/chat_provider/`` per project convention.
 Mock all external dependencies — no real API calls.
@@ -11,7 +11,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from src.chat_provider.base import ProviderConfigError, ToolUseRequested, ProviderAPIError
-from src.chat_provider.gemini_provider import GeminiChatProvider, _is_transient_error
+from src.chat_provider.google_provider import GoogleChatProvider, _is_transient_error
 from src.chat_provider.types import (
     ChatRequest,
     ChatResponse,
@@ -34,9 +34,9 @@ from src.chat_provider.types import (
 
 
 @pytest.fixture()
-def _gemini_env(monkeypatch):
-    """Set the GEMINI_API_KEY env var for all tests that need it."""
-    monkeypatch.setenv("GEMINI_API_KEY", "test-dummy-key")
+def _google_env(monkeypatch):
+    """Set the GOOGLE_API_KEY env var for all tests that need it."""
+    monkeypatch.setenv("GOOGLE_API_KEY", "test-dummy-key")
 
 
 @pytest.fixture()
@@ -50,10 +50,10 @@ def base_config():
 
 
 @pytest.fixture()
-def provider(_gemini_env, base_config):
-    """Return a GeminiChatProvider with mocked genai.Client."""
-    with patch("src.chat_provider.gemini_provider.genai.Client"):
-        return GeminiChatProvider(base_config)
+def provider(_google_env, base_config):
+    """Return a GoogleChatProvider with mocked genai.Client."""
+    with patch("src.chat_provider.google_provider.genai.Client"):
+        return GoogleChatProvider(base_config)
 
 
 # ---------------------------------------------------------------------------
@@ -61,46 +61,46 @@ def provider(_gemini_env, base_config):
 # ---------------------------------------------------------------------------
 
 
-def test_init_success(_gemini_env, base_config):
+def test_init_success(_google_env, base_config):
     """Provider initialises with a valid config and env key."""
-    with patch("src.chat_provider.gemini_provider.genai.Client"):
-        p = GeminiChatProvider(base_config)
+    with patch("src.chat_provider.google_provider.genai.Client"):
+        p = GoogleChatProvider(base_config)
         assert p.get_active_model() == "gemini-3.5-flash"
 
 
 def test_init_empty_config():
     """Empty config raises ProviderConfigError."""
     with pytest.raises(ProviderConfigError, match="non-empty"):
-        GeminiChatProvider({})
+        GoogleChatProvider({})
 
 
-def test_init_missing_model(_gemini_env):
+def test_init_missing_model(_google_env):
     """Missing primary_model raises ProviderConfigError."""
     with pytest.raises(ProviderConfigError, match="primary_model"):
-        with patch("src.chat_provider.gemini_provider.genai.Client"):
-            GeminiChatProvider({"timeout_ms": 10000, "retry_attempts": 2})
+        with patch("src.chat_provider.google_provider.genai.Client"):
+            GoogleChatProvider({"timeout_ms": 10000, "retry_attempts": 2})
 
 
-def test_init_missing_timeout(_gemini_env):
+def test_init_missing_timeout(_google_env):
     """Missing timeout_ms raises ProviderConfigError."""
     with pytest.raises(ProviderConfigError, match="timeout_ms"):
-        with patch("src.chat_provider.gemini_provider.genai.Client"):
-            GeminiChatProvider({"primary_model": "gemini-3.5-flash", "retry_attempts": 2})
+        with patch("src.chat_provider.google_provider.genai.Client"):
+            GoogleChatProvider({"primary_model": "gemini-3.5-flash", "retry_attempts": 2})
 
 
-def test_init_missing_retry(_gemini_env):
+def test_init_missing_retry(_google_env):
     """Missing retry_attempts raises ProviderConfigError."""
     with pytest.raises(ProviderConfigError, match="retry_attempts"):
-        with patch("src.chat_provider.gemini_provider.genai.Client"):
-            GeminiChatProvider({"primary_model": "gemini-3.5-flash", "timeout_ms": 10000})
+        with patch("src.chat_provider.google_provider.genai.Client"):
+            GoogleChatProvider({"primary_model": "gemini-3.5-flash", "timeout_ms": 10000})
 
 
 def test_init_missing_api_key(monkeypatch):
     """Missing API key raises ProviderConfigError."""
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
-    with pytest.raises(ProviderConfigError, match="No Gemini API key"):
-        GeminiChatProvider({
+    with pytest.raises(ProviderConfigError, match="No Google API key"):
+        GoogleChatProvider({
             "primary_model": "gemini-3.5-flash",
             "timeout_ms": 10000,
             "retry_attempts": 2,
@@ -111,8 +111,8 @@ def test_init_api_key_from_config(monkeypatch):
     """API key passed in config dict takes precedence."""
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
-    with patch("src.chat_provider.gemini_provider.genai.Client"):
-        p = GeminiChatProvider({
+    with patch("src.chat_provider.google_provider.genai.Client"):
+        p = GoogleChatProvider({
             "primary_model": "gemini-3.5-flash",
             "timeout_ms": 10000,
             "retry_attempts": 2,
@@ -129,12 +129,12 @@ def test_init_api_key_from_config(monkeypatch):
 def test_to_wire_simple_text(provider):
     """A single user text message produces correct Content structure."""
     req = ChatRequest(
-        messages=[Message(role="user", content=[TextBlock(text="Hello Gemini")])]
+        messages=[Message(role="user", content=[TextBlock(text="Hello Google")])]
     )
     contents, kwargs = provider._to_wire(req)
     assert len(contents) == 1
     assert contents[0].role == "user"
-    assert contents[0].parts[0].text == "Hello Gemini"
+    assert contents[0].parts[0].text == "Hello Google"
 
 
 def test_to_wire_role_mapping(provider):
@@ -310,7 +310,7 @@ def test_from_wire_none_candidates(provider):
 def test_from_wire_text_response(provider):
     """A normal text response is extracted correctly."""
     part_mock = MagicMock()
-    part_mock.text = "Hello from Gemini"
+    part_mock.text = "Hello from Google"
     part_mock.function_call = None
 
     candidate = MagicMock()
@@ -328,7 +328,7 @@ def test_from_wire_text_response(provider):
     resp = provider._from_wire(raw, output_format=None)
     assert resp.stop_reason == "end_turn"
     assert len(resp.content) == 1
-    assert resp.content[0].text == "Hello from Gemini"
+    assert resp.content[0].text == "Hello from Google"
     assert resp.usage.input_tokens == 10
     assert resp.usage.output_tokens == 5
 
@@ -363,7 +363,7 @@ def test_non_transient_error_not_found():
 # ---------------------------------------------------------------------------
 
 
-class _FakeGeminiChunk:
+class _FakeGoogleChunk:
     def __init__(
         self,
         text: str | None = None,
@@ -404,7 +404,7 @@ class _FakeGeminiChunk:
 
 
 class _FakeAsyncStream:
-    def __init__(self, chunks: list[_FakeGeminiChunk]) -> None:
+    def __init__(self, chunks: list[_FakeGoogleChunk]) -> None:
         self._chunks = chunks
 
     def __aiter__(self):
@@ -414,19 +414,19 @@ class _FakeAsyncStream:
         return gen()
 
 
-def _install_async_stream(provider: GeminiChatProvider, chunks: list) -> None:
+def _install_async_stream(provider: GoogleChatProvider, chunks: list) -> None:
     async def _create(*args, **kwargs):
         return _FakeAsyncStream(chunks)
     provider._async_client.aio.models.generate_content_stream = _create
 
 
-class TestGeminiStream:
+class TestGoogleStream:
     @pytest.mark.asyncio
     async def test_stream_text_success(self, provider):
         chunks = [
-            _FakeGeminiChunk(text="Hello "),
-            _FakeGeminiChunk(text="Gemini!"),
-            _FakeGeminiChunk(finish_reason="STOP", usage={"prompt_token_count": 10, "candidates_token_count": 5}),
+            _FakeGoogleChunk(text="Hello "),
+            _FakeGoogleChunk(text="Google!"),
+            _FakeGoogleChunk(finish_reason="STOP", usage={"prompt_token_count": 10, "candidates_token_count": 5}),
         ]
         _install_async_stream(provider, chunks)
 
@@ -434,14 +434,14 @@ class TestGeminiStream:
         tokens = []
         async for token in provider.stream(req):
             tokens.append(token)
-        assert tokens == ["Hello ", "Gemini!"]
+        assert tokens == ["Hello ", "Google!"]
 
     @pytest.mark.asyncio
     async def test_stream_tool_use(self, provider):
         chunks = [
-            _FakeGeminiChunk(text="Let me look that up. "),
-            _FakeGeminiChunk(function_calls=[{"id": "call_1", "name": "search", "args": {"q": "test"}}]),
-            _FakeGeminiChunk(finish_reason="STOP", usage={"prompt_token_count": 12, "candidates_token_count": 6}),
+            _FakeGoogleChunk(text="Let me look that up. "),
+            _FakeGoogleChunk(function_calls=[{"id": "call_1", "name": "search", "args": {"q": "test"}}]),
+            _FakeGoogleChunk(finish_reason="STOP", usage={"prompt_token_count": 12, "candidates_token_count": 6}),
         ]
         _install_async_stream(provider, chunks)
 
@@ -460,8 +460,8 @@ class TestGeminiStream:
     @pytest.mark.asyncio
     async def test_stream_safety_error(self, provider):
         chunks = [
-            _FakeGeminiChunk(text="Potentially unsafe "),
-            _FakeGeminiChunk(finish_reason="SAFETY"),
+            _FakeGoogleChunk(text="Potentially unsafe "),
+            _FakeGoogleChunk(finish_reason="SAFETY"),
         ]
         _install_async_stream(provider, chunks)
 
@@ -475,8 +475,8 @@ class TestGeminiStream:
     @pytest.mark.asyncio
     async def test_stream_recitation_error(self, provider):
         chunks = [
-            _FakeGeminiChunk(text="Potentially copyrighted "),
-            _FakeGeminiChunk(finish_reason="RECITATION"),
+            _FakeGoogleChunk(text="Potentially copyrighted "),
+            _FakeGoogleChunk(finish_reason="RECITATION"),
         ]
         _install_async_stream(provider, chunks)
 

@@ -214,12 +214,12 @@ def test_json_loads_failure_fallback(setup_openai_provider):
 
 
 @pytest.fixture()
-def setup_gemini_provider(monkeypatch):
-    monkeypatch.setattr(app_mod, "_devkit_provider", "gemini")
-    monkeypatch.setattr(app_mod, "_gemini_api_key", "test-gemini-key")
+def setup_google_provider(monkeypatch):
+    monkeypatch.setattr(app_mod, "_devkit_provider", "google")
+    monkeypatch.setattr(app_mod, "_google_api_key", "test-google-key")
 
 
-def test_gemini_devkit_llm_call_success(setup_gemini_provider):
+def test_google_devkit_llm_call_success(setup_google_provider):
     messages = [
         {"role": "user", "content": "Hello"},
         {
@@ -271,9 +271,9 @@ def test_gemini_devkit_llm_call_success(setup_gemini_provider):
         mock_client.models.generate_content.return_value = mock_response
         
         llm_call = app_mod._build_devkit_llm_call()
-        res = llm_call("gemini system prompt", messages)
+        res = llm_call("google system prompt", messages)
         
-        mock_client_cls.assert_called_once_with(api_key="test-gemini-key", http_options={"timeout": 30.0})
+        mock_client_cls.assert_called_once_with(api_key="test-google-key", http_options={"timeout": 30.0})
         mock_client.models.generate_content.assert_called_once()
         
         assert res.text == "Here is the result."
@@ -283,7 +283,7 @@ def test_gemini_devkit_llm_call_success(setup_gemini_provider):
         assert res.model == "gemini-2.5"
 
 
-def test_gemini_devkit_llm_call_empty_candidates(setup_gemini_provider):
+def test_google_devkit_llm_call_empty_candidates(setup_google_provider):
     mock_response = mock.MagicMock()
     mock_response.candidates = []
     mock_response.model_version = "gemini-2.5"
@@ -295,7 +295,7 @@ def test_gemini_devkit_llm_call_empty_candidates(setup_gemini_provider):
         mock_client.models.generate_content.return_value = mock_response
         
         llm_call = app_mod._build_devkit_llm_call()
-        res = llm_call("gemini system prompt", [{"role": "user", "content": "hello"}])
+        res = llm_call("google system prompt", [{"role": "user", "content": "hello"}])
         
         assert res.text == "[Response blocked by safety filters]"
         assert res.stop_reason == "error"

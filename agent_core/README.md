@@ -132,7 +132,7 @@ Both `process_turn()` and `stream_turn()` run the same 13-step sequence:
 6.  Assemble constraints        Trust Layer.assemble_constraints if active_risks present
 7.  Build system prompt         Subagent prompt + guardrail constraints + required disclosures
 8.  LLM call #1                 ChatProviderBase — call() (sync) or stream() (streaming),
-                                via the configured provider (anthropic, openai, or gemini)
+                                via the configured provider (anthropic, openai, or google)
 9.  Tool-use loop               ManagerAgent — if LLM returns tool_use: route via ToolRegistry;
                                 knowledge_retrieval → KE; all other tools → Action Gateway;
                                 append result, LLM call #2; bounded by max_tool_rounds
@@ -295,7 +295,7 @@ Buffers multi-segment input and decides when to invoke `stream_turn()`. Holds `_
 LLM → tool → LLM loop. Both sync and async variants. Used by `process_turn()` for synchronous tool rounds; `stream_turn()` handles tool use via the `ToolUseRequested` exception raised from `provider.stream()`.
 
 **`chat_provider/` — multi-provider LLM interface**
-`ChatProviderBase` is the only LLM type the rest of agent_core depends on. `build_chat_provider(agent_config)` selects a concrete provider from `agent.provider` (anthropic, openai, or gemini today; AzureOpenAI/Ollama as follow-ups). Each provider lives in its own file and is the sole importer of its SDK. `call()` is sync; `stream()` yields text deltas and raises `ToolUseRequested(list[ToolUseBlock])` when the model emits tool calls — the caller executes the tools and resumes. Capabilities (prompt cache, image input, structured output, etc.) are declared per provider class and reconciled against deployment YAML at startup; mismatches fail loud with `ProviderConfigError`.
+`ChatProviderBase` is the only LLM type the rest of agent_core depends on. `build_chat_provider(agent_config)` selects a concrete provider from `agent.provider` (anthropic, openai, or google today; AzureOpenAI/Ollama as follow-ups). Each provider lives in its own file and is the sole importer of its SDK. `call()` is sync; `stream()` yields text deltas and raises `ToolUseRequested(list[ToolUseBlock])` when the model emits tool calls — the caller executes the tools and resumes. Capabilities (prompt cache, image input, structured output, etc.) are declared per provider class and reconciled against deployment YAML at startup; mismatches fail loud with `ProviderConfigError`.
 
 **`preprocessing/language_normalisation.py` — LanguageNormaliser**
 Runs before NLU. Detects dialect, normalises code-switching (Hindi/Kannada/English), and transliterates Romanised Indic text. Currently only the `internal` provider (LLM-based normalisation via a haiku model) is implemented.
@@ -376,7 +376,7 @@ cd agent_core
 uv run uvicorn src.servers.orchestration_server:app --port 8000
 ```
 
-Requires `ANTHROPIC_API_KEY` (or `OPENAI_API_KEY` or `GEMINI_API_KEY`) to be set in the environment.
+Requires `ANTHROPIC_API_KEY` (or `OPENAI_API_KEY` or `GOOGLE_API_KEY`) to be set in the environment.
 
 To enable the TurnAssembler session endpoints, construct the FastAPI app via `create_orchestration_app(agent_core, turn_assembler=<instance>)`. When `turn_assembler=None` (default), only `/process_turn`, `/stream_turn`, and `/health` are registered — zero breaking changes for deployments that don't use session-based input.
 
@@ -399,7 +399,7 @@ uv run pytest tests/ -v --cov=src --cov-report=term-missing
 |---|---|---|
 | `anthropic` | >=0.40.0 | Anthropic SDK — used only in `chat_provider/anthropic_provider.py` |
 | `openai` | >=1.50.0 | OpenAI SDK — used only in `chat_provider/openai_provider.py` |
-| `google-genai` | >=1.0.0 | Google Gemini SDK — used only in `chat_provider/gemini_provider.py` |
+| `google-genai` | >=1.0.0 | Google SDK — used only in `chat_provider/google_provider.py` |
 | `httpx` | >=0.27.0 | HTTP clients (sync + async) for all downstream DPG services |
 | `pydantic` | >=2.0 | Request/response models |
 | `pyyaml` | >=6.0 | Config loading |
@@ -430,7 +430,7 @@ See `CLAUDE.md` and `ARCHITECTURE.md` in the repository root for full engineerin
 
 ## Known gaps
 
-**Anthropic, OpenAI, and Gemini providers are implemented (#287).** AzureOpenAI and Ollama are planned follow-ups; they slot into `chat_provider/` without changing the orchestration layer.
+**Anthropic, OpenAI, and Google providers are implemented (#287).** AzureOpenAI and Ollama are planned follow-ups; they slot into `chat_provider/` without changing the orchestration layer.
 
 **`POST /internal/llm/call` proxy is not yet wired to downstream callers.** The endpoint is implemented and registered, but no other DPG block calls it. The intended architecture routes all LLM calls from other blocks through this proxy; current state has only Agent Core calling the configured provider's SDK directly.
 
