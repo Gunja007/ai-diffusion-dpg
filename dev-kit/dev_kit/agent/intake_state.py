@@ -17,7 +17,7 @@ from typing import Literal
 
 logger = logging.getLogger(__name__)
 
-Channel = Literal["web", "voice"]
+Channel = Literal["web", "voice", "mcp"]
 
 # The 7 binary flags the wizard captures via update_intake during the tier phase.
 # When all 7 are present in IntakeState.binary_flags_seen, intake is complete.
@@ -88,12 +88,12 @@ class IntakeState:
         # Validate Channel literal manually since dataclass doesn't enforce it.
         if not self.selected_channels:
             raise ValueError(
-                "selected_channels must be non-empty; pick at least one of 'web' or 'voice'"
+                "selected_channels must be non-empty; pick at least one of 'web', 'voice', or 'mcp'"
             )
         for ch in self.selected_channels:
-            if ch not in ("web", "voice"):
+            if ch not in ("web", "voice", "mcp"):
                 raise ValueError(
-                    f"Invalid channel {ch!r}; only 'web' and 'voice' allowed"
+                    f"Invalid channel {ch!r}; only 'web', 'voice', and 'mcp' allowed"
                 )
 
     def touch(self) -> None:

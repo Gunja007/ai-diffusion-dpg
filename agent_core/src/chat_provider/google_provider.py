@@ -110,8 +110,6 @@ class _RetryableExhausted(Exception):
         super().__init__(message)
         self.error_type = error_type
         self.error_message = error_message
-
-
 class GoogleChatProvider(ChatProviderBase):
     """Google Gemini implementation of ChatProviderBase.
 

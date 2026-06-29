@@ -215,6 +215,15 @@ class VoiceDpg(BaseModel):
     recording: RecordingDpg = Field(default_factory=RecordingDpg)
 
 
+class McpDpg(BaseModel):
+    """Defaults for the MCP channel adapter."""
+
+    model_config = ConfigDict(extra="forbid")
+    enabled: bool = True
+    assembly_mode: AssemblyMode = "session"
+    port: int = Field(default=8007, gt=0, lt=65536)
+
+
 class ChannelsDpg(BaseModel):
     """Container for all Reach Layer channel adapter defaults."""
 
@@ -222,6 +231,7 @@ class ChannelsDpg(BaseModel):
     cli: CliDpg
     web: WebDpg
     voice: VoiceDpg
+    mcp: McpDpg
 
 
 class ReachLayerInner(BaseModel):

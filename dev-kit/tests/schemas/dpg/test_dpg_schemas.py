@@ -194,6 +194,7 @@ def _reach_minimal_dict():
         "channels": {
             "cli": {},
             "web": {},
+            "mcp": {},
             "voice": {
                 "vobiz": {"auth_id": "x", "auth_token": "y"},
                 "raya": {"api_key": "k", "stt_wss_url": "https://x", "tts_base_url": "https://x"},

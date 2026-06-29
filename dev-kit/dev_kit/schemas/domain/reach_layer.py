@@ -141,12 +141,23 @@ class CliChannelSection(BaseModel):
     agent_prefix: str = ""
 
 
+class McpChannelSection(BaseModel):
+    """reach_layer.channels.mcp — MCP channel domain config (GH-338).
+
+    No user-configurable fields at Scope 1. The class must exist so
+    update_config(path="reach_layer.channels.mcp", value={}) does not
+    fail the per-write pydantic gate with 'extra_forbidden'.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+
 class ChannelsSection(BaseModel):
     """reach_layer.channels — at most one entry per channel type."""
     model_config = ConfigDict(extra="forbid")
     web: Optional[WebChannelSection] = None
     voice: Optional[VoiceChannelSection] = None
     cli: Optional[CliChannelSection] = None
+    mcp: Optional[McpChannelSection] = None
 
 
 class CommonObservabilityConfig(BaseModel):

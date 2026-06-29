@@ -34,7 +34,7 @@ def test_predetermined_rules_reference_intake_fields_only():
         # f-string prefix 'f', module-level constant names, and kwarg names.
         _KNOWN_LITERALS = {
             # Channel names used as string literals in rule expressions
-            "voice", "web",
+            "voice", "web", "mcp",
             # Storage mode literals
             "saved", "anonymous",
             # Route / tool name literals

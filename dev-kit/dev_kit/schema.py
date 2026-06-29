@@ -542,6 +542,10 @@ class ChannelsTopLevelConfig(BaseModel):
         default_factory=ChannelConfig,
         description="CLI channel configuration",
     )
+    mcp: ChannelConfig = Field(
+        default_factory=ChannelConfig,
+        description="MCP channel configuration",
+    )
 
 
 class AgentCoreConfig(BaseModel):
@@ -1245,12 +1249,21 @@ class VoiceChannelConfig(BaseModel):
     )
 
 
+class McpChannelConfig(BaseModel):
+    """Configuration for the MCP channel adapter (GH-338).
+
+    Mirrors runtime ``reach_layer/base/schema/config.py:McpChannelConfig``.
+    """
+    port: int = Field(default=8007, description="Port the MCP server binds to")
+
+
 class ChannelsConfig(BaseModel):
     """Per-channel configuration. Omit channels that are not deployed."""
 
     cli: CLIChannelConfig | None = Field(default=None, description="CLI channel config. None = not deployed.")
     web: WebChannelConfig | None = Field(default=None, description="Web channel config. None = not deployed.")
     voice: VoiceChannelConfig | None = Field(default=None, description="Voice channel config. None = not deployed.")
+    mcp: McpChannelConfig | None = Field(default=None, description="MCP channel config. None = not deployed.")
 
 
 class ReachHttpClientConfig(BaseModel):

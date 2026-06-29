@@ -604,6 +604,7 @@ class ChannelsConfig(BaseModel):
     voice: ChannelConfig = Field(default_factory=ChannelConfig)
     web: ChannelConfig = Field(default_factory=ChannelConfig)
     cli: ChannelConfig = Field(default_factory=ChannelConfig)
+    mcp: ChannelConfig = Field(default_factory=ChannelConfig)
 
 
 # ---------------------------------------------------------------------------

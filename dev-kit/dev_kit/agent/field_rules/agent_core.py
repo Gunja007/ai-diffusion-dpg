@@ -677,6 +677,32 @@ FIELD_RULES: dict[str, FieldRule] = {
         pydantic_class="ChannelsSection",
     ),
 
+    # ── Gated chat: channels.mcp.* ──────────────────────────────────────────────
+
+    "channels.mcp.system_prompt_suffix": FieldRule(
+        category="chat",
+        phase="language",
+        applies_if='"mcp" in selected_channels',
+        description="System prompt suffix for MCP channel.",
+        invalidated_by=["default_language", "supported_languages"],
+        pydantic_class="ChannelsSection",
+    ),
+
+    # ── Predetermined: channels.mcp.turn_assembler.* ────────────────────────────
+
+    "channels.mcp.turn_assembler.silence_trigger.silence_ms": FieldRule(
+        category="predetermined",
+        rule='set: 400 if "mcp" in selected_channels else None',
+        invalidated_by=["selected_channels"],
+        pydantic_class="ChannelsSection",
+    ),
+    "channels.mcp.turn_assembler.max_wait_ceiling.max_wait_ms": FieldRule(
+        category="predetermined",
+        rule='set: 8000 if "mcp" in selected_channels else None',
+        invalidated_by=["selected_channels"],
+        pydantic_class="ChannelsSection",
+    ),
+
     # ── Derived: observability.domain ────────────────────────────────────────
 
     "observability.domain": FieldRule(

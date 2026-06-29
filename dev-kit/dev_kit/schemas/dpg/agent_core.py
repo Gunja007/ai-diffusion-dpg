@@ -114,6 +114,24 @@ class ReachLayerDefaults(BaseModel):
     turn_assembler: TurnAssemblerDpg = Field(default_factory=TurnAssemblerDpg)
 
 
+class ChannelConfigDpg(BaseModel):
+    """Configuration defaults for an Agent Core channel in DPG config."""
+
+    model_config = ConfigDict(extra="forbid")
+    system_prompt_suffix: str = ""
+    turn_assembler: Optional[TurnAssemblerDpg] = None
+
+
+class ChannelsDpg(BaseModel):
+    """DPG framework defaults for channels."""
+
+    model_config = ConfigDict(extra="forbid")
+    voice: Optional[ChannelConfigDpg] = None
+    web: Optional[ChannelConfigDpg] = None
+    cli: Optional[ChannelConfigDpg] = None
+    mcp: Optional[ChannelConfigDpg] = None
+
+
 class AgentCoreDpgConfig(BaseModel):
     """Validated against the operator-edited dev-kit/dpg/agent_core.yaml."""
 
@@ -127,3 +145,4 @@ class AgentCoreDpgConfig(BaseModel):
     action_gateway_client: ClientConfig
     reach_layer: ReachLayerDefaults
     observability: ObservabilityDpg
+    channels: Optional[ChannelsDpg] = None

@@ -411,6 +411,8 @@ class ReachLayerBase(ABC):
                 latency_ms=payload.get("latency_ms", 0),
                 turn_id=payload.get("turn_id", ""),
                 session_ended=payload.get("session_ended", False),
+                error_type=payload.get("error_type"),
+                error_message=payload.get("error_message"),
             )
         elif event_type == "consent":
             return ConsentEvent(
