@@ -110,15 +110,6 @@ class _RetryableExhausted(Exception):
         super().__init__(message)
         self.error_type = error_type
         self.error_message = error_message
-<<<<<<< HEAD
-=======
-
->>>>>>> 905052c (feat(error-handling): implement structured system error propagation with user-friendly messages)
-
-<<<<<<< HEAD
-
-=======
->>>>>>> 1b9c88c (refactor(agent_core): migrate gemini chat provider to google)
 class GoogleChatProvider(ChatProviderBase):
     """Google Gemini implementation of ChatProviderBase.
 

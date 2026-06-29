@@ -12,7 +12,7 @@ render them without coupling to Agent Core internals.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Union
+from typing import Optional, Union
 
 
 @dataclass
@@ -46,6 +46,8 @@ class DoneEvent:
     latency_ms: int = 0
     turn_id: str = ""
     session_ended: bool = False
+    error_type: Optional[str] = None
+    error_message: Optional[str] = None
     type: str = "done"
 
 

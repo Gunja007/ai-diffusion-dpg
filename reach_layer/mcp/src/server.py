@@ -138,14 +138,18 @@ async def _handle_call_tool(
     # ------------------------------------------------------------------
     parts: list[str] = []
     finished: bool = False
+    error_type: str | None = None
+    error_message: str | None = None
 
     async def _aggregate() -> None:
-        nonlocal finished
+        nonlocal finished, error_type, error_message
         async for event in mcp_reach.subscribe_events(session_id):
             if isinstance(event, SentenceEvent):
                 parts.append(event.text)
             elif isinstance(event, DoneEvent):
                 finished = event.session_ended
+                error_type = event.error_type
+                error_message = event.error_message
                 break
 
     try:
@@ -194,8 +198,8 @@ async def _handle_call_tool(
         "reply": " ".join(parts).strip(),
         "session_id": session_id,
         "finished": finished,
-        "error_type": None,
-        "error_message": None,
+        "error_type": error_type,
+        "error_message": error_message,
     }
 
 

@@ -221,6 +221,30 @@ class TestHandleCallTool:
         mock_reach.on_session_end.assert_awaited_once_with("s-1")
 
     @pytest.mark.asyncio
+    async def test_handle_call_tool_DoneEvent_with_error_propagates(self) -> None:
+        """Verify that a DoneEvent carrying error fields propagates them instead of returning None."""
+        mock_reach = MagicMock(spec=McpReachLayer)
+        mock_reach.on_session_start = AsyncMock()
+        mock_reach.on_session_end = AsyncMock()
+        mock_reach.submit_input = AsyncMock()
+
+        async def fake_subscribe(session_id: str, user_id: str | None = None):
+            yield DoneEvent(
+                turn_status="abandoned",
+                session_ended=True,
+                error_type="provider_failure",
+                error_message="The model failed to generate a response."
+            )
+
+        mock_reach.subscribe_events = fake_subscribe
+
+        result = await _handle_call_tool(mock_reach, "s-1", "test")
+        assert result["finished"] is True
+        assert result["error_type"] == "provider_failure"
+        assert result["error_message"] == "The model failed to generate a response."
+        mock_reach.on_session_end.assert_awaited_once_with("s-1")
+
+    @pytest.mark.asyncio
     async def test_handle_call_tool_empty_reply_on_no_sentences(self) -> None:
         """Verify DoneEvent with no preceding SentenceEvent returns reply=""."""
         mock_reach = MagicMock(spec=McpReachLayer)
