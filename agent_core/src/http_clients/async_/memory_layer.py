@@ -50,7 +50,13 @@ class AsyncMemoryLayerHttpClient(AsyncMemoryLayerBase):
         """Close the underlying httpx.AsyncClient."""
         await self._client.aclose()
 
-    async def context_bundle(self, session_id: str, user_id: str, adopt: bool = True) -> ContextBundle:
+    async def context_bundle(
+        self,
+        session_id: str,
+        user_id: str,
+        adopt: bool = True,
+        caller_agent_id: Optional[str] = None
+    ) -> ContextBundle:
         """POST /context_bundle -> ContextBundle. Returns ContextBundle.empty() on failure."""
         if not session_id:
             raise ValueError("session_id must not be empty")
@@ -61,7 +67,12 @@ class AsyncMemoryLayerHttpClient(AsyncMemoryLayerBase):
         try:
             response = await self._client.post(
                 f"{self._endpoint}/context_bundle",
-                json={"session_id": session_id, "user_id": user_id, "adopt": adopt},
+                json={
+                    "session_id": session_id,
+                    "user_id": user_id,
+                    "adopt": adopt,
+                    "caller_agent_id": caller_agent_id,
+                },
             )
             response.raise_for_status()
             data = response.json()

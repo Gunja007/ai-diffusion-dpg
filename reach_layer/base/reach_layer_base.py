@@ -142,6 +142,9 @@ class ReachLayerBase(ABC):
         session_id: str,
         text: str,
         user_id: Optional[str] = None,
+        caller_agent_id: Optional[str] = None,
+        locale: Optional[str] = None,
+        metadata: Optional[dict] = None,
     ) -> Optional[dict]:
         """Submit text to Agent Core. Routes based on assembly_mode.
 
@@ -155,6 +158,9 @@ class ReachLayerBase(ABC):
             session_id: Unique session identifier.
             text: User input text.
             user_id: Optional user identifier.
+            caller_agent_id: Optional caller agent identifier.
+            locale: Optional language locale.
+            metadata: Optional caller metadata.
 
         Returns:
             In direct mode: TurnResult dict from Agent Core.
@@ -174,6 +180,12 @@ class ReachLayerBase(ABC):
                 "channel": self._channel_name,
                 "user_id": user_id or "",
             }
+            if caller_agent_id:
+                payload["caller_agent_id"] = caller_agent_id
+            if locale:
+                payload["locale"] = locale
+            if metadata:
+                payload["metadata"] = metadata
             try:
                 resp = await client.post(url, json=payload)
                 resp.raise_for_status()
@@ -209,6 +221,12 @@ class ReachLayerBase(ABC):
                 "channel": self._channel_name,
                 "user_id": user_id or "",
             }
+            if caller_agent_id:
+                payload["caller_agent_id"] = caller_agent_id
+            if locale:
+                payload["locale"] = locale
+            if metadata:
+                payload["metadata"] = metadata
             try:
                 resp = await client.post(url, json=payload)
                 resp.raise_for_status()

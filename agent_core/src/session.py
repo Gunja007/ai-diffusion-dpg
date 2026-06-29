@@ -36,6 +36,7 @@ class Session:
     session_id: str
     user_id: Optional[str]
     channel: str
+    caller_agent_id: Optional[str] = None
     current_turn: Optional[Turn] = None
     ended: bool = False
     turn_changed: asyncio.Event = field(default_factory=asyncio.Event)
@@ -75,6 +76,7 @@ class Session:
             user_id=self.user_id,
             started_at_ms=int(time.time() * 1000),
             segments=list(seed_segments) if seed_segments else [],
+            caller_agent_id=self.caller_agent_id,
         )
         self.current_turn = turn
         self.turn_changed.set()

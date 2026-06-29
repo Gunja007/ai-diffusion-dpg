@@ -367,6 +367,7 @@ A channel is therefore *not* identified by its mode — Web can run in either mo
 | CLI (`reach_layer/cli/`) | ✅ | `CLIReach` — direct mode, readline loop, port-free. No TurnAssembler. |
 | Web (`reach_layer/web/`) | ✅ | FastAPI + React 19 SPA, port 8005. `POST /chat`, `GET /user-history/{user_id}`, `GET /app-config`. Direct mode by default; session mode is supported. Google Sign-In optional. |
 | Voice (`reach_layer/voice/`) | ✅ | `VobizAdapter` on pipecat pipeline (VAD → Raya STT → AgentCoreLLM → Raya TTS → SIP), port 8006. Session mode (required by VAD-driven input). Barge-in supported. 166 tests. Call recording (audit) — ✅ behind `reach_layer.channels.voice.recording.source` config switch (default: disabled). Sources: vobiz native + Pipecat pipeline tap. Stores: local + S3. Sidecar JSON manifest + Observability signals + OTel `recording.lifecycle` span. |
+| MCP (`reach_layer/mcp/`) | ✅ | Model Context Protocol server exposing `dpg.send_message` tool over SSE transport, port 8007. Supports API-key auth, caller namespacing, and streaming progress updates (GH-338). |
 | Production SIP/PSTN | ❌ | Out of scope — VOIP via pipecat/Vobiz is the production path |
 | WhatsApp | ⏳ | Gupshup/Twilio webhook — pending |
 | Mobile SDK | ⏳ | Pending |
@@ -376,6 +377,8 @@ A channel is therefore *not* identified by its mode — Web can run in either mo
 
 - `reach_layer/web/server.py` calls Memory Layer `GET /users/{user_id}/active-history` to restore chat history on session resume, before turn 1. Production-approved — the call happens outside the turn pipeline (no LLM response is owed) and is the canonical way to repopulate the SPA's sidebar.
 - Reach Layer `POST /ingest` forwards user-uploaded documents to Knowledge Engine's ingestion endpoint. Production-approved for the same reason: ingestion is asynchronous to the turn pipeline.
+- Reach Layer MCP (`reach_layer/mcp/`) calls Agent Core `POST /process_turn` or `POST /sessions/{session_id}/input`. Production-approved as a standard inbound channel.
+- Outbound MCP tool invocations are made using the standard `McpAdapter` to invoke peer agents / standard MCP servers. See [outbound MCP recipe](file:///Users/samhithrao/projects/ai-diffusion-dpg/docs/superpowers/specs/issue-338-outbound-mcp-recipe.md).
 
 Other Reach Layer → downstream-block calls remain prohibited unless added to this list.
 
@@ -387,8 +390,9 @@ Other Reach Layer → downstream-block calls remain prohibited unless added to t
 - `reach_layer/web/web-src/` — React 19 + Vite 6 + Tailwind SPA
 - `reach_layer/voice/src/vobiz_adapter.py` — `VobizAdapter`; `voice/src/bot.py`, `campaign_manager.py`
 - `reach_layer/voice/src/pipecat_services/` — Raya STT/TTS pipecat services
+- `reach_layer/mcp/src/server.py` — MCP SSE FastAPI server; `mcp/src/mcp_reach.py` — `McpReachLayer`
 
-**Tests:** 308 Python tests across 20 files (cli 47 + web 95 + voice 166) + 143 React UI tests across 14 files.
+**Tests:** 308 Python tests across 20 files (cli 47 + web 95 + voice 166) + 143 React UI tests across 14 files. Also includes MCP standard integration and auth tests in `reach_layer/mcp/tests/test_mcp_reach.py`.
 
 ---
 

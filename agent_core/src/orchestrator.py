@@ -417,6 +417,10 @@ class AgentCore(AgentCoreBase):
             "dpg.domain",
             self._config.get("observability", {}).get("domain", "unknown"),
         )
+        if getattr(turn_input, "caller_agent_id", None):
+            _span.set_attribute("peer.agent_id", turn_input.caller_agent_id)
+            _span.set_attribute("peer.protocol", "mcp")
+            _span.set_attribute("peer.direction", "inbound")
         _trace_id: str = self._current_trace_id()
 
         logger.info(
@@ -448,7 +452,12 @@ class AgentCore(AgentCoreBase):
             memory_endpoint, session_id,
         )
         t1 = time.time()
-        bundle = self._memory.context_bundle(session_id, user_id, adopt=not turn_input.fresh)
+        bundle = self._memory.context_bundle(
+            session_id,
+            user_id,
+            adopt=not turn_input.fresh,
+            caller_agent_id=getattr(turn_input, "caller_agent_id", None),
+        )
         current_subagent_id: str = (
             bundle.session.get("current_subagent_id")
             or self._workflow.start_subagent_id
@@ -530,8 +539,34 @@ class AgentCore(AgentCoreBase):
         if ask_for_consent:
             user_storage_mode: str | None = bundle.session.get("user_storage_mode")
             turn_count: int = int(bundle.session.get("turn_count", 0) or 0)
+            caller_agent_id = getattr(turn_input, "caller_agent_id", None)
 
-            if user_storage_mode is None and turn_count == 0:
+            if caller_agent_id:
+                # Bypass interactive consent prompt for agent callers.
+                # Auto-grant consent if pre-granted flag exists in metadata, otherwise default to anonymous.
+                if user_storage_mode is None:
+                    meta = getattr(turn_input, "metadata", {}) or {}
+                    if isinstance(meta, str):
+                        try:
+                            meta = json.loads(meta)
+                        except Exception:
+                            meta = {}
+                    consent_granted = meta.get("consent_granted", False)
+                    user_storage_mode = "saved" if consent_granted else "anonymous"
+                    self._write_memory_sync(session_id, user_id, "session", "user_storage_mode", user_storage_mode)
+                    bundle.session["user_storage_mode"] = user_storage_mode
+                    logger.info(
+                        "orchestrator.consent_gate_bypass",
+                        extra={
+                            "operation": "orchestrator.consent_gate",
+                            "status": "bypassed_for_agent",
+                            "session_id": session_id,
+                            "caller_agent_id": caller_agent_id,
+                            "consent_granted": consent_granted,
+                            "user_storage_mode": user_storage_mode,
+                        },
+                    )
+            elif user_storage_mode is None and turn_count == 0:
                 # Turn 1: deliver consent prompt (translated to user's language),
                 # no LLM inference, no Trust Layer call.
                 # Stash the user's original message and its normalised form so the
@@ -2042,6 +2077,7 @@ class AgentCore(AgentCoreBase):
             args=(
                 session_id, user_id, turn_id, response_text,
                 turn_input.user_message, turn_event, do_flush, flush_reason,
+                getattr(turn_input, "caller_agent_id", None),
             ),
             daemon=True,
         )
@@ -2059,6 +2095,7 @@ class AgentCore(AgentCoreBase):
         turn_event: TurnEvent,
         do_flush: bool,
         flush_reason: str,
+        caller_agent_id: Optional[str] = None,
     ) -> None:
         """
         Run Steps 12-13 asynchronously after the TurnResult is returned.
@@ -2104,6 +2141,9 @@ class AgentCore(AgentCoreBase):
                     "model": turn_event.model_used,
                     "latency_ms": turn_event.latency_ms,
                     "intent": turn_event.intent,
+                    "caller_agent_id": caller_agent_id,
+                    "peer_protocol": "mcp" if caller_agent_id else None,
+                    "peer_direction": "inbound" if caller_agent_id else None,
                 }
             )
         except Exception as e:

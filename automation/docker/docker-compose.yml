@@ -488,6 +488,8 @@ services:
         - linux/arm64
     image: sanketikahub/dpg-reach-layer-mcp:${GIT_SHA:-latest}
     container_name: reach_layer_mcp
+    ports:
+      - "8007:8007"
     environment:
       - CONFIG_FOLDER=/app/config
     volumes:

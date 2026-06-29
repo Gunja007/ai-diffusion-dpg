@@ -218,6 +218,9 @@ class McpAdapter(ToolAdapter):
             with _get_tracer().start_as_current_span("action.mcp.tool_call") as mcp_span:
                 mcp_span.set_attribute("mcp.server_url", self._server_url)
                 mcp_span.set_attribute("mcp.tool_name", mcp_tool_name)
+                mcp_span.set_attribute("peer.agent_id", self._namespace)
+                mcp_span.set_attribute("peer.protocol", "mcp")
+                mcp_span.set_attribute("peer.direction", "outbound")
                 call_result = await self._call_tool(mcp_tool_name, params)
                 latency_ms = int((time.time() - start) * 1000)
                 mcp_span.set_attribute("latency_ms", latency_ms)

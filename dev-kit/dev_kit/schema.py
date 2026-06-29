@@ -1249,12 +1249,21 @@ class VoiceChannelConfig(BaseModel):
     )
 
 
+class CallerConfig(BaseModel):
+    """Configuration for an authorized inbound caller agent (GH-338)."""
+    caller_agent_id: str = Field(description="Unique identifier of calling agent")
+    api_key: str = Field(description="Secret API key for authentication")
+
+
 class McpChannelConfig(BaseModel):
     """Configuration for the MCP channel adapter (GH-338).
 
     Mirrors runtime ``reach_layer/base/schema/config.py:McpChannelConfig``.
     """
+    enabled: bool = Field(default=True, description="Enable the MCP channel")
+    assembly_mode: str = Field(default="session", description="Assembly mode: session or direct")
     port: int = Field(default=8007, description="Port the MCP server binds to")
+    callers: list[CallerConfig] = Field(default_factory=list, description="Authorised inbound callers")
 
 
 class ChannelsConfig(BaseModel):

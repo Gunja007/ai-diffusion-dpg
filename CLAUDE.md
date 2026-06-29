@@ -20,7 +20,7 @@ cd automation/docker
 docker compose -f docker-compose.dev.yml up -d                    # all services except reach_layer
 docker compose -f docker-compose.dev.yml run --rm reach_layer     # interactive CLI session
 ```
-Ports: Agent Core `:8000`, Knowledge Engine `:8001`, Memory Layer `:8002`, Trust Layer `:8003`, Observability Layer `:8004`, Reach Layer Web `:8005`, Reach Layer Voice `:8006`, Action Gateway `:9999`.
+Ports: Agent Core `:8000`, Knowledge Engine `:8001`, Memory Layer `:8002`, Trust Layer `:8003`, Observability Layer `:8004`, Reach Layer Web `:8005`, Reach Layer Voice `:8006`, Reach Layer MCP `:8007`, Action Gateway `:9999`.
 
 **Run tests (per module):**
 ```bash
@@ -63,7 +63,7 @@ The framework assembles AI-powered voice/chat systems from **7 standardised DPG 
 
 **Action Gateway** — sole interface with external systems. Executes tool calls expressed by the LLM; the LLM never calls APIs directly. Returns normalised results to Agent Core. Write/identity connectors require Trust Layer consent before execution.
 
-**Reach Layer** — normalises inbound channels (VOIP, WhatsApp, Web, Mobile SDK) and delivers responses. Manages outbound campaigns and cross-channel handoffs. Channel and assembly mode are independent: Voice is constrained to `session` mode (VAD-driven multi-segment input); CLI uses `direct` mode and does not need TurnAssembler; Web defaults to `direct` and can be configured for `session`. Also includes approved direct calls — see "Module interaction rules" below.
+**Reach Layer** — normalises inbound channels (VOIP, WhatsApp, Web, Mobile SDK, MCP) and delivers responses. Manages outbound campaigns and cross-channel handoffs. Channel and assembly mode are independent: Voice is constrained to `session` mode (VAD-driven multi-segment input); CLI uses `direct` mode and does not need TurnAssembler; Web defaults to `direct` and can be configured for `session`; MCP defaults to `session` mode for tool call aggregation. Also includes approved direct calls — see "Module interaction rules" below.
 
 **Observability Layer** — async-only observability. Emits turn events after response delivery; never in the response path. Produces audit log, quality scores, feedback signals, and outcome tracking.
 
@@ -176,7 +176,7 @@ When changing a runtime block's `<block>/src/schema/config.py`, also update the 
 
 Full implementations: **Agent Core** (818 tests — sync + async streaming + TurnAssembler + multi-provider chat_provider), **Knowledge Engine** (192 tests), **Memory Layer** (226 tests, Redis + Memgraph + SQLite), **Action Gateway** (173 tests — RestApiAdapter + McpAdapter), **Domain Configuration Kit** (365 tests).
 
-Partial implementations (correct interface, some gaps): **Trust Layer** (138 tests — all 4 sub-blocks; HiTL log backend only, consent store in-process), **Reach Layer** (308 Python + 143 UI tests — CLI ✅, Web/React SPA ✅ (with `routing_only` mode for voice-only deployments), Voice/pipecat ✅), **Observability Layer** (101 tests — OTel functional; Grafana dashboards pending).
+Partial implementations (correct interface, some gaps): **Trust Layer** (138 tests — all 4 sub-blocks; HiTL log backend only, consent store in-process), **Reach Layer** (308 Python + 143 UI tests — CLI ✅, Web/React SPA ✅ (with `routing_only` mode for voice-only deployments), Voice/pipecat ✅, MCP server ✅), **Observability Layer** (101 tests — OTel functional; Grafana dashboards pending).
 
 **Stub interfaces must exactly match the real interface** — they must be replaceable without changing Agent Core or other modules.
 

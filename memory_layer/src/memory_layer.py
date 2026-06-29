@@ -145,7 +145,13 @@ class MemoryLayer:
     # Public interface — mirrors MemoryLayerBase (agent_core)
     # ------------------------------------------------------------------
 
-    def context_bundle(self, session_id: str, user_id: str, adopt: bool = True) -> dict:
+    def context_bundle(
+        self,
+        session_id: str,
+        user_id: str,
+        adopt: bool = True,
+        caller_agent_id: Optional[str] = None
+    ) -> dict:
         """
         Called at the start of every turn. Returns a ContextBundle-shaped dict.
 
@@ -200,6 +206,8 @@ class MemoryLayer:
                 initial_state = _build_initial_session(
                     session_id, user_id, self._schema, is_returning
                 )
+                if caller_agent_id:
+                    initial_state["caller_agent_id"] = caller_agent_id
 
                 # ── Session Adoption ────────────────────────────────────────
                 # If a recent session exists in Redis for this user_id,
@@ -734,6 +742,7 @@ def _build_scope_map(
         "user_id": "session",
         "journey_id": "session",
         "is_returning": "session",
+        "caller_agent_id": "session",
         # Signal — always this key
         "signal": "signal",
     }

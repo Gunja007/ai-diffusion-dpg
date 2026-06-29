@@ -167,3 +167,4 @@ reach_layer:
       enabled: true
       assembly_mode: session   # MCP host drives sessions; TurnAssembler handles buffering
       port: 8007
+      callers: []

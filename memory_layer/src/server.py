@@ -49,6 +49,7 @@ class ContextBundleRequest(BaseModel):
     session_id: str
     user_id: str
     adopt: bool = True
+    caller_agent_id: str | None = None
 
 
 class WriteRequest(BaseModel):
@@ -133,7 +134,12 @@ def create_app(memory: MemoryLayer) -> FastAPI:
             span.set_attribute("session_id", session_id)
             span.set_attribute("db.system", "redis")
             try:
-                bundle = memory.context_bundle(session_id, user_id, adopt=request.adopt)
+                bundle = memory.context_bundle(
+                    session_id,
+                    user_id,
+                    adopt=request.adopt,
+                    caller_agent_id=request.caller_agent_id,
+                )
                 logger.info(
                     "memory_server.context_bundle",
                     extra={

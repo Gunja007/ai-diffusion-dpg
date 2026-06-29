@@ -2,24 +2,31 @@
 
 Covers constructor behavior, lifecycle logs, run_loop no-op,
 and _handle_call_tool SSE stream aggregation and finished flag mapping,
-error handling (submit_input failures), stream timeout, and session-start
-guard (fires once per session, resets after session ends).
+error handling (submit_input failures), stream timeout, session-start
+guard (fires once per session, resets after session ends), and standard MCP
+JSON-RPC protocol endpoints (SSE, tool listing, call tool, auth, namespacing).
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+from fastapi.testclient import TestClient
 from reach_layer_base import DoneEvent, SentenceEvent, TextChannelBase
 from src.mcp_reach import McpReachLayer
-from src.server import _handle_call_tool, create_app
+from src.server import _handle_call_tool, create_app, current_caller_agent_id
 
 
-def _make_config(port: int | None = None, tool_timeout_s: float | None = None) -> dict:
+def _make_config(
+    port: int | None = None,
+    tool_timeout_s: float | None = None,
+    callers: list[dict] | None = None
+) -> dict:
     """Helper to generate a base configuration dict."""
     cfg = {
         "agent_core_client": {
@@ -38,6 +45,8 @@ def _make_config(port: int | None = None, tool_timeout_s: float | None = None) -
         cfg["reach_layer"]["channels"]["mcp"]["port"] = port
     if tool_timeout_s is not None:
         cfg["reach_layer"]["channels"]["mcp"]["tool_timeout_s"] = tool_timeout_s
+    if callers is not None:
+        cfg["reach_layer"]["channels"]["mcp"]["callers"] = callers
     return cfg
 
 
@@ -102,7 +111,7 @@ class TestMcpReachLayer:
         layer = McpReachLayer(_make_config())
         with caplog.at_level(logging.INFO):
             await layer.on_session_start("session-123", "user-456")
-        
+
         assert len(caplog.records) == 1
         record = caplog.records[0]
         assert record.message == "mcp_reach.session_start"
@@ -123,7 +132,7 @@ class TestMcpReachLayer:
         layer = McpReachLayer(_make_config())
         with caplog.at_level(logging.INFO):
             await layer.on_session_end("session-123")
-        
+
         assert len(caplog.records) == 1
         record = caplog.records[0]
         assert record.message == "mcp_reach.session_end"
@@ -222,7 +231,7 @@ class TestHandleCallTool:
 
     @pytest.mark.asyncio
     async def test_handle_call_tool_DoneEvent_with_error_propagates(self) -> None:
-        """Verify that a DoneEvent carrying error fields propagates them instead of returning None."""
+        """Verify that a DoneEvent carrying error fields propagates them."""
         mock_reach = MagicMock(spec=McpReachLayer)
         mock_reach.on_session_start = AsyncMock()
         mock_reach.on_session_end = AsyncMock()
@@ -397,8 +406,9 @@ class TestHandleCallToolFailures:
             await client.post("/call_tool", json={"session_id": "multi-1", "text": "turn 1"})
             await client.post("/call_tool", json={"session_id": "multi-1", "text": "turn 2"})
 
-        # on_session_start must have fired exactly once for session "multi-1"
-        layer.on_session_start.assert_awaited_once_with("multi-1", "")
+        # on_session_start must have fired exactly once for session "anonymous:multi-1"
+        # since it namespaces by authenticated caller (default anonymous)
+        layer.on_session_start.assert_awaited_once_with("anonymous:multi-1", "")
 
     @pytest.mark.asyncio
     async def test_on_session_start_fires_again_after_session_ends(self) -> None:
@@ -413,7 +423,6 @@ class TestHandleCallToolFailures:
         async def fake_subscribe(session_id: str, user_id: str | None = None):
             nonlocal call_count
             call_count += 1
-            # First call ends the session; second call is a fresh reconnect.
             yield DoneEvent(
                 turn_status="completed",
                 session_ended=(call_count == 1),
@@ -432,9 +441,181 @@ class TestHandleCallToolFailures:
             )
             assert resp1.json()["finished"] is True
 
-            # Same session_id — should trigger on_session_start again
             await client.post(
                 "/call_tool", json={"session_id": "reuse-1", "text": "reconnect"}
             )
 
         assert layer.on_session_start.await_count == 2
+
+
+# ---------------------------------------------------------------------------
+# MCP Protocol Tests (Auth, Namespacing, JSON-RPC endpoints)
+# ---------------------------------------------------------------------------
+
+class TestMcpServerEndpoints:
+    """Tests verification of MCP JSON-RPC over SSE endpoints, auth, and namespacing."""
+
+    def test_health_endpoint(self) -> None:
+        """Verify health check returns status ok."""
+        layer = McpReachLayer(_make_config())
+        app = create_app(layer, _make_config())
+        client = TestClient(app)
+        resp = client.get("/health")
+        assert resp.status_code == 200
+        assert resp.json() == {"status": "ok"}
+
+    def test_call_tool_auth_required_if_callers_present(self) -> None:
+        """Verify REST call_tool endpoint returns 401 if callers configured but auth missing."""
+        layer = McpReachLayer(_make_config())
+        callers = [{"caller_agent_id": "agent-1", "api_key": "secret"}]
+        app = create_app(layer, _make_config(callers=callers))
+        client = TestClient(app)
+
+        resp = client.post("/call_tool", json={"session_id": "s1", "text": "hi"})
+        assert resp.status_code == 401
+
+        # Providing invalid key
+        resp = client.post(
+            "/call_tool",
+            json={"session_id": "s1", "text": "hi"},
+            headers={"Authorization": "Bearer badkey"}
+        )
+        assert resp.status_code == 401
+
+        # Providing valid key
+        layer.submit_input = AsyncMock()
+        async def fake_subscribe(session_id: str):
+            yield DoneEvent(turn_status="completed", session_ended=True)
+        layer.subscribe_events = fake_subscribe
+
+        resp = client.post(
+            "/call_tool",
+            json={"session_id": "s1", "text": "hi"},
+            headers={"Authorization": "Bearer secret"}
+        )
+        assert resp.status_code == 200
+        # Verify submit_input is called with namespaced session_id
+        layer.submit_input.assert_called_once_with(
+            "agent-1:s1", "hi", user_id=None, caller_agent_id="agent-1", locale=None, metadata=None
+        )
+
+    @pytest.mark.asyncio
+    async def test_mcp_call_tool_handler_success(self) -> None:
+        """Verify handle_call_tool correctly aggregates and namespaces session_id."""
+        layer = McpReachLayer(_make_config())
+        layer.submit_input = AsyncMock()
+
+        async def fake_subscribe(session_id: str):
+            yield SentenceEvent(text="Hello from DPG.", sentence_index=0)
+            yield DoneEvent(turn_status="completed", session_ended=False)
+        layer.subscribe_events = fake_subscribe
+
+        callers = [{"caller_agent_id": "callerA", "api_key": "keyA"}]
+        app = create_app(layer, _make_config(callers=callers))
+
+        from httpx import AsyncClient, ASGITransport
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            # Query param api_key auth
+            resp = await client.post(
+                "/call_tool",
+                json={"session_id": "123", "text": "test turn"},
+                params={"api_key": "keyA"}
+            )
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["reply"] == "Hello from DPG."
+            assert data["finished"] is False
+            assert data["session_id"] == "callerA:123"
+
+            layer.submit_input.assert_called_with(
+                "callerA:123", "test turn", user_id=None, caller_agent_id="callerA", locale=None, metadata=None
+            )
+
+    @pytest.mark.asyncio
+    async def test_mcp_progress_callback(self) -> None:
+        """Verify progress notifications are triggered during subscription."""
+        layer = McpReachLayer(_make_config())
+        layer.submit_input = AsyncMock()
+
+        async def fake_subscribe(session_id: str):
+            yield SentenceEvent(text="Sentence 1", sentence_index=0)
+            yield SentenceEvent(text="Sentence 2", sentence_index=1)
+            yield DoneEvent(turn_status="completed", session_ended=False)
+        layer.subscribe_events = fake_subscribe
+
+        app = create_app(layer, _make_config())
+
+        # Mock RequestContext & session to capture progress notification
+        mock_ctx = MagicMock()
+        mock_ctx.meta = {"progressToken": "token-xyz"}
+        mock_session = AsyncMock()
+        mock_ctx.session = mock_session
+
+        handle_call_tool = app.state.handle_call_tool
+        result = await handle_call_tool("dpg.send_message", {"session_id": "abc", "message": "hello"}, mock_ctx)
+        
+        # Verify result format
+        assert len(result) == 1
+        payload = json.loads(result[0].text)
+        assert payload["reply"] == "Sentence 1 Sentence 2"
+
+        # Verify progress calls
+        assert mock_session.send_notification.call_count == 2
+        mock_session.send_notification.assert_any_call(
+            "notifications/progress",
+            {
+                "progressToken": "token-xyz",
+                "progress": 0,
+                "meta": {
+                    "text": "Sentence 1",
+                    "sentence_index": 0,
+                }
+            }
+        )
+        mock_session.send_notification.assert_any_call(
+            "notifications/progress",
+            {
+                "progressToken": "token-xyz",
+                "progress": 1,
+                "meta": {
+                    "text": "Sentence 2",
+                    "sentence_index": 1,
+                }
+            }
+        )
+
+    @pytest.mark.asyncio
+    async def test_mcp_call_tool_with_locale_and_metadata(self) -> None:
+        """Verify locale and metadata are propagated down through REST /call_tool."""
+        layer = McpReachLayer(_make_config())
+        layer.submit_input = AsyncMock()
+
+        async def fake_subscribe(session_id: str):
+            yield DoneEvent(turn_status="completed", session_ended=True)
+        layer.subscribe_events = fake_subscribe
+
+        callers = [{"caller_agent_id": "callerA", "api_key": "keyA"}]
+        app = create_app(layer, _make_config(callers=callers))
+
+        from httpx import AsyncClient, ASGITransport
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            resp = await client.post(
+                "/call_tool",
+                json={
+                    "session_id": "123",
+                    "text": "test turn",
+                    "locale": "en_US",
+                    "metadata": {"consent_granted": True}
+                },
+                params={"api_key": "keyA"}
+            )
+            assert resp.status_code == 200
+            layer.submit_input.assert_called_once_with(
+                "callerA:123", "test turn", user_id=None, caller_agent_id="callerA",
+                locale="en_US", metadata={"consent_granted": True}
+            )
+
