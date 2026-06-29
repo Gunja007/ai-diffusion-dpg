@@ -167,4 +167,11 @@ reach_layer:
       enabled: true
       assembly_mode: session   # MCP host drives sessions; TurnAssembler handles buffering
       port: 8007
+      # Authorised inbound callers. Store API keys in environment variables, not
+      # in plaintext YAML. Example (set MCP_CALLER_MYAGENT_KEY in the shell or
+      # Docker environment before starting the stack):
+      #   callers:
+      #     - caller_agent_id: my-agent
+      #       api_key: ${MCP_CALLER_MYAGENT_KEY}
+      # The config loader expands ${VAR} and ${VAR:-default} placeholders at boot.
       callers: []

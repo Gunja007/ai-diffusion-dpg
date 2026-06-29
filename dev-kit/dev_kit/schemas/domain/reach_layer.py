@@ -145,7 +145,13 @@ class CallerSection(BaseModel):
     """reach_layer.channels.mcp.callers[] — authorised inbound callers."""
     model_config = ConfigDict(extra="forbid")
     caller_agent_id: str
-    api_key: str
+    api_key: str = Field(
+        description=(
+            "API key for this caller. Use an env-var placeholder so the secret "
+            "is not stored in plaintext YAML — e.g. api_key: ${MCP_CALLER_MYAGENT_KEY}. "
+            "The config loader expands ${VAR} and ${VAR:-default} at boot time."
+        )
+    )
 
 
 class McpChannelSection(BaseModel):

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 from contextvars import ContextVar
+import hmac
 import json
 import logging
 from typing import Any, Callable, Optional
@@ -53,21 +54,30 @@ class CallToolResponse(BaseModel):
 def _authenticate_request(request: Request, callers: list[Any]) -> str:
     """Validate request API key and return matching caller_agent_id.
 
-    If no callers are configured, returns "anonymous".
+    Raises:
+        HTTPException(503): If no callers are configured (service not ready).
+        HTTPException(401): If the Authorization header is absent or invalid.
+
+    API keys must be supplied via the ``Authorization: Bearer <key>`` header.
+    Query-parameter auth (``?api_key=``) is not supported; it leaks credentials
+    into HTTP access logs and proxy histories.
     """
     if not callers:
-        return "anonymous"
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "MCP channel has no authorised callers configured. "
+                "Add at least one entry to reach_layer.channels.mcp.callers[] "
+                "before exposing this endpoint."
+            ),
+        )
 
     api_key: str | None = None
 
-    # 1. Check Authorization header
+    # Only accept Authorization: Bearer <key> — query-param auth is not supported.
     auth_header = request.headers.get("Authorization")
     if auth_header and auth_header.startswith("Bearer "):
         api_key = auth_header[7:].strip()
-
-    # 2. Check query parameter
-    if not api_key:
-        api_key = request.query_params.get("api_key")
 
     if not api_key:
         raise HTTPException(status_code=401, detail="API key is missing")
@@ -75,7 +85,8 @@ def _authenticate_request(request: Request, callers: list[Any]) -> str:
     for caller in callers:
         caller_key = getattr(caller, "api_key", None) or (caller.get("api_key") if isinstance(caller, dict) else None)
         caller_id = getattr(caller, "caller_agent_id", None) or (caller.get("caller_agent_id") if isinstance(caller, dict) else None)
-        if caller_key == api_key and caller_id:
+        # Use constant-time comparison to prevent timing side-channel attacks.
+        if caller_key and hmac.compare_digest(caller_key, api_key) and caller_id:
             return caller_id
 
     raise HTTPException(status_code=401, detail="Invalid API key")
@@ -364,7 +375,12 @@ def create_app(mcp_reach: McpReachLayer, config: dict) -> FastAPI:
                         },
                         "caller_agent_id": {
                             "type": "string",
-                            "description": "Unique identifier of the calling agent (optional)"
+                            "description": (
+                                "Deprecated: this field is ignored by the server. "
+                                "The caller identity is always derived from the "
+                                "Authorization: Bearer header and cannot be overridden "
+                                "by the client."
+                            )
                         },
                     },
                     "required": ["session_id", "message"],
@@ -392,11 +408,13 @@ def create_app(mcp_reach: McpReachLayer, config: dict) -> FastAPI:
         if not session_id or not text:
             raise ValueError("session_id and message must not be empty")
 
+        # caller_id is always auth-derived from _authenticate_request via the
+        # ContextVar set on /sse, /messages, and /call_tool. The client-supplied
+        # caller_agent_id argument is intentionally ignored to prevent forgery.
         caller_id = current_caller_agent_id.get()
-        if not caller_id or caller_id == "anonymous":
-            caller_id = arguments.get("caller_agent_id") or "anonymous"
 
-        # Namespace session_id by caller_agent_id
+        # Namespace session_id by authenticated caller to prevent cross-caller
+        # session collision.
         namespaced_session_id = f"{caller_id}:{session_id}" if caller_id else session_id
 
         is_new_session = namespaced_session_id not in _active_sessions
@@ -479,13 +497,12 @@ def create_app(mcp_reach: McpReachLayer, config: dict) -> FastAPI:
 
     @app.post("/call_tool", response_model=CallToolResponse)
     async def call_tool(req: CallToolRequest, request: Request) -> dict[str, Any]:
-        """Backward-compatible REST tool call endpoint."""
-        caller_id = "anonymous"
-        try:
-            caller_id = _authenticate_request(request, callers)
-        except HTTPException:
-            if callers:
-                raise
+        """Backward-compatible REST tool call endpoint.
+
+        Requires ``Authorization: Bearer <key>`` when callers are configured.
+        Returns 503 if no callers are configured (service not ready).
+        """
+        caller_id = _authenticate_request(request, callers)
 
         token = current_caller_agent_id.set(caller_id)
         try:

@@ -397,18 +397,19 @@ class TestHandleCallToolFailures:
 
         layer.subscribe_events = fake_subscribe
 
-        app = create_app(layer, _make_config())
+        callers = [{"caller_agent_id": "agent-1", "api_key": "secret"}]
+        app = create_app(layer, _make_config(callers=callers))
 
         from httpx import AsyncClient, ASGITransport
         async with AsyncClient(
             transport=ASGITransport(app=app), base_url="http://test"
         ) as client:
-            await client.post("/call_tool", json={"session_id": "multi-1", "text": "turn 1"})
-            await client.post("/call_tool", json={"session_id": "multi-1", "text": "turn 2"})
+            auth = {"Authorization": "Bearer secret"}
+            await client.post("/call_tool", json={"session_id": "multi-1", "text": "turn 1"}, headers=auth)
+            await client.post("/call_tool", json={"session_id": "multi-1", "text": "turn 2"}, headers=auth)
 
-        # on_session_start must have fired exactly once for session "anonymous:multi-1"
-        # since it namespaces by authenticated caller (default anonymous)
-        layer.on_session_start.assert_awaited_once_with("anonymous:multi-1", "")
+        # on_session_start fires exactly once — second turn reuses the active session.
+        layer.on_session_start.assert_awaited_once_with("agent-1:multi-1", "")
 
     @pytest.mark.asyncio
     async def test_on_session_start_fires_again_after_session_ends(self) -> None:
@@ -430,19 +431,21 @@ class TestHandleCallToolFailures:
 
         layer.subscribe_events = fake_subscribe
 
-        app = create_app(layer, _make_config())
+        callers = [{"caller_agent_id": "agent-1", "api_key": "secret"}]
+        app = create_app(layer, _make_config(callers=callers))
 
         from httpx import AsyncClient, ASGITransport
+        auth = {"Authorization": "Bearer secret"}
         async with AsyncClient(
             transport=ASGITransport(app=app), base_url="http://test"
         ) as client:
             resp1 = await client.post(
-                "/call_tool", json={"session_id": "reuse-1", "text": "first"}
+                "/call_tool", json={"session_id": "reuse-1", "text": "first"}, headers=auth
             )
             assert resp1.json()["finished"] is True
 
             await client.post(
-                "/call_tool", json={"session_id": "reuse-1", "text": "reconnect"}
+                "/call_tool", json={"session_id": "reuse-1", "text": "reconnect"}, headers=auth
             )
 
         assert layer.on_session_start.await_count == 2
@@ -517,11 +520,11 @@ class TestMcpServerEndpoints:
         async with AsyncClient(
             transport=ASGITransport(app=app), base_url="http://test"
         ) as client:
-            # Query param api_key auth
+            # Authorization: Bearer header auth (query-param auth is not supported)
             resp = await client.post(
                 "/call_tool",
                 json={"session_id": "123", "text": "test turn"},
-                params={"api_key": "keyA"}
+                headers={"Authorization": "Bearer keyA"}
             )
             assert resp.status_code == 200
             data = resp.json()
@@ -611,7 +614,7 @@ class TestMcpServerEndpoints:
                     "locale": "en_US",
                     "metadata": {"consent_granted": True}
                 },
-                params={"api_key": "keyA"}
+                headers={"Authorization": "Bearer keyA"}
             )
             assert resp.status_code == 200
             layer.submit_input.assert_called_once_with(
@@ -619,3 +622,100 @@ class TestMcpServerEndpoints:
                 locale="en_US", metadata={"consent_granted": True}
             )
 
+
+# ---------------------------------------------------------------------------
+# Security regression tests (GH-338 re-review: pullrequestreview-4590269104)
+# ---------------------------------------------------------------------------
+
+class TestSecurityRegressions:
+    """Explicit security tests covering all re-review blocker and non-blocking items."""
+
+    def test_call_tool_returns_503_when_no_callers_configured(self) -> None:
+        """Blocker 1: /call_tool returns 503 when callers list is empty (fail-closed)."""
+        layer = McpReachLayer(_make_config())
+        app = create_app(layer, _make_config())
+        client = TestClient(app)
+
+        resp = client.post("/call_tool", json={"session_id": "s1", "text": "hi"})
+        assert resp.status_code == 503
+        assert "callers" in resp.json()["detail"]
+
+    def test_sse_returns_503_when_no_callers_configured(self) -> None:
+        """Blocker 1: /sse returns 503 when callers list is empty (fail-closed)."""
+        layer = McpReachLayer(_make_config())
+        app = create_app(layer, _make_config())
+        client = TestClient(app, raise_server_exceptions=False)
+
+        resp = client.get("/sse", headers={"Accept": "text/event-stream"})
+        assert resp.status_code == 503
+
+    @pytest.mark.asyncio
+    async def test_handle_call_tool_ignores_client_supplied_caller_agent_id(self) -> None:
+        """Blocker 2: server ignores caller_agent_id in JSON arguments; uses auth-derived ID.
+
+        An attacker sending caller_agent_id='attacker' in arguments must not be able
+        to impersonate another caller or bypass the consent gate.
+        """
+        layer = McpReachLayer(_make_config())
+        layer.submit_input = AsyncMock()
+
+        async def fake_subscribe(session_id: str):
+            yield DoneEvent(turn_status="completed", session_ended=False)
+        layer.subscribe_events = fake_subscribe
+
+        callers = [{"caller_agent_id": "legit-agent", "api_key": "good-key"}]
+        app = create_app(layer, _make_config(callers=callers))
+
+        from httpx import AsyncClient, ASGITransport
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            resp = await client.post(
+                "/call_tool",
+                json={
+                    "session_id": "s1",
+                    "text": "hi",
+                    "caller_agent_id": "attacker"  # client-supplied, must be ignored
+                },
+                headers={"Authorization": "Bearer good-key"}
+            )
+            assert resp.status_code == 200
+
+        # Verify submit_input was called with the auth-derived ID, not the client-supplied one.
+        layer.submit_input.assert_called_once_with(
+            "legit-agent:s1", "hi", user_id=None,
+            caller_agent_id="legit-agent",  # must be auth-derived, never "attacker"
+            locale=None, metadata=None
+        )
+
+    def test_hmac_timing_safe_comparison_rejects_similar_key(self) -> None:
+        """NB-1: Keys differing by one char must be rejected (timing-safe comparison)."""
+        from fastapi import Request as FastAPIRequest
+        from unittest.mock import MagicMock
+
+        callers = [{"caller_agent_id": "agent-1", "api_key": "correct-key-abc"}]
+
+        mock_request = MagicMock(spec=FastAPIRequest)
+        mock_request.headers = {"Authorization": "Bearer correct-key-abX"}  # 1 char different
+        mock_request.query_params = {}
+
+        from src.server import _authenticate_request
+        from fastapi import HTTPException as FastHTTPException
+        with pytest.raises(FastHTTPException) as exc_info:
+            _authenticate_request(mock_request, callers)
+        assert exc_info.value.status_code == 401
+
+    def test_query_param_api_key_is_rejected(self) -> None:
+        """NB-2: ?api_key= query-param auth must be rejected (leaks keys into logs)."""
+        layer = McpReachLayer(_make_config())
+        callers = [{"caller_agent_id": "agent-1", "api_key": "secret"}]
+        app = create_app(layer, _make_config(callers=callers))
+        client = TestClient(app)
+
+        # Even with the correct key in the query param, it must not authenticate.
+        resp = client.post(
+            "/call_tool",
+            json={"session_id": "s1", "text": "hi"},
+            params={"api_key": "secret"}
+        )
+        assert resp.status_code == 401
