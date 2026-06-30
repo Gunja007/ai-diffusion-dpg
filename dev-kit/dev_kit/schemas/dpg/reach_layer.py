@@ -215,6 +215,20 @@ class VoiceDpg(BaseModel):
     recording: RecordingDpg = Field(default_factory=RecordingDpg)
 
 
+class CallerDpg(BaseModel):
+    """Configuration for an authorized inbound caller agent (GH-338)."""
+
+    model_config = ConfigDict(extra="forbid")
+    caller_agent_id: str
+    api_key: str = Field(
+        description=(
+            "API key for this caller. Use an env-var placeholder so the secret "
+            "is not stored in plaintext YAML — e.g. api_key: ${MCP_CALLER_MYAGENT_KEY}. "
+            "The config loader expands ${VAR} and ${VAR:-default} at boot time."
+        )
+    )
+
+
 class McpDpg(BaseModel):
     """Defaults for the MCP channel adapter."""
 
@@ -222,6 +236,7 @@ class McpDpg(BaseModel):
     enabled: bool = True
     assembly_mode: AssemblyMode = "session"
     port: int = Field(default=8007, gt=0, lt=65536)
+    callers: list[CallerDpg] = Field(default_factory=list)
 
 
 class ChannelsDpg(BaseModel):

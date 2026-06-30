@@ -250,6 +250,7 @@ class TurnAssembler(TurnAssemblerBase):
         *,
         user_id: str | None = None,
         channel: str | None = None,
+        caller_agent_id: str | None = None,
     ) -> Session:
         """Look up the Session for session_id, creating it on first access.
 
@@ -257,6 +258,7 @@ class TurnAssembler(TurnAssemblerBase):
             session_id: Unique session identifier.
             user_id: User identifier (cached on first access; ignored thereafter).
             channel: Channel name (cached on first access; ignored thereafter).
+            caller_agent_id: Optional caller agent identifier.
 
         Returns:
             The Session — existing or newly created.
@@ -267,6 +269,7 @@ class TurnAssembler(TurnAssemblerBase):
                 session_id=session_id,
                 user_id=user_id,
                 channel=channel or "",
+                caller_agent_id=caller_agent_id,
             )
             self._sessions[session_id] = session
         return session
@@ -310,6 +313,7 @@ class TurnAssembler(TurnAssemblerBase):
             session_id,
             user_id=getattr(segment, "user_id", None),
             channel=getattr(segment, "channel", None),
+            caller_agent_id=getattr(segment, "caller_agent_id", None),
         )
 
         async with session._lock:
@@ -977,12 +981,19 @@ class TurnAssembler(TurnAssemblerBase):
         """
         assembled_text = " ".join(s.text.strip() for s in turn.segments)
 
+        first_segment = turn.segments[0] if turn.segments else None
+        locale = getattr(first_segment, "locale", None) if first_segment else None
+        metadata = getattr(first_segment, "metadata", None) if first_segment else None
+
         turn_input = TurnInput(
             session_id=turn.session_id,
             user_message=assembled_text,
             channel=turn.channel,
             timestamp_ms=turn.started_at_ms,
             user_id=turn.user_id,
+            caller_agent_id=turn.caller_agent_id,
+            locale=locale,
+            metadata=metadata,
         )
 
         logger.info(

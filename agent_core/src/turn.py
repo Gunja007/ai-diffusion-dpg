@@ -46,6 +46,7 @@ class Turn:
     channel: str
     user_id: Optional[str]
     started_at_ms: int
+    caller_agent_id: Optional[str] = None
     segments: list[SegmentInput] = field(default_factory=list)
     status: TurnStatus = TurnStatus.WAITING
     abort_event: asyncio.Event = field(default_factory=asyncio.Event)

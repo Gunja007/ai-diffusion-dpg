@@ -16,6 +16,7 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "observability-layer",
     "opentelemetry-instrumentation-httpx>=0.61b0",
+    "mcp>=1.0",
 ]
 
 [project.optional-dependencies]

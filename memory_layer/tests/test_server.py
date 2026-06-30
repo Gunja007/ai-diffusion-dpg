@@ -74,7 +74,13 @@ def test_context_bundle_returns_bundle(client, mock_memory):
 def test_context_bundle_calls_memory_with_correct_args(client, mock_memory):
     mock_memory.context_bundle.return_value = {"session": {}, "profile": {}, "journey": None}
     client.post("/context_bundle", json={"session_id": "sess-1", "user_id": "user-1"})
-    mock_memory.context_bundle.assert_called_once_with("sess-1", "user-1", adopt=True)
+    mock_memory.context_bundle.assert_called_once_with("sess-1", "user-1", adopt=True, caller_agent_id=None)
+
+
+def test_context_bundle_calls_memory_with_caller_agent_id(client, mock_memory):
+    mock_memory.context_bundle.return_value = {"session": {}, "profile": {}, "journey": None}
+    client.post("/context_bundle", json={"session_id": "sess-1", "user_id": "user-1", "caller_agent_id": "agent-1"})
+    mock_memory.context_bundle.assert_called_once_with("sess-1", "user-1", adopt=True, caller_agent_id="agent-1")
 
 
 # ---------------------------------------------------------------------------

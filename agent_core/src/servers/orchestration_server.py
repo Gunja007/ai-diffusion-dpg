@@ -46,7 +46,10 @@ class ProcessTurnRequest(BaseModel):
     channel: str | None = None
     timestamp_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
     user_id: str | None = None
+    caller_agent_id: str | None = None
     fresh: bool = False
+    locale: str | None = None
+    metadata: dict | None = None
 
 
 class ProcessTurnResponse(BaseModel):
@@ -69,6 +72,9 @@ class SegmentInputRequest(BaseModel):
     # per-channel config resolves explicitly; defaulting would mask misconfig.
     channel: str | None = None
     timestamp_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
+    caller_agent_id: str | None = None
+    locale: str | None = None
+    metadata: dict | None = None
 
 
 class StatusResponse(BaseModel):
@@ -143,7 +149,10 @@ def create_orchestration_app(
             if request.timestamp_ms
             else int(time.time() * 1000),
             user_id=request.user_id,
+            caller_agent_id=request.caller_agent_id,
             fresh=request.fresh,
+            locale=request.locale,
+            metadata=request.metadata,
         )
 
         try:
@@ -234,7 +243,10 @@ def create_orchestration_app(
             if request.timestamp_ms
             else int(time.time() * 1000),
             user_id=request.user_id,
+            caller_agent_id=request.caller_agent_id,
             fresh=request.fresh,
+            locale=request.locale,
+            metadata=request.metadata,
         )
 
         async def event_generator():
@@ -314,6 +326,9 @@ def create_orchestration_app(
                 user_id=request.user_id,
                 channel=request.channel,
                 timestamp_ms=request.timestamp_ms or int(time.time() * 1000),
+                caller_agent_id=request.caller_agent_id,
+                locale=request.locale,
+                metadata=request.metadata,
             )
 
             await _assembler.add_segment(session_id, segment)

@@ -101,7 +101,19 @@ def test_context_bundle_posts_to_correct_endpoint(client):
 
     mock_post.assert_called_once_with(
         "http://memory-layer:8002/context_bundle",
-        json={"session_id": "sess-1", "user_id": "user-1", "adopt": True},
+        json={"session_id": "sess-1", "user_id": "user-1", "adopt": True, "caller_agent_id": None},
+        timeout=2.0,
+    )
+
+
+def test_context_bundle_posts_with_caller_agent_id(client):
+    mock_resp = _mock_response({"session": {}, "profile": {}, "journey": None})
+    with patch("src.http_clients.memory_layer.httpx.post", return_value=mock_resp) as mock_post:
+        client.context_bundle("sess-1", "user-1", caller_agent_id="agent-1")
+
+    mock_post.assert_called_once_with(
+        "http://memory-layer:8002/context_bundle",
+        json={"session_id": "sess-1", "user_id": "user-1", "adopt": True, "caller_agent_id": "agent-1"},
         timeout=2.0,
     )
 

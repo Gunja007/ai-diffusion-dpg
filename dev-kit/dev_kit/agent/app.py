@@ -2634,6 +2634,7 @@ async def get_deploy_preview(slug: str, body: dict) -> dict:
         "web": "reach_layer_web",
         "voice": "reach_layer_voice",
         "cli": "reach_layer_cli",
+        "mcp": "reach_layer_mcp",
     }
     target = body.get("target", "docker")
     if target == "docker":
@@ -3056,6 +3057,7 @@ async def _run_docker_deploy(
         "web": "reach_layer_web",
         "voice": "reach_layer_voice",
         "cli": "reach_layer_cli",
+        "mcp": "reach_layer_mcp",
     }
     if selected_channels is None:
         selected_channels = ["web", "voice", "cli"]
@@ -3359,6 +3361,7 @@ _NO_HEALTHCHECK_SERVICES = {"loki", "grafana", "prometheus", "jaeger", "otel_col
 _COMPOSE_TO_STATE = {
     "reach_layer_web": "reach_layer",
     "reach_layer_voice": "reach_layer",
+    "reach_layer_mcp": "reach_layer",
     "otelcol": "otel_collector",
 }
 

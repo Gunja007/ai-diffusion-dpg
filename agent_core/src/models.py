@@ -44,7 +44,10 @@ class TurnInput:
     channel: str          # "cli" | "whatsapp" | "web" | "voip"
     timestamp_ms: int
     user_id: Optional[str] = None   # opaque identifier set by Reach Layer (phone, email, etc.)
+    caller_agent_id: Optional[str] = None  # unique identifier of calling agent (GH-338)
     fresh: bool = False             # True when caller wants a clean "New chat" — disables session adoption
+    locale: Optional[str] = None
+    metadata: Optional[dict] = None
 
 
 @dataclass
@@ -61,6 +64,9 @@ class SegmentInput:
     user_id: Optional[str] = None
     channel: Optional[str] = None
     timestamp_ms: int = 0
+    caller_agent_id: Optional[str] = None  # unique identifier of calling agent (GH-338)
+    locale: Optional[str] = None
+    metadata: Optional[dict] = None
 
 
 # ---------------------------------------------------------------------------

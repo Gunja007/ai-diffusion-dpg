@@ -357,6 +357,15 @@ class VoiceChannelConfig(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+class CallerConfig(BaseModel):
+    """Configuration for an authorized inbound caller agent (GH-338)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    caller_agent_id: str = Field(min_length=1)
+    api_key: str = Field(min_length=1)
+
+
 class McpChannelConfig(BaseModel):
     """MCP channel service config."""
 
@@ -365,6 +374,7 @@ class McpChannelConfig(BaseModel):
     enabled: bool = True
     assembly_mode: AssemblyMode = AssemblyMode.session
     port: int = Field(default=8007, gt=0, lt=65536)
+    callers: list[CallerConfig] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------

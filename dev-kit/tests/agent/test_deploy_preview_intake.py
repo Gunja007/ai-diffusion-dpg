@@ -198,6 +198,24 @@ class TestIntakeStateServiceGating:
         services = compose.get("services", {})
         assert "reach_layer_voice" in services
 
+    def test_mcp_not_selected_removes_reach_layer_mcp(self, tmp_client):
+        """reach_layer_mcp must be absent when mcp is not selected."""
+        client, tmp_path = tmp_client
+        intake = _make_intake(selected_channels=["web"])
+        _build_project(tmp_path, "test-web-only-mcp", intake)
+        compose = _preview_compose(client, "test-web-only-mcp")
+        services = compose.get("services", {})
+        assert "reach_layer_mcp" not in services
+
+    def test_mcp_selected_retains_reach_layer_mcp(self, tmp_client):
+        """reach_layer_mcp must be present when mcp is in selected_channels."""
+        client, tmp_path = tmp_client
+        intake = _make_intake(selected_channels=["web", "mcp"])
+        _build_project(tmp_path, "test-mcp", intake)
+        compose = _preview_compose(client, "test-mcp")
+        services = compose.get("services", {})
+        assert "reach_layer_mcp" in services
+
     def test_dev_kit_is_always_removed(self, tmp_client):
         """dev_kit service must never appear in the generated compose output."""
         client, tmp_path = tmp_client
