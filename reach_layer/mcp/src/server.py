@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 from contextvars import ContextVar
+from dataclasses import asdict
 import hmac
 import json
 import logging
@@ -15,6 +16,7 @@ from typing import Any, Callable, Optional
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
+from starlette.types import Receive, Scope, Send
 
 import mcp.types as types
 from mcp.server import Server
@@ -102,6 +104,7 @@ async def _handle_call_tool(
     progress_callback: Optional[Callable[[SentenceEvent], Any]] = None,
     locale: Optional[str] = None,
     metadata: Optional[dict] = None,
+    include_events: bool = True,
 ) -> dict[str, Any]:
     """Submit a tool call to Agent Core and aggregate the SSE stream.
 
@@ -238,8 +241,8 @@ async def _handle_call_tool(
         async def _aggregate() -> None:
             nonlocal finished, error_type, error_message
             async for event in mcp_reach.subscribe_events(session_id):
-                from dataclasses import asdict
-                events_list.append(asdict(event))
+                if include_events:
+                    events_list.append(asdict(event))
                 if isinstance(event, SentenceEvent):
                     parts.append(event.text)
                     if progress_callback:
@@ -314,6 +317,29 @@ async def _handle_call_tool(
             "error_type": error_type,
             "error_message": error_message,
         }
+
+
+class MessagesASGIApp:
+    """Raw ASGI application to handle client messages for the SSE transport.
+
+    Using a raw ASGI application class bypasses FastAPI's standard route handler
+    response wrapping, preventing 'http.response.start' duplicate message errors.
+    """
+    def __init__(self, callers: list[Any], sse: SseServerTransport) -> None:
+        self.callers = callers
+        self.sse = sse
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            return
+
+        request = Request(scope, receive)
+        caller_id = _authenticate_request(request, self.callers)
+        token = current_caller_agent_id.set(caller_id)
+        try:
+            await self.sse.handle_post_message(scope, receive, send)
+        finally:
+            current_caller_agent_id.reset(token)
 
 
 def create_app(mcp_reach: McpReachLayer, config: dict) -> FastAPI:
@@ -392,7 +418,7 @@ def create_app(mcp_reach: McpReachLayer, config: dict) -> FastAPI:
     async def handle_call_tool(
         name: str,
         arguments: dict | None,
-        ctx: RequestContext
+        ctx: RequestContext | None = None
     ) -> list[types.TextContent]:
         """Handle JSON-RPC call_tool requests."""
         if name != "dpg.send_message":
@@ -408,6 +434,12 @@ def create_app(mcp_reach: McpReachLayer, config: dict) -> FastAPI:
         if not session_id or not text:
             raise ValueError("session_id and message must not be empty")
 
+        if ctx is None:
+            try:
+                ctx = mcp_server.request_context
+            except LookupError:
+                ctx = None
+
         # caller_id is always auth-derived from _authenticate_request via the
         # ContextVar set on /sse, /messages, and /call_tool. The client-supplied
         # caller_agent_id argument is intentionally ignored to prevent forgery.
@@ -415,27 +447,45 @@ def create_app(mcp_reach: McpReachLayer, config: dict) -> FastAPI:
 
         # Namespace session_id by authenticated caller to prevent cross-caller
         # session collision.
-        namespaced_session_id = f"{caller_id}:{session_id}" if caller_id else session_id
+        prefix = f"{caller_id}:" if caller_id else ""
+        namespaced_session_id = session_id
+        if prefix and not session_id.startswith(prefix):
+            namespaced_session_id = f"{prefix}{session_id}"
 
         is_new_session = namespaced_session_id not in _active_sessions
         if is_new_session:
             _active_sessions.add(namespaced_session_id)
 
-        progress_token = getattr(ctx, "meta", {}).get("progressToken") if ctx else None
+        progress_token = None
+        if ctx and getattr(ctx, "meta", None) is not None:
+            meta = ctx.meta
+            if isinstance(meta, dict):
+                progress_token = meta.get("progressToken")
+            else:
+                progress_token = getattr(meta, "progressToken", None)
 
         async def progress_callback(event: SentenceEvent) -> None:
-            if progress_token and ctx.session:
+            if progress_token and ctx and ctx.session:
                 await ctx.session.send_notification(
-                    "notifications/progress",
-                    {
-                        "progressToken": progress_token,
-                        "progress": event.sentence_index,
-                        "meta": {
-                            "text": event.text,
-                            "sentence_index": event.sentence_index,
-                        }
-                    }
+                    types.ProgressNotification(
+                        method="notifications/progress",
+                        params=types.ProgressNotificationParams(
+                            progressToken=progress_token,
+                            progress=float(event.sentence_index),
+                            meta=types.NotificationParams.Meta(
+                                extra={
+                                    "text": event.text,
+                                    "sentence_index": event.sentence_index,
+                                }
+                            )
+                        )
+                    )
                 )
+
+        # Optimize by not returning full event list to standard MCP tool callers
+        include_events = False
+        if metadata and metadata.get("include_events"):
+            include_events = True
 
         result = await _handle_call_tool(
             mcp_reach,
@@ -447,10 +497,14 @@ def create_app(mcp_reach: McpReachLayer, config: dict) -> FastAPI:
             progress_callback=progress_callback,
             locale=locale,
             metadata=metadata,
+            include_events=include_events,
         )
 
         if result.get("finished"):
             _active_sessions.discard(namespaced_session_id)
+
+        # Restore original un-namespaced session_id for the client
+        result["session_id"] = session_id
 
         return [
             types.TextContent(
@@ -483,17 +537,8 @@ def create_app(mcp_reach: McpReachLayer, config: dict) -> FastAPI:
         finally:
             current_caller_agent_id.reset(token)
 
-    @app.post("/messages")
-    async def handle_messages(request: Request):
-        """Handle incoming client messages for the SSE transport."""
-        caller_id = _authenticate_request(request, callers)
-        token = current_caller_agent_id.set(caller_id)
-        try:
-            await sse.handle_post_message(
-                request.scope, request.receive, request._send
-            )
-        finally:
-            current_caller_agent_id.reset(token)
+    # Register raw ASGI app for messages to bypass FastAPI response wrapping
+    app.add_route("/messages", MessagesASGIApp(callers, sse), methods=["POST"])
 
     @app.post("/call_tool", response_model=CallToolResponse)
     async def call_tool(req: CallToolRequest, request: Request) -> dict[str, Any]:
@@ -506,7 +551,11 @@ def create_app(mcp_reach: McpReachLayer, config: dict) -> FastAPI:
 
         token = current_caller_agent_id.set(caller_id)
         try:
-            namespaced_session_id = f"{caller_id}:{req.session_id}" if caller_id else req.session_id
+            prefix = f"{caller_id}:" if caller_id else ""
+            namespaced_session_id = req.session_id
+            if prefix and not req.session_id.startswith(prefix):
+                namespaced_session_id = f"{prefix}{req.session_id}"
+
             is_new_session = namespaced_session_id not in _active_sessions
             if is_new_session:
                 _active_sessions.add(namespaced_session_id)
@@ -520,10 +569,14 @@ def create_app(mcp_reach: McpReachLayer, config: dict) -> FastAPI:
                 caller_agent_id=caller_id,
                 locale=req.locale,
                 metadata=req.metadata,
+                include_events=True,  # Always include events for backward-compatible REST endpoint
             )
 
             if result.get("finished"):
                 _active_sessions.discard(namespaced_session_id)
+
+            # Restore original un-namespaced session_id for the client
+            result["session_id"] = req.session_id
 
             return result
         finally:

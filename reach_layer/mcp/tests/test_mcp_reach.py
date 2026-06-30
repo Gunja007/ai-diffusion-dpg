@@ -17,6 +17,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 from fastapi.testclient import TestClient
+import mcp.types as types
+
 from reach_layer_base import DoneEvent, SentenceEvent, TextChannelBase
 from src.mcp_reach import McpReachLayer
 from src.server import _handle_call_tool, create_app, current_caller_agent_id
@@ -530,7 +532,7 @@ class TestMcpServerEndpoints:
             data = resp.json()
             assert data["reply"] == "Hello from DPG."
             assert data["finished"] is False
-            assert data["session_id"] == "callerA:123"
+            assert data["session_id"] == "123"
 
             layer.submit_input.assert_called_with(
                 "callerA:123", "test turn", user_id=None, caller_agent_id="callerA", locale=None, metadata=None
@@ -567,26 +569,34 @@ class TestMcpServerEndpoints:
         # Verify progress calls
         assert mock_session.send_notification.call_count == 2
         mock_session.send_notification.assert_any_call(
-            "notifications/progress",
-            {
-                "progressToken": "token-xyz",
-                "progress": 0,
-                "meta": {
-                    "text": "Sentence 1",
-                    "sentence_index": 0,
-                }
-            }
+            types.ProgressNotification(
+                method="notifications/progress",
+                params=types.ProgressNotificationParams(
+                    progressToken="token-xyz",
+                    progress=0.0,
+                    meta=types.NotificationParams.Meta(
+                        extra={
+                            "text": "Sentence 1",
+                            "sentence_index": 0,
+                        }
+                    )
+                )
+            )
         )
         mock_session.send_notification.assert_any_call(
-            "notifications/progress",
-            {
-                "progressToken": "token-xyz",
-                "progress": 1,
-                "meta": {
-                    "text": "Sentence 2",
-                    "sentence_index": 1,
-                }
-            }
+            types.ProgressNotification(
+                method="notifications/progress",
+                params=types.ProgressNotificationParams(
+                    progressToken="token-xyz",
+                    progress=1.0,
+                    meta=types.NotificationParams.Meta(
+                        extra={
+                            "text": "Sentence 2",
+                            "sentence_index": 1,
+                        }
+                    )
+                )
+            )
         )
 
     @pytest.mark.asyncio
@@ -719,3 +729,58 @@ class TestSecurityRegressions:
             params={"api_key": "secret"}
         )
         assert resp.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_sse_integration_with_real_client(self) -> None:
+        """Verify standard MCP SSE tool calls function end-to-end with a real client session.
+
+        Uses a background uvicorn server thread to prevent in-process ASGI deadlocks.
+        """
+        import threading
+        import time
+        import uvicorn
+        from mcp.client.sse import sse_client
+        from mcp.client.session import ClientSession
+
+        layer = McpReachLayer(_make_config())
+        layer.submit_input = AsyncMock()
+
+        async def fake_subscribe(session_id: str):
+            yield SentenceEvent(text="Integrated SSE sentence.", sentence_index=0)
+            yield DoneEvent(turn_status="completed", session_ended=True)
+        layer.subscribe_events = fake_subscribe
+
+        callers = [{"caller_agent_id": "callerA", "api_key": "keyA"}]
+        app = create_app(layer, _make_config(callers=callers))
+
+        import socket
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+
+        def run_server():
+            uvicorn.run(app, host="127.0.0.1", port=port, log_level="warning")
+
+        server_thread = threading.Thread(target=run_server, daemon=True)
+        server_thread.start()
+        time.sleep(0.5)
+
+        headers = {"Authorization": "Bearer keyA"}
+        url = f"http://127.0.0.1:{port}/sse"
+        
+        async with sse_client(url, headers=headers) as (read_stream, write_stream):
+            async with ClientSession(read_stream, write_stream) as session:
+                await session.initialize()
+                
+                tools_result = await session.list_tools()
+                assert len(tools_result.tools) == 1
+                assert tools_result.tools[0].name == "dpg.send_message"
+
+                result = await session.call_tool("dpg.send_message", {"session_id": "s-integrated", "message": "hello"})
+                assert len(result.content) == 1
+                assert result.content[0].type == "text"
+                
+                payload = json.loads(result.content[0].text)
+                assert payload["reply"] == "Integrated SSE sentence."
+                assert payload["session_id"] == "s-integrated"
+                assert payload["finished"] is True

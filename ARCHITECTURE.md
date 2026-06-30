@@ -378,7 +378,7 @@ A channel is therefore *not* identified by its mode — Web can run in either mo
 - `reach_layer/web/server.py` calls Memory Layer `GET /users/{user_id}/active-history` to restore chat history on session resume, before turn 1. Production-approved — the call happens outside the turn pipeline (no LLM response is owed) and is the canonical way to repopulate the SPA's sidebar.
 - Reach Layer `POST /ingest` forwards user-uploaded documents to Knowledge Engine's ingestion endpoint. Production-approved for the same reason: ingestion is asynchronous to the turn pipeline.
 - Reach Layer MCP (`reach_layer/mcp/`) calls Agent Core `POST /process_turn` or `POST /sessions/{session_id}/input`. Production-approved as a standard inbound channel.
-- Outbound MCP tool invocations are made using the standard `McpAdapter` to invoke peer agents / standard MCP servers. See [outbound MCP recipe](file:///Users/samhithrao/projects/ai-diffusion-dpg/docs/superpowers/specs/issue-338-outbound-mcp-recipe.md).
+- Outbound MCP tool invocations are made using the standard `McpAdapter` to invoke peer agents / standard MCP servers. See [outbound MCP recipe](docs/superpowers/specs/issue-338-outbound-mcp-recipe.md).
 
 Other Reach Layer → downstream-block calls remain prohibited unless added to this list.
 
